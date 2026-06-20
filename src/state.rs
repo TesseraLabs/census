@@ -1,0 +1,171 @@
+//! Current Census-managed state.
+//!
+//! This slice reads ONLY the managed registry (`/var/lib/census/managed.toml`)
+//! — what Census previously recorded as managed. It does NOT read live
+//! `/etc/passwd` (live drift is a later slice). The registry is authoritative
+//! for "what Census manages" (spec §4).
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// A single managed account as last recorded by Census.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedAccount {
+    /// Unix login name.
+    pub name: String,
+    /// Recorded UID.
+    pub uid: u32,
+    /// Recorded shell.
+    pub shell: String,
+    /// Recorded groups.
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// Declaration `version` this account was created/updated from.
+    pub from_version: u32,
+}
+
+/// Read-only view of the current managed state.
+pub trait SystemState {
+    /// Managed accounts keyed by name.
+    fn managed_accounts(&self) -> BTreeMap<String, ManagedAccount>;
+}
+
+/// Registry-backed state read from `managed.toml`. Absent file = empty state.
+#[derive(Debug)]
+pub struct RegistryState {
+    accounts: BTreeMap<String, ManagedAccount>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RegistryFile {
+    #[serde(default, rename = "account")]
+    accounts: Vec<ManagedAccount>,
+}
+
+/// Errors reading the managed registry.
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    /// Registry file exists but cannot be read.
+    #[error("cannot read managed registry {path}: {reason}")]
+    Io { path: PathBuf, reason: String },
+    /// Registry TOML is malformed.
+    #[error("managed registry {path} is invalid: {reason}")]
+    TomlParse { path: PathBuf, reason: String },
+}
+
+impl RegistryState {
+    /// Load the registry. A missing file yields an empty (no-managed) state.
+    pub fn load(path: &Path) -> Result<Self, StateError> {
+        if !path.exists() {
+            return Ok(RegistryState { accounts: BTreeMap::new() });
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| StateError::Io {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+        let file: RegistryFile = toml::from_str(&text).map_err(|e| StateError::TomlParse {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+        let accounts = file
+            .accounts
+            .into_iter()
+            .map(|a| (a.name.clone(), a))
+            .collect();
+        Ok(RegistryState { accounts })
+    }
+}
+
+impl SystemState for RegistryState {
+    fn managed_accounts(&self) -> BTreeMap<String, ManagedAccount> {
+        self.accounts.clone()
+    }
+}
+
+/// In-memory state for tests.
+#[cfg(test)]
+pub struct FakeState {
+    /// The managed accounts this fake reports.
+    pub accounts: BTreeMap<String, ManagedAccount>,
+}
+
+#[cfg(test)]
+impl SystemState for FakeState {
+    fn managed_accounts(&self) -> BTreeMap<String, ManagedAccount> {
+        self.accounts.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn missing_registry_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = RegistryState::load(&tmp.path().join("absent.toml")).unwrap();
+        assert!(st.managed_accounts().is_empty());
+    }
+
+    #[test]
+    fn reads_recorded_accounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(
+            br#"
+[[account]]
+name = "oper"
+uid = 9010
+shell = "/bin/bash"
+groups = ["wheel"]
+from_version = 3
+"#,
+        )
+        .unwrap();
+        let st = RegistryState::load(&path).unwrap();
+        let accts = st.managed_accounts();
+        assert_eq!(accts.len(), 1);
+        let oper = &accts["oper"];
+        assert_eq!(oper.uid, 9010);
+        assert_eq!(oper.groups, vec!["wheel"]);
+        assert_eq!(oper.from_version, 3);
+    }
+
+    #[test]
+    fn unknown_field_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[account]]
+name = "oper"
+uid = 9010
+shell = "/bin/bash"
+groups = ["wheel"]
+from_version = 3
+bogus = "nope"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            RegistryState::load(&path).unwrap_err(),
+            StateError::TomlParse { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_registry_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(&path, "= = bad").unwrap();
+        assert!(matches!(
+            RegistryState::load(&path).unwrap_err(),
+            StateError::TomlParse { .. }
+        ));
+    }
+}

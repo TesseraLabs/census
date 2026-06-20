@@ -1,0 +1,473 @@
+//! `census apply` orchestrator (spec R-flow / tasks section 6).
+//!
+//! Flow (design "Поток apply"):
+//! ```text
+//! verify trust → parse + resolve (slice-1) → load managed state → diff
+//!   → anti-lockout gate → snapshot → apply phases (create→update→delete)
+//!   → on any phase error: restore → return error (non-zero)
+//!   → on success: write managed registry (atomic, LAST) → drop snapshot
+//! ```
+//!
+//! The orchestrator depends on the [`Provisioner`] trait (not on shadow-utils
+//! directly), so it is fully unit-testable with a [`FakeProvisioner`]: happy
+//! path, phase-failure → restore + no registry write, and idempotent empty plan.
+
+use crate::declaration::Declaration;
+use crate::mutate::{Provisioner, ProvisionError};
+use crate::plan::{self, Action};
+use crate::state::{ManagedAccount, SystemState};
+use crate::trust::{self, TrustOptions};
+use std::path::{Path, PathBuf};
+
+/// Errors that abort apply (each maps to a non-zero exit upstream).
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyError {
+    /// Declaration was not trusted (fail-closed); carries the reason.
+    #[error("declaration not trusted: {0}")]
+    NotTrusted(String),
+    /// Trust evaluation itself failed.
+    #[error(transparent)]
+    Trust(#[from] trust::TrustError),
+    /// Anti-lockout gate refused the plan.
+    #[error(transparent)]
+    Lockout(#[from] crate::lockout::LockoutError),
+    /// A provisioning phase failed; rollback was attempted.
+    #[error("apply failed during {phase}: {source}; rollback {rollback}")]
+    Phase {
+        /// Which phase failed (create/update/delete).
+        phase: &'static str,
+        /// The underlying provisioner error.
+        source: ProvisionError,
+        /// Outcome of the restore attempt.
+        rollback: RollbackOutcome,
+    },
+    /// Writing the managed registry (last, atomic) failed after success.
+    #[error("registry write failed: {0}")]
+    Registry(String),
+}
+
+/// Result of attempting a rollback after a phase failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollbackOutcome {
+    /// Snapshot restored successfully — OS is back to the prior state.
+    Restored,
+    /// Restore itself failed; the snapshot is retained for manual recovery.
+    Failed(String),
+}
+
+impl std::fmt::Display for RollbackOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RollbackOutcome::Restored => write!(f, "succeeded"),
+            RollbackOutcome::Failed(e) => write!(f, "FAILED: {e}"),
+        }
+    }
+}
+
+/// A line for the caller to log (trust decisions, risk acknowledgements, etc.).
+pub type LogLine = String;
+
+/// Inputs to [`run`] beyond the trait object.
+pub struct ApplyInputs<'a> {
+    /// Parsed, schema-valid declaration.
+    pub declaration: &'a Declaration,
+    /// Current managed state (registry-backed in production).
+    pub state: &'a dyn SystemState,
+    /// Trust options (`--trust-fs`).
+    pub trust: TrustOptions,
+    /// Anti-lockout context (`rescue_present`, `--i-understand-no-rescue`).
+    pub lockout: crate::lockout::LockoutContext,
+}
+
+/// Outcome of a successful apply: the new managed registry contents and the log
+/// lines accumulated along the way. The caller persists the registry atomically.
+#[derive(Debug)]
+pub struct ApplyReport {
+    /// New managed accounts (to write to the registry, atomic & last).
+    pub managed: Vec<ManagedAccount>,
+    /// Lines worth logging (trust decision, risk-ack, per-phase actions).
+    pub log: Vec<LogLine>,
+    /// Number of mutating operations performed (0 == idempotent no-op).
+    pub mutations: usize,
+    /// Whether the caller should persist the managed registry. `false` on an
+    /// empty (idempotent no-op) plan: the registry already matches the target
+    /// set, so a byte-identical rewrite would only bump mtime (spec R8: zero
+    /// mutations means zero on-disk changes).
+    pub registry_written: bool,
+}
+
+/// Run the apply orchestration over a provisioner. This is the unit-testable
+/// core; CLI wiring (reading files, writing the registry to disk) lives in
+/// [`crate::cli`].
+///
+/// On success returns the new managed set; the caller writes it to the registry
+/// atomically and last. On any phase failure the provisioner has already been
+/// asked to restore, and the error carries the rollback outcome.
+pub fn run(
+    inputs: ApplyInputs<'_>,
+    provisioner: &mut dyn Provisioner,
+) -> Result<ApplyReport, ApplyError> {
+    let mut log = Vec::new();
+
+    // 1. Trust (fail-closed) — before any state read or mutation.
+    let decision = trust::verify_trust(inputs.declaration, inputs.trust)?;
+    log.push(decision.reason().to_owned());
+    if !decision.is_trusted() {
+        return Err(ApplyError::NotTrusted(decision.reason().to_owned()));
+    }
+
+    // 2-3. Resolve targets (slice-1).
+    let targets = crate::model::resolve(inputs.declaration)
+        .map_err(|e| ApplyError::Registry(e.to_string()))?;
+
+    // 4-5. Diff vs managed state.
+    let managed_now = inputs.state.managed_accounts();
+    let plan = plan::diff(&targets, inputs.state);
+
+    // 6. Anti-lockout gate (before snapshot / mutation).
+    if inputs.lockout.risk_acknowledged {
+        log.push("anti-lockout: proceeding under --i-understand-no-rescue".to_owned());
+    }
+    crate::lockout::gate(&plan, inputs.lockout)?;
+
+    // Idempotence: empty plan → zero mutations, no snapshot, no registry churn
+    // (but registry still reflects the in-sync target set, identical to before).
+    if plan.is_empty() {
+        log.push("plan is empty — no changes".to_owned());
+        return Ok(ApplyReport {
+            managed: build_managed_set(&targets, inputs.declaration.version, &managed_now),
+            log,
+            mutations: 0,
+            registry_written: false,
+        });
+    }
+
+    // 7. Snapshot before any mutation.
+    provisioner
+        .snapshot()
+        .map_err(|e| ApplyError::Phase {
+            phase: "snapshot",
+            source: e,
+            rollback: RollbackOutcome::Restored, // nothing mutated yet
+        })?;
+
+    // 8. Apply phases create → update → delete. On any error: restore, abort.
+    let mut mutations = 0usize;
+    for action in &plan.actions {
+        let (phase, result) = match action {
+            Action::Create(acct) => ("create", provisioner.create(acct)),
+            Action::Update { account, changes } => {
+                ("update", provisioner.update(account, changes))
+            }
+            Action::Delete { name } => ("delete", provisioner.delete(name)),
+        };
+        match result {
+            Ok(()) => {
+                mutations += 1;
+                log.push(format!("{phase}: {}", action_label(action)));
+            }
+            Err(source) => {
+                let rollback = match provisioner.restore() {
+                    Ok(()) => RollbackOutcome::Restored,
+                    Err(e) => RollbackOutcome::Failed(e.to_string()),
+                };
+                return Err(ApplyError::Phase { phase, source, rollback });
+            }
+        }
+    }
+
+    // 9. Success: drop the snapshot. Registry write is the caller's job (atomic,
+    // last) — we return the new managed set with from_version recorded.
+    log.push("all phases succeeded".to_owned());
+    Ok(ApplyReport {
+        managed: build_managed_set(&targets, inputs.declaration.version, &managed_now),
+        log,
+        mutations,
+        registry_written: true,
+    })
+}
+
+/// A short label for a planned action (for logs).
+fn action_label(action: &Action) -> String {
+    match action {
+        Action::Create(a) => format!("create {} (uid {})", a.name, a.uid),
+        Action::Update { account, changes } => {
+            format!("update {} ({})", account.name, changes.join(", "))
+        }
+        Action::Delete { name } => format!("delete {name}"),
+    }
+}
+
+/// Build the new managed registry set from the resolved targets, recording
+/// `from_version`. Accounts already managed and unchanged keep their recorded
+/// `from_version`; created/updated accounts get the declaration's version.
+fn build_managed_set(
+    targets: &[crate::model::ResolvedAccount],
+    version: u32,
+    current: &std::collections::BTreeMap<String, ManagedAccount>,
+) -> Vec<ManagedAccount> {
+    targets
+        .iter()
+        .map(|t| {
+            let from_version = match current.get(&t.name) {
+                Some(existing) if existing.uid == t.uid
+                    && existing.shell == t.shell
+                    && groups_equal(&existing.groups, &t.groups) =>
+                {
+                    existing.from_version
+                }
+                _ => version,
+            };
+            ManagedAccount {
+                name: t.name.clone(),
+                uid: t.uid,
+                shell: t.shell.clone(),
+                groups: t.groups.clone(),
+                from_version,
+            }
+        })
+        .collect()
+}
+
+fn groups_equal(a: &[String], b: &[String]) -> bool {
+    let mut a = a.to_vec();
+    let mut b = b.to_vec();
+    a.sort();
+    b.sort();
+    a == b
+}
+
+/// Serialize a managed set to TOML and write it atomically (temp + rename) to
+/// `path`. Used by the CLI as the final step after a successful [`run`].
+pub fn write_registry(path: &Path, managed: &[ManagedAccount]) -> Result<(), ApplyError> {
+    let doc = RegistryDoc { account: managed.to_vec() };
+    let text = toml::to_string(&doc).map_err(|e| ApplyError::Registry(e.to_string()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp: PathBuf = parent.join(".census-managed.toml.tmp");
+    std::fs::write(&tmp, text.as_bytes()).map_err(|e| ApplyError::Registry(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        ApplyError::Registry(e.to_string())
+    })
+}
+
+#[derive(serde::Serialize)]
+struct RegistryDoc {
+    account: Vec<ManagedAccount>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lockout::LockoutContext;
+    use crate::model::ResolvedAccount;
+    use crate::state::FakeState;
+
+    /// Records every call and can be told to fail at a given phase.
+    #[derive(Default)]
+    struct FakeProvisioner {
+        calls: Vec<String>,
+        snapshotted: bool,
+        restored: bool,
+        /// Phase name on which `create`/`update`/`delete` should fail.
+        fail_on: Option<&'static str>,
+    }
+
+    impl FakeProvisioner {
+        fn failing(phase: &'static str) -> Self {
+            FakeProvisioner { fail_on: Some(phase), ..Default::default() }
+        }
+        fn maybe_fail(&mut self, phase: &'static str, name: &str) -> Result<(), ProvisionError> {
+            self.calls.push(format!("{phase}:{name}"));
+            if self.fail_on == Some(phase) {
+                Err(ProvisionError::Sudoers(format!("injected failure at {phase}")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Provisioner for FakeProvisioner {
+        fn create(&mut self, acct: &ResolvedAccount) -> Result<(), ProvisionError> {
+            self.maybe_fail("create", &acct.name)
+        }
+        fn update(&mut self, acct: &ResolvedAccount, _c: &[String]) -> Result<(), ProvisionError> {
+            self.maybe_fail("update", &acct.name)
+        }
+        fn delete(&mut self, name: &str) -> Result<(), ProvisionError> {
+            self.maybe_fail("delete", name)
+        }
+        fn snapshot(&mut self) -> Result<(), ProvisionError> {
+            self.snapshotted = true;
+            self.calls.push("snapshot".to_owned());
+            Ok(())
+        }
+        fn restore(&mut self) -> Result<(), ProvisionError> {
+            self.restored = true;
+            self.calls.push("restore".to_owned());
+            Ok(())
+        }
+    }
+
+    fn decl(role: &str, uid: u32) -> (tempfile::TempDir, Declaration) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{role}.toml")),
+            format!("role = \"{role}\"\nversion = 1\nos = \"linux\"\nname = \"X\"\nlevel = 0\n[payload]\ngroups = [\"wheel\"]\n"),
+        )
+        .unwrap();
+        let store = tmp.path().display().to_string();
+        let text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+        );
+        let d = Declaration::parse(&text).unwrap();
+        (tmp, d)
+    }
+
+    fn managed(name: &str, uid: u32, groups: &[&str], v: u32) -> ManagedAccount {
+        ManagedAccount {
+            name: name.to_owned(),
+            uid,
+            shell: "/bin/bash".to_owned(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            from_version: v,
+        }
+    }
+
+    fn fake_state(accts: Vec<ManagedAccount>) -> FakeState {
+        FakeState {
+            accounts: accts.into_iter().map(|a| (a.name.clone(), a)).collect(),
+        }
+    }
+
+    #[test]
+    fn fail_closed_without_trust_aborts_before_mutation() {
+        let (_t, d) = decl("oper", 9010);
+        let st = fake_state(vec![]);
+        let mut p = FakeProvisioner::default();
+        let err = run(
+            ApplyInputs {
+                declaration: &d,
+                state: &st,
+                trust: TrustOptions::default(), // no --trust-fs
+                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            },
+            &mut p,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApplyError::NotTrusted(_)));
+        assert!(!p.snapshotted, "no snapshot before trust passes");
+        assert!(p.calls.is_empty(), "no mutations on untrusted declaration");
+    }
+
+    #[test]
+    fn happy_path_creates_and_returns_registry() {
+        let (_t, d) = decl("oper", 9010);
+        let st = fake_state(vec![]);
+        let mut p = FakeProvisioner::default();
+        let report = run(
+            ApplyInputs {
+                declaration: &d,
+                state: &st,
+                trust: TrustOptions { trust_fs: true },
+                lockout: LockoutContext::default(),
+            },
+            &mut p,
+        )
+        .unwrap();
+        assert!(p.snapshotted);
+        assert!(!p.restored, "no restore on success");
+        assert_eq!(report.mutations, 1);
+        assert!(report.registry_written, "mutating plan must persist the registry");
+        assert_eq!(report.managed.len(), 1);
+        assert_eq!(report.managed[0].name, "oper");
+        assert_eq!(report.managed[0].from_version, 5);
+        assert!(p.calls.contains(&"create:oper".to_owned()));
+    }
+
+    #[test]
+    fn phase_failure_triggers_restore_and_no_registry_commit() {
+        let (_t, d) = decl("oper", 9010);
+        let st = fake_state(vec![]);
+        let mut p = FakeProvisioner::failing("create");
+        let err = run(
+            ApplyInputs {
+                declaration: &d,
+                state: &st,
+                trust: TrustOptions { trust_fs: true },
+                lockout: LockoutContext::default(),
+            },
+            &mut p,
+        )
+        .unwrap_err();
+        match err {
+            ApplyError::Phase { phase, rollback, .. } => {
+                assert_eq!(phase, "create");
+                assert_eq!(rollback, RollbackOutcome::Restored);
+            }
+            other => panic!("expected Phase error, got {other:?}"),
+        }
+        assert!(p.restored, "failure must trigger restore");
+    }
+
+    #[test]
+    fn idempotent_empty_plan_does_zero_mutations() {
+        // Managed state already matches the declaration → empty plan.
+        let (_t, d) = decl("oper", 9010);
+        let st = fake_state(vec![managed("oper", 9010, &["wheel"], 5)]);
+        let mut p = FakeProvisioner::default();
+        let report = run(
+            ApplyInputs {
+                declaration: &d,
+                state: &st,
+                trust: TrustOptions { trust_fs: true },
+                lockout: LockoutContext::default(),
+            },
+            &mut p,
+        )
+        .unwrap();
+        assert_eq!(report.mutations, 0);
+        assert!(!report.registry_written, "empty plan must not request a registry write");
+        assert!(!p.snapshotted, "empty plan must not snapshot");
+        assert!(p.calls.is_empty(), "empty plan must not mutate");
+        // registry still reflects the in-sync account, preserving from_version.
+        assert_eq!(report.managed[0].from_version, 5);
+    }
+
+    #[test]
+    fn lockout_gate_refuses_before_snapshot() {
+        // Declaration with no accounts, managed has one → delete-only plan, no rescue.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().display().to_string();
+        let text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+        );
+        let d = Declaration::parse(&text).unwrap();
+        let st = fake_state(vec![managed("oper", 9010, &["wheel"], 5)]);
+        let mut p = FakeProvisioner::default();
+        let err = run(
+            ApplyInputs {
+                declaration: &d,
+                state: &st,
+                trust: TrustOptions { trust_fs: true },
+                lockout: LockoutContext::default(), // no rescue, no risk-ack
+            },
+            &mut p,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApplyError::Lockout(_)));
+        assert!(!p.snapshotted, "lockout refusal must precede snapshot");
+    }
+
+    #[test]
+    fn write_registry_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        let set = vec![managed("oper", 9010, &["wheel"], 5)];
+        write_registry(&path, &set).unwrap();
+        let reloaded = crate::state::RegistryState::load(&path).unwrap();
+        let accts = reloaded.managed_accounts();
+        assert_eq!(accts["oper"].uid, 9010);
+        assert_eq!(accts["oper"].from_version, 5);
+    }
+}

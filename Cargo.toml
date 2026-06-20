@@ -1,0 +1,23 @@
+[package]
+name = "census"
+version = "0.1.0"
+edition = "2021"
+description = "Declarative provisioner of Unix access objects from a Tessera role-store"
+license = "AGPL-3.0-only"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "census"
+path = "src/main.rs"
+
+[lib]
+name = "census"
+path = "src/lib.rs"
