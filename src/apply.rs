@@ -77,6 +77,10 @@ pub struct ApplyInputs<'a> {
     pub trust: TrustOptions,
     /// Anti-lockout context (`rescue_present`, `--i-understand-no-rescue`).
     pub lockout: crate::lockout::LockoutContext,
+    /// Directory the role sudoers fragments live in (default `/etc/sudoers.d`;
+    /// injectable for tests). Used to compute the touched fragment paths added
+    /// to the backup set before snapshot, and must match the provisioner's dir.
+    pub sudoers_dir: PathBuf,
 }
 
 /// Outcome of a successful apply: the new managed registry contents and the log
@@ -142,7 +146,16 @@ pub fn run(
         });
     }
 
-    // 7. Snapshot before any mutation.
+    // 7a. Register every touched sudoers fragment in the backup set BEFORE the
+    // snapshot, so a later-phase failure rolls the fragment back too (spec R2).
+    // Touched = every created/updated role that carries a sudo right (its
+    // fragment is written/refreshed) + every deleted role's `census-<role>`
+    // fragment (it is removed). Computed from the plan + the sudoers dir.
+    for path in touched_sudoers_paths(&plan, &inputs.sudoers_dir) {
+        provisioner.track_sudoers_backup(path);
+    }
+
+    // 7b. Snapshot before any mutation.
     provisioner
         .snapshot()
         .map_err(|e| ApplyError::Phase {
@@ -152,14 +165,29 @@ pub fn run(
         })?;
 
     // 8. Apply phases create → update → delete. On any error: restore, abort.
+    // Each create/update also materializes (or clears) its sudoers fragment;
+    // each delete first removes the role's fragment, then the account.
     let mut mutations = 0usize;
     for action in &plan.actions {
         let (phase, result) = match action {
-            Action::Create(acct) => ("create", provisioner.create(acct)),
-            Action::Update { account, changes } => {
-                ("update", provisioner.update(account, changes))
-            }
-            Action::Delete { name } => ("delete", provisioner.delete(name)),
+            Action::Create(acct) => (
+                "create",
+                provisioner
+                    .create(acct)
+                    .and_then(|()| provisioner.apply_sudoers(acct)),
+            ),
+            Action::Update { account, changes } => (
+                "update",
+                provisioner
+                    .update(account, changes)
+                    .and_then(|()| provisioner.apply_sudoers(account)),
+            ),
+            Action::Delete { name } => (
+                "delete",
+                provisioner
+                    .remove_sudoers(name)
+                    .and_then(|()| provisioner.delete(name)),
+            ),
         };
         match result {
             Ok(()) => {
@@ -187,6 +215,35 @@ pub fn run(
     })
 }
 
+/// Compute the set of `census-<role>` sudoers fragment paths the plan will
+/// touch, so they can be added to the backup set before the snapshot (spec R2).
+///
+/// A fragment is touched when:
+/// * a created/updated role carries a sudo right (its fragment is written), OR
+/// * a created/updated role does NOT carry sudo (its fragment, if any, is
+///   removed — drop-to-none must also roll back), OR
+/// * a role is deleted (its `census-<role>` fragment is removed).
+///
+/// We back up the path for every created/updated/deleted role unconditionally:
+/// backing up an absent file is a no-op snapshot that correctly restores
+/// "absent" on rollback, and it spares us re-reading the role-store here.
+/// Deduplicated and order-stable.
+fn touched_sudoers_paths(plan: &plan::Plan, sudoers_dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for action in &plan.actions {
+        let name = match action {
+            Action::Create(acct) => &acct.name,
+            Action::Update { account, .. } => &account.name,
+            Action::Delete { name } => name,
+        };
+        let p = sudoers_dir.join(crate::sudoers::sudoers_filename(name));
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
 /// A short label for a planned action (for logs).
 fn action_label(action: &Action) -> String {
     match action {
@@ -212,7 +269,8 @@ fn build_managed_set(
             let from_version = match current.get(&t.name) {
                 Some(existing) if existing.uid == t.uid
                     && existing.shell == t.shell
-                    && groups_equal(&existing.groups, &t.groups) =>
+                    && groups_equal(&existing.groups, &t.groups)
+                    && existing.sudo_role == t.sudo_role =>
                 {
                     existing.from_version
                 }
@@ -223,6 +281,7 @@ fn build_managed_set(
                 uid: t.uid,
                 shell: t.shell.clone(),
                 groups: t.groups.clone(),
+                sudo_role: t.sudo_role.clone(),
                 from_version,
             }
         })
@@ -269,7 +328,9 @@ mod tests {
         calls: Vec<String>,
         snapshotted: bool,
         restored: bool,
-        /// Phase name on which `create`/`update`/`delete` should fail.
+        /// Sudoers fragment paths registered for backup before snapshot.
+        tracked_backups: Vec<std::path::PathBuf>,
+        /// Phase name on which a mutating call should fail.
         fail_on: Option<&'static str>,
     }
 
@@ -296,6 +357,16 @@ mod tests {
         }
         fn delete(&mut self, name: &str) -> Result<(), ProvisionError> {
             self.maybe_fail("delete", name)
+        }
+        fn apply_sudoers(&mut self, acct: &ResolvedAccount) -> Result<(), ProvisionError> {
+            self.maybe_fail("apply_sudoers", &acct.name)
+        }
+        fn remove_sudoers(&mut self, name: &str) -> Result<(), ProvisionError> {
+            self.maybe_fail("remove_sudoers", name)
+        }
+        fn track_sudoers_backup(&mut self, path: std::path::PathBuf) {
+            self.calls.push(format!("track_backup:{}", path.display()));
+            self.tracked_backups.push(path);
         }
         fn snapshot(&mut self) -> Result<(), ProvisionError> {
             self.snapshotted = true;
@@ -330,6 +401,7 @@ mod tests {
             uid,
             shell: "/bin/bash".to_owned(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
+            sudo_role: None,
             from_version: v,
         }
     }
@@ -351,6 +423,7 @@ mod tests {
                 state: &st,
                 trust: TrustOptions::default(), // no --trust-fs
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
             &mut p,
         )
@@ -371,6 +444,7 @@ mod tests {
                 state: &st,
                 trust: TrustOptions { trust_fs: true },
                 lockout: LockoutContext::default(),
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
             &mut p,
         )
@@ -396,6 +470,7 @@ mod tests {
                 state: &st,
                 trust: TrustOptions { trust_fs: true },
                 lockout: LockoutContext::default(),
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
             &mut p,
         )
@@ -422,6 +497,7 @@ mod tests {
                 state: &st,
                 trust: TrustOptions { trust_fs: true },
                 lockout: LockoutContext::default(),
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
             &mut p,
         )
@@ -451,6 +527,7 @@ mod tests {
                 state: &st,
                 trust: TrustOptions { trust_fs: true },
                 lockout: LockoutContext::default(), // no rescue, no risk-ack
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
             &mut p,
         )
@@ -459,15 +536,145 @@ mod tests {
         assert!(!p.snapshotted, "lockout refusal must precede snapshot");
     }
 
+    /// Like `decl`, but the role slice carries a `sudo_role`, so the resolved
+    /// account yields a sudoers fragment.
+    fn decl_with_sudo(role: &str, uid: u32) -> (tempfile::TempDir, Declaration) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{role}.toml")),
+            format!("role = \"{role}\"\nversion = 1\nos = \"linux\"\nname = \"X\"\nlevel = 0\n[payload]\ngroups = [\"wheel\"]\nsudo_role = \"ops\"\n"),
+        )
+        .unwrap();
+        let store = tmp.path().display().to_string();
+        let text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+        );
+        let d = Declaration::parse(&text).unwrap();
+        (tmp, d)
+    }
+
+    #[test]
+    fn create_applies_sudoers_and_tracks_backup_before_snapshot() {
+        let (_t, d) = decl_with_sudo("oper", 9010);
+        let st = fake_state(vec![]);
+        let mut p = FakeProvisioner::default();
+        let report = run(
+            ApplyInputs {
+                declaration: &d,
+                state: &st,
+                trust: TrustOptions { trust_fs: true },
+                lockout: LockoutContext::default(),
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            },
+            &mut p,
+        )
+        .unwrap();
+        assert_eq!(report.mutations, 1);
+        // The fragment path was registered for backup …
+        assert_eq!(
+            p.tracked_backups,
+            vec![PathBuf::from("/etc/sudoers.d/census-oper")]
+        );
+        // … BEFORE the snapshot was taken (ordering via the recorded call log).
+        let track_idx = p
+            .calls
+            .iter()
+            .position(|c| c == "track_backup:/etc/sudoers.d/census-oper")
+            .expect("track_backup recorded");
+        let snap_idx = p.calls.iter().position(|c| c == "snapshot").expect("snapshot recorded");
+        assert!(track_idx < snap_idx, "backup must be registered before snapshot");
+        // … and the sudoers fragment was materialized for the created role.
+        assert!(p.calls.contains(&"create:oper".to_owned()));
+        assert!(p.calls.contains(&"apply_sudoers:oper".to_owned()));
+    }
+
+    #[test]
+    fn delete_removes_sudoers_and_tracks_backup() {
+        // Declaration with no accounts, managed has one → delete-only plan.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().display().to_string();
+        let text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+        );
+        let d = Declaration::parse(&text).unwrap();
+        let st = fake_state(vec![managed("oper", 9010, &["wheel"], 5)]);
+        let mut p = FakeProvisioner::default();
+        let report = run(
+            ApplyInputs {
+                declaration: &d,
+                state: &st,
+                trust: TrustOptions { trust_fs: true },
+                // Rescue present so the delete-only plan passes the lockout gate.
+                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            },
+            &mut p,
+        )
+        .unwrap();
+        assert_eq!(report.mutations, 1);
+        assert!(p.calls.contains(&"remove_sudoers:oper".to_owned()));
+        assert!(p.calls.contains(&"delete:oper".to_owned()));
+        // sudoers removal precedes userdel.
+        let rm_idx = p.calls.iter().position(|c| c == "remove_sudoers:oper").unwrap();
+        let del_idx = p.calls.iter().position(|c| c == "delete:oper").unwrap();
+        assert!(rm_idx < del_idx, "sudoers removal must precede userdel");
+        // Deleted role's fragment was tracked for backup.
+        assert_eq!(
+            p.tracked_backups,
+            vec![PathBuf::from("/etc/sudoers.d/census-oper")]
+        );
+    }
+
+    #[test]
+    fn sudoers_failure_triggers_restore_and_no_registry_write() {
+        let (_t, d) = decl_with_sudo("oper", 9010);
+        let st = fake_state(vec![]);
+        // Account creation succeeds; the sudoers materialization fails.
+        let mut p = FakeProvisioner::failing("apply_sudoers");
+        let err = run(
+            ApplyInputs {
+                declaration: &d,
+                state: &st,
+                trust: TrustOptions { trust_fs: true },
+                lockout: LockoutContext::default(),
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            },
+            &mut p,
+        )
+        .unwrap_err();
+        match err {
+            ApplyError::Phase { phase, rollback, source } => {
+                assert_eq!(phase, "create", "sudoers is part of the create phase");
+                assert_eq!(rollback, RollbackOutcome::Restored);
+                assert!(matches!(source, ProvisionError::Sudoers(_)));
+            }
+            other => panic!("expected Phase error, got {other:?}"),
+        }
+        assert!(p.restored, "sudoers failure must trigger restore");
+        // create ran, apply_sudoers ran and failed; backup of the fragment was
+        // registered before the snapshot so the restore covers it.
+        assert!(p.calls.contains(&"create:oper".to_owned()));
+        assert!(p.calls.contains(&"apply_sudoers:oper".to_owned()));
+        assert_eq!(
+            p.tracked_backups,
+            vec![PathBuf::from("/etc/sudoers.d/census-oper")]
+        );
+    }
+
     #[test]
     fn write_registry_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("managed.toml");
-        let set = vec![managed("oper", 9010, &["wheel"], 5)];
+        let mut sudo_acct = managed("oper", 9010, &["wheel"], 5);
+        sudo_acct.sudo_role = Some("ops".to_owned());
+        let set = vec![sudo_acct, managed("plain", 9011, &[], 5)];
         write_registry(&path, &set).unwrap();
         let reloaded = crate::state::RegistryState::load(&path).unwrap();
         let accts = reloaded.managed_accounts();
         assert_eq!(accts["oper"].uid, 9010);
         assert_eq!(accts["oper"].from_version, 5);
+        // sudo_role must survive the registry roundtrip (the privilege-retention fix).
+        assert_eq!(accts["oper"].sudo_role.as_deref(), Some("ops"));
+        assert_eq!(accts["plain"].sudo_role, None);
     }
 }

@@ -21,6 +21,11 @@ pub struct ManagedAccount {
     /// Recorded groups.
     #[serde(default)]
     pub groups: Vec<String>,
+    /// Recorded sudo role grant, if any. `None` means the account has no
+    /// Census-owned sudoers fragment. Persisted so a sudo-only grant/revocation
+    /// is visible to the plan diff (otherwise a revoked fragment leaks).
+    #[serde(default)]
+    pub sudo_role: Option<String>,
     /// Declaration `version` this account was created/updated from.
     pub from_version: u32,
 }

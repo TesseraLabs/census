@@ -112,8 +112,9 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
     };
 
     // Real provisioner over the auth-DB backup. The managed snapshot lets the
-    // provisioner detect a UID change on update.
-    // INTEGRATION (task 7): before snapshot(), call backup.add_file() for each touched /etc/sudoers.d/census-<role> when sudoers writing lands, else a sudoers write won't roll back (spec R2).
+    // provisioner detect a UID change on update. Touched sudoers fragments are
+    // registered into this backup by the orchestrator (via the provisioner)
+    // before the snapshot, so a later-phase failure rolls them back too (R2).
     let mut backup = Backup::new(BackupTargets::auth_db_default(), opts.rollback_root.clone());
     let managed_now = state.managed_accounts();
 
@@ -127,6 +128,7 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
             rescue_present: false,
             risk_acknowledged: opts.risk_acknowledged,
         },
+        sudoers_dir: PathBuf::from(crate::sudoers::SUDOERS_DIR),
     };
 
     // Scope the provisioner so its mutable borrow of `backup` ends before we

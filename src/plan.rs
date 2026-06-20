@@ -64,6 +64,9 @@ fn diff_fields(target: &ResolvedAccount, current: &ManagedAccount) -> Vec<String
     if tg != cg {
         changes.push(format!("groups {:?} -> {:?}", current.groups, target.groups));
     }
+    if target.sudo_role != current.sudo_role {
+        changes.push(format!("sudo {:?} -> {:?}", current.sudo_role, target.sudo_role));
+    }
     changes
 }
 
@@ -128,8 +131,36 @@ mod tests {
             uid,
             shell: shell.to_owned(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
+            sudo_role: None,
             from_version: v,
         }
+    }
+
+    /// Resolved target carrying a sudo_role (other fields match `target`).
+    fn target_sudo(
+        name: &str,
+        uid: u32,
+        shell: &str,
+        groups: &[&str],
+        sudo_role: Option<&str>,
+    ) -> ResolvedAccount {
+        let mut t = target(name, uid, shell, groups);
+        t.sudo_role = sudo_role.map(|s| s.to_owned());
+        t
+    }
+
+    /// Managed record carrying a sudo_role (other fields match `managed`).
+    fn managed_sudo(
+        name: &str,
+        uid: u32,
+        shell: &str,
+        groups: &[&str],
+        sudo_role: Option<&str>,
+        v: u32,
+    ) -> ManagedAccount {
+        let mut m = managed(name, uid, shell, groups, v);
+        m.sudo_role = sudo_role.map(|s| s.to_owned());
+        m
     }
 
     fn state_of(accts: Vec<ManagedAccount>) -> FakeState {
@@ -187,6 +218,67 @@ mod tests {
         let plan = diff(&targets, &st);
         assert_eq!(plan.actions, vec![Action::Delete { name: "oper".into() }]);
         assert!(plan.actions[0].is_destructive());
+    }
+
+    #[test]
+    fn sudo_revocation_yields_update_even_with_no_other_change() {
+        // Managed account has sudo; target drops it. No other field differs.
+        let targets = vec![target_sudo("oper", 9010, "/bin/bash", &["wheel"], None)];
+        let st = state_of(vec![managed_sudo(
+            "oper",
+            9010,
+            "/bin/bash",
+            &["wheel"],
+            Some("ops"),
+            3,
+        )]);
+        let plan = diff(&targets, &st);
+        assert_eq!(plan.actions.len(), 1, "sudo revocation must produce one action");
+        match &plan.actions[0] {
+            Action::Update { changes, .. } => {
+                assert_eq!(changes.len(), 1, "only the sudo field should differ");
+                assert!(changes[0].contains("sudo"), "change must mention sudo: {changes:?}");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sudo_grant_yields_update_even_with_no_other_change() {
+        // Reverse: managed has no sudo, target gains it.
+        let targets = vec![target_sudo("oper", 9010, "/bin/bash", &["wheel"], Some("ops"))];
+        let st = state_of(vec![managed_sudo(
+            "oper",
+            9010,
+            "/bin/bash",
+            &["wheel"],
+            None,
+            3,
+        )]);
+        let plan = diff(&targets, &st);
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            Action::Update { changes, .. } => {
+                assert_eq!(changes.len(), 1);
+                assert!(changes[0].contains("sudo"), "change must mention sudo: {changes:?}");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identical_sudo_role_is_idempotent() {
+        let targets = vec![target_sudo("oper", 9010, "/bin/bash", &["wheel"], Some("ops"))];
+        let st = state_of(vec![managed_sudo(
+            "oper",
+            9010,
+            "/bin/bash",
+            &["wheel"],
+            Some("ops"),
+            3,
+        )]);
+        let plan = diff(&targets, &st);
+        assert!(plan.is_empty(), "identical sudo_role must produce no actions");
     }
 
     #[test]

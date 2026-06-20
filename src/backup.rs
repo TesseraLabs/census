@@ -98,6 +98,13 @@ impl Backup {
         self.snapshot_dir.is_some()
     }
 
+    /// Add a touched file (e.g. a `census-<role>` sudoers fragment) to the
+    /// snapshot target set, deduplicated. Must be called BEFORE [`Backup::snapshot`]
+    /// — files added after a snapshot is taken are not captured by it.
+    pub fn add_file(&mut self, path: PathBuf) {
+        self.targets.add_file(path);
+    }
+
     /// Snapshot every existing target file. Missing files are skipped (they
     /// must be absent again after restore — recorded so restore can remove a
     /// file that the mutation may have created). The snapshot dir is created

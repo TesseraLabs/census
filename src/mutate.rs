@@ -78,6 +78,12 @@ pub enum ProvisionError {
     Sudoers(String),
 }
 
+impl From<crate::sudoers::SudoersError> for ProvisionError {
+    fn from(e: crate::sudoers::SudoersError) -> Self {
+        ProvisionError::Sudoers(e.to_string())
+    }
+}
+
 /// Build the ordered argv list to **create** a role account.
 ///
 /// `useradd -u <uid> -m -d <home> -s <shell>` (NO `-c`: Astra GECOS quirk),
@@ -196,6 +202,18 @@ pub trait Provisioner {
         -> Result<(), ProvisionError>;
     /// Delete a managed account by name.
     fn delete(&mut self, name: &str) -> Result<(), ProvisionError>;
+    /// Materialize (or clear) the sudoers fragment for an account: if the
+    /// account carries a sudo right ([`crate::sudoers::build_sudoers_content`]
+    /// yields `Some`), write & validate `census-<role>`; otherwise ensure the
+    /// fragment does not exist (a role that dropped sudo must lose its file).
+    fn apply_sudoers(&mut self, acct: &ResolvedAccount) -> Result<(), ProvisionError>;
+    /// Remove the `census-<name>` sudoers fragment for a deleted role
+    /// (idempotent: absent fragment is success).
+    fn remove_sudoers(&mut self, name: &str) -> Result<(), ProvisionError>;
+    /// Register a sudoers fragment path in the pre-mutation backup set, so a
+    /// later-phase failure rolls the fragment back too (spec R2). Called by the
+    /// orchestrator for every touched fragment BEFORE [`Provisioner::snapshot`].
+    fn track_sudoers_backup(&mut self, path: std::path::PathBuf);
     /// Snapshot auth DB + touched sudoers files before mutation.
     fn snapshot(&mut self) -> Result<(), ProvisionError>;
     /// Restore from the snapshot taken by [`Provisioner::snapshot`].
@@ -210,15 +228,37 @@ pub trait Provisioner {
 pub struct ShadowUtilsProvisioner<'a> {
     managed: std::collections::BTreeMap<String, ManagedAccount>,
     backup: &'a mut crate::backup::Backup,
+    /// Directory the role sudoers fragments live in. Defaults to
+    /// [`crate::sudoers::SUDOERS_DIR`]; injectable for tests/containers.
+    sudoers_dir: std::path::PathBuf,
 }
 
 impl<'a> ShadowUtilsProvisioner<'a> {
-    /// Build a real provisioner over the current managed snapshot and a backup.
+    /// Build a real provisioner over the current managed snapshot and a backup,
+    /// writing sudoers fragments under the production `/etc/sudoers.d`.
     pub fn new(
         managed: std::collections::BTreeMap<String, ManagedAccount>,
         backup: &'a mut crate::backup::Backup,
     ) -> Self {
-        ShadowUtilsProvisioner { managed, backup }
+        Self::with_sudoers_dir(
+            managed,
+            backup,
+            std::path::PathBuf::from(crate::sudoers::SUDOERS_DIR),
+        )
+    }
+
+    /// Build a real provisioner with an explicit sudoers directory (tests /
+    /// containers inject a writable temp dir).
+    pub fn with_sudoers_dir(
+        managed: std::collections::BTreeMap<String, ManagedAccount>,
+        backup: &'a mut crate::backup::Backup,
+        sudoers_dir: std::path::PathBuf,
+    ) -> Self {
+        ShadowUtilsProvisioner {
+            managed,
+            backup,
+            sudoers_dir,
+        }
     }
 
     /// Run one argv command, mapping non-zero exit / spawn failure to errors.
@@ -277,6 +317,28 @@ impl Provisioner for ShadowUtilsProvisioner<'_> {
         Self::run_all(&build_delete_argv(name))
     }
 
+    fn apply_sudoers(&mut self, acct: &ResolvedAccount) -> Result<(), ProvisionError> {
+        match crate::sudoers::build_sudoers_content(acct) {
+            Some(content) => {
+                crate::sudoers::write_sudoers(&self.sudoers_dir, &acct.name, &content)?;
+            }
+            None => {
+                // No sudo right → the fragment must not exist (drop-to-none).
+                crate::sudoers::remove_sudoers(&self.sudoers_dir, &acct.name)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_sudoers(&mut self, name: &str) -> Result<(), ProvisionError> {
+        crate::sudoers::remove_sudoers(&self.sudoers_dir, name)?;
+        Ok(())
+    }
+
+    fn track_sudoers_backup(&mut self, path: std::path::PathBuf) {
+        self.backup.add_file(path);
+    }
+
     fn snapshot(&mut self) -> Result<(), ProvisionError> {
         self.backup
             .snapshot()
@@ -315,6 +377,7 @@ mod tests {
             uid,
             shell: shell.to_owned(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
+            sudo_role: None,
             from_version: 1,
         }
     }

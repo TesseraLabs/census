@@ -9,10 +9,197 @@
 //! Census never edits foreign sudoers files — only `census-*`.
 
 use crate::model::ResolvedAccount;
+use std::path::{Path, PathBuf};
+
+/// Default directory Census owns role sudoers fragments in. Injectable as a
+/// parameter so tests/containers can point at a writable temp dir.
+pub const SUDOERS_DIR: &str = "/etc/sudoers.d";
 
 /// Filename (basename) Census owns for a role's sudoers fragment.
 pub fn sudoers_filename(role: &str) -> String {
     format!("census-{role}")
+}
+
+/// Errors raised while materializing or removing a role sudoers fragment.
+#[derive(Debug, thiserror::Error)]
+pub enum SudoersError {
+    /// Could not write the temporary fragment before validation.
+    #[error("cannot write temp sudoers file {path}: {reason}")]
+    WriteTemp {
+        /// Temp file path.
+        path: PathBuf,
+        /// OS error.
+        reason: String,
+    },
+    /// Could not set the 0440 mode on the temp fragment.
+    #[error("cannot set mode on temp sudoers file {path}: {reason}")]
+    Mode {
+        /// Temp file path.
+        path: PathBuf,
+        /// OS error.
+        reason: String,
+    },
+    /// `visudo -c` could not be spawned.
+    #[error("cannot run visudo: {reason}")]
+    VisudoSpawn {
+        /// OS error.
+        reason: String,
+    },
+    /// `visudo -c -f <temp>` rejected the generated fragment. The temp file has
+    /// been removed; the live fragment is NOT activated.
+    #[error("visudo -c rejected sudoers fragment for role {role}: {stderr}")]
+    VisudoRejected {
+        /// Role whose fragment failed validation.
+        role: String,
+        /// Captured visudo stderr (trimmed).
+        stderr: String,
+    },
+    /// The validated temp fragment could not be atomically renamed into place.
+    #[error("cannot activate sudoers fragment {dest}: {reason}")]
+    Activate {
+        /// Destination path.
+        dest: PathBuf,
+        /// OS error.
+        reason: String,
+    },
+    /// An existing live fragment could not be removed.
+    #[error("cannot remove sudoers fragment {path}: {reason}")]
+    Remove {
+        /// Fragment path.
+        path: PathBuf,
+        /// OS error.
+        reason: String,
+    },
+}
+
+/// Absolute path of the live fragment Census owns for `role` under `dir`.
+pub fn sudoers_path(dir: &Path, role: &str) -> PathBuf {
+    dir.join(sudoers_filename(role))
+}
+
+/// Materialize a role sudoers fragment: write `content` to a temp file in `dir`,
+/// validate it with `visudo -c -f <temp>`, and only on success atomically rename
+/// it into `<dir>/census-<role>`. The file is `0440` (sudoers convention) before
+/// activation. On `visudo -c` failure the temp file is removed and the live
+/// fragment is left untouched (never activated). Atomic: a partial/invalid file
+/// is never visible at the canonical path.
+pub fn write_sudoers(dir: &Path, role: &str, content: &str) -> Result<(), SudoersError> {
+    let tmp = dir.join(format!(".census-{role}.tmp"));
+
+    // Write the candidate fragment via O_EXCL (`create_new`): the open fails if
+    // the path already exists, so a pre-planted symlink at this temp path cannot
+    // redirect our write to an attacker-chosen file. A leftover temp from a
+    // killed run is benign — remove it once and retry, then give up.
+    let mut handle = match open_excl(&tmp) {
+        Ok(h) => h,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Stale temp from a previous run: clear it and retry exactly once.
+            let _ = std::fs::remove_file(&tmp);
+            open_excl(&tmp).map_err(|e| SudoersError::WriteTemp {
+                path: tmp.clone(),
+                reason: e.to_string(),
+            })?
+        }
+        Err(e) => {
+            return Err(SudoersError::WriteTemp {
+                path: tmp.clone(),
+                reason: e.to_string(),
+            });
+        }
+    };
+    {
+        use std::io::Write as _;
+        if let Err(e) = handle.write_all(content.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(SudoersError::WriteTemp {
+                path: tmp.clone(),
+                reason: e.to_string(),
+            });
+        }
+    }
+    drop(handle);
+
+    // sudoers fragments must be 0440 or visudo/sudo refuse them.
+    if let Err(e) = set_mode_0440(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Validate the fragment in isolation (-f points visudo at the temp file).
+    let output = std::process::Command::new("visudo")
+        .arg("-c")
+        .arg("-f")
+        .arg(&tmp)
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(SudoersError::VisudoSpawn {
+                reason: e.to_string(),
+            });
+        }
+    };
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SudoersError::VisudoRejected {
+            role: role.to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    // Atomic activation: rename the validated temp over the canonical path.
+    let dest = sudoers_path(dir, role);
+    std::fs::rename(&tmp, &dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        SudoersError::Activate {
+            dest: dest.clone(),
+            reason: e.to_string(),
+        }
+    })
+}
+
+/// Remove the role sudoers fragment Census owns under `dir`. Idempotent: an
+/// absent fragment is success (a role that lost its sudo right, or was never
+/// granted one, must have no fragment).
+pub fn remove_sudoers(dir: &Path, role: &str) -> Result<(), SudoersError> {
+    let path = sudoers_path(dir, role);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SudoersError::Remove {
+            path,
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Create the temp file with O_EXCL semantics: fails with `AlreadyExists` if
+/// the path is already present (including a symlink), so we never follow a
+/// pre-planted link to clobber an arbitrary file.
+fn open_excl(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn set_mode_0440(path: &Path) -> Result<(), SudoersError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o440)).map_err(|e| {
+        SudoersError::Mode {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn set_mode_0440(_path: &Path) -> Result<(), SudoersError> {
+    // sudoers is a Unix concept; on non-unix this is a no-op (apply only runs on
+    // Linux as root). Kept compilable for cross-platform `cargo test`.
+    Ok(())
 }
 
 /// Build the sudoers.d file content for an account, or `None` if the role
@@ -99,5 +286,89 @@ mod tests {
     fn census_owns_only_prefixed_files() {
         assert_eq!(sudoers_filename("oper"), "census-oper");
         assert!(sudoers_filename("oper").starts_with("census-"));
+    }
+
+    #[test]
+    fn remove_sudoers_is_ok_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file present → idempotent success.
+        remove_sudoers(dir.path(), "oper").unwrap();
+        assert!(!sudoers_path(dir.path(), "oper").exists());
+    }
+
+    #[test]
+    fn remove_sudoers_deletes_present_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sudoers_path(dir.path(), "oper");
+        std::fs::write(&path, b"oper ALL=(ALL) CENSUS_OPS\n").unwrap();
+        assert!(path.exists());
+        remove_sudoers(dir.path(), "oper").unwrap();
+        assert!(!path.exists(), "present fragment must be removed");
+    }
+
+    /// Whether `visudo` is on PATH; the write path requires it. Dev machines
+    /// without sudo installed skip the live-write assertions rather than fail.
+    fn visudo_available() -> bool {
+        std::process::Command::new("visudo")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn write_sudoers_validates_and_activates_atomically() {
+        if !visudo_available() {
+            eprintln!("skipping write_sudoers test: visudo not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            build_sudoers_content(&acct("oper", Some("ops"))).expect("sudo role yields content");
+        write_sudoers(dir.path(), "oper", &content).unwrap();
+        let dest = sudoers_path(dir.path(), "oper");
+        assert!(dest.exists(), "validated fragment must be activated");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), content);
+        // No temp file left behind.
+        assert!(!dir.path().join(".census-oper.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_sudoers_refuses_to_follow_a_preplanted_symlink() {
+        // A symlink squatting at the temp path must not redirect our write.
+        // O_EXCL fails (AlreadyExists for a symlink) — but a stale REGULAR temp
+        // is benign and cleared. Here we plant a symlink to a sentinel target
+        // and assert the sentinel is never written through.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"original\n").unwrap();
+        let tmp = dir.path().join(".census-oper.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        // create_new on a symlink path returns AlreadyExists; remove_file removes
+        // the symlink (not its target) and the retry writes a fresh regular file.
+        let err = open_excl(&tmp).expect_err("symlink must trip O_EXCL");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Victim is untouched by the failed exclusive open.
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn write_sudoers_rejects_invalid_fragment_and_does_not_activate() {
+        if !visudo_available() {
+            eprintln!("skipping invalid-fragment test: visudo not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // Syntactically broken sudoers content → visudo -c must reject it.
+        let err = write_sudoers(dir.path(), "oper", "this is not valid sudoers !!!\n")
+            .expect_err("invalid sudoers must be rejected");
+        assert!(matches!(err, SudoersError::VisudoRejected { .. }));
+        assert!(
+            !sudoers_path(dir.path(), "oper").exists(),
+            "invalid fragment must NOT be activated"
+        );
+        assert!(!dir.path().join(".census-oper.tmp").exists(), "temp must be cleaned up");
     }
 }
