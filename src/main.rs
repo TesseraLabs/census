@@ -50,6 +50,8 @@ fn main() -> std::process::ExitCode {
             trust_fs,
             risk_acknowledged: i_understand_no_rescue,
             rollback_root: std::path::PathBuf::from("/var/lib/census/rollback"),
+            trust_anchor_path: std::path::PathBuf::from(census::trust::DEFAULT_TRUST_ANCHOR),
+            persist_dir: std::path::PathBuf::from(census::trust::DEFAULT_PERSIST_DIR),
         }),
     }
 }

@@ -48,6 +48,13 @@ pub struct Declaration {
     /// Role accounts (TOML `[[role_account]]`).
     #[serde(default, rename = "role_account")]
     pub role_accounts: Vec<RoleAccount>,
+    /// Detached Ed25519 signature over the declaration bytes minus this line
+    /// (hex of 64 bytes). Present in managed mode; absent under `--trust-fs`.
+    /// The field exists so the strict (`deny_unknown_fields`) parser accepts a
+    /// `signature = "..."` line — verification operates on RAW bytes via
+    /// `trust::signed_payload`, not on this parsed value.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 /// Errors from parsing or validating a declaration.
@@ -265,6 +272,21 @@ uid = 9020
                 "role id {good:?} must pass"
             );
         }
+    }
+
+    #[test]
+    fn signature_line_accepted_by_strict_parser() {
+        // deny_unknown_fields must not reject a `signature = "..."` line. As a
+        // top-level scalar key it must precede any `[table]` header.
+        let doc = "version = 12\nrole_store = \"/r\"\nsignature = \"abcdef\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n";
+        let d = Declaration::parse(doc).unwrap();
+        assert_eq!(d.signature.as_deref(), Some("abcdef"));
+    }
+
+    #[test]
+    fn absent_signature_defaults_to_none() {
+        let d = Declaration::parse(SAMPLE).unwrap();
+        assert_eq!(d.signature, None);
     }
 
     #[test]

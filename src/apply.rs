@@ -16,7 +16,7 @@ use crate::declaration::Declaration;
 use crate::mutate::{Provisioner, ProvisionError};
 use crate::plan::{self, Action};
 use crate::state::{ManagedAccount, SystemState};
-use crate::trust::{self, TrustOptions};
+use crate::trust::{self, TrustMode, TrustOptions};
 use std::path::{Path, PathBuf};
 
 /// Errors that abort apply (each maps to a non-zero exit upstream).
@@ -71,9 +71,12 @@ pub type LogLine = String;
 pub struct ApplyInputs<'a> {
     /// Parsed, schema-valid declaration.
     pub declaration: &'a Declaration,
+    /// Raw declaration bytes (for managed-mode signature canonicalization). The
+    /// signature covers these bytes with the `signature` line removed.
+    pub declaration_bytes: &'a [u8],
     /// Current managed state (registry-backed in production).
     pub state: &'a dyn SystemState,
-    /// Trust options (`--trust-fs`).
+    /// Trust options (`--trust-fs`, trust-anchor path, anti-rollback persist dir).
     pub trust: TrustOptions,
     /// Anti-lockout context (`rescue_present`, `--i-understand-no-rescue`).
     pub lockout: crate::lockout::LockoutContext,
@@ -98,6 +101,10 @@ pub struct ApplyReport {
     /// set, so a byte-identical rewrite would only bump mtime (spec R8: zero
     /// mutations means zero on-disk changes).
     pub registry_written: bool,
+    /// The trust mode this apply ran under. The caller persists the
+    /// anti-rollback version floor (only) when this is
+    /// [`TrustMode::Managed`] AND the apply succeeded; standalone never persists.
+    pub trust_mode: TrustMode,
 }
 
 /// Run the apply orchestration over a provisioner. This is the unit-testable
@@ -113,12 +120,15 @@ pub fn run(
 ) -> Result<ApplyReport, ApplyError> {
     let mut log = Vec::new();
 
-    // 1. Trust (fail-closed) — before any state read or mutation.
-    let decision = trust::verify_trust(inputs.declaration, inputs.trust)?;
+    // 1. Trust (fail-closed) — before any state read or mutation. Operates on
+    // the RAW declaration bytes so managed mode can canonicalize the signature.
+    let decision =
+        trust::verify_trust(inputs.declaration, inputs.declaration_bytes, &inputs.trust)?;
     log.push(decision.reason().to_owned());
-    if !decision.is_trusted() {
-        return Err(ApplyError::NotTrusted(decision.reason().to_owned()));
-    }
+    let trust_mode = match decision.mode() {
+        Some(mode) => mode.clone(),
+        None => return Err(ApplyError::NotTrusted(decision.reason().to_owned())),
+    };
 
     // 2-3. Resolve targets (slice-1).
     let targets = crate::model::resolve(inputs.declaration)
@@ -143,6 +153,7 @@ pub fn run(
             log,
             mutations: 0,
             registry_written: false,
+            trust_mode,
         });
     }
 
@@ -212,6 +223,7 @@ pub fn run(
         log,
         mutations,
         registry_written: true,
+        trust_mode,
     })
 }
 
@@ -420,6 +432,7 @@ mod tests {
         let err = run(
             ApplyInputs {
                 declaration: &d,
+                declaration_bytes: b"",
                 state: &st,
                 trust: TrustOptions::default(), // no --trust-fs
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
@@ -428,7 +441,15 @@ mod tests {
             &mut p,
         )
         .unwrap_err();
-        assert!(matches!(err, ApplyError::NotTrusted(_)));
+        // Managed mode with no signature fails closed (missing signature) before
+        // any snapshot or mutation.
+        assert!(
+            matches!(
+                err,
+                ApplyError::Trust(trust::TrustError::MissingSignature) | ApplyError::NotTrusted(_)
+            ),
+            "expected fail-closed trust error, got {err:?}"
+        );
         assert!(!p.snapshotted, "no snapshot before trust passes");
         assert!(p.calls.is_empty(), "no mutations on untrusted declaration");
     }
@@ -441,8 +462,9 @@ mod tests {
         let report = run(
             ApplyInputs {
                 declaration: &d,
+                declaration_bytes: b"",
                 state: &st,
-                trust: TrustOptions { trust_fs: true },
+                trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
@@ -467,8 +489,9 @@ mod tests {
         let err = run(
             ApplyInputs {
                 declaration: &d,
+                declaration_bytes: b"",
                 state: &st,
-                trust: TrustOptions { trust_fs: true },
+                trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
@@ -494,8 +517,9 @@ mod tests {
         let report = run(
             ApplyInputs {
                 declaration: &d,
+                declaration_bytes: b"",
                 state: &st,
-                trust: TrustOptions { trust_fs: true },
+                trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
@@ -524,8 +548,9 @@ mod tests {
         let err = run(
             ApplyInputs {
                 declaration: &d,
+                declaration_bytes: b"",
                 state: &st,
-                trust: TrustOptions { trust_fs: true },
+                trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(), // no rescue, no risk-ack
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
@@ -561,8 +586,9 @@ mod tests {
         let report = run(
             ApplyInputs {
                 declaration: &d,
+                declaration_bytes: b"",
                 state: &st,
-                trust: TrustOptions { trust_fs: true },
+                trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
@@ -602,8 +628,9 @@ mod tests {
         let report = run(
             ApplyInputs {
                 declaration: &d,
+                declaration_bytes: b"",
                 state: &st,
-                trust: TrustOptions { trust_fs: true },
+                trust: TrustOptions { trust_fs: true, ..Default::default() },
                 // Rescue present so the delete-only plan passes the lockout gate.
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -634,8 +661,9 @@ mod tests {
         let err = run(
             ApplyInputs {
                 declaration: &d,
+                declaration_bytes: b"",
                 state: &st,
-                trust: TrustOptions { trust_fs: true },
+                trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             },
@@ -676,5 +704,146 @@ mod tests {
         // sudo_role must survive the registry roundtrip (the privilege-retention fix).
         assert_eq!(accts["oper"].sudo_role.as_deref(), Some("ops"));
         assert_eq!(accts["plain"].sudo_role, None);
+    }
+
+    // ---- managed-mode integration (task 4.4) ----
+
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Build a managed (signed) declaration that creates one role-account, plus
+    /// a pinned trust-anchor file. Returns (tempdir, raw bytes, parsed decl,
+    /// anchor path). The signature covers the doc minus the `signature` line.
+    fn signed_managed(
+        sk: &SigningKey,
+        version: u32,
+        role: &str,
+        uid: u32,
+    ) -> (tempfile::TempDir, String, Declaration, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{role}.toml")),
+            format!("role = \"{role}\"\nversion = 1\nos = \"linux\"\nname = \"X\"\nlevel = 0\n[payload]\ngroups = [\"wheel\"]\n"),
+        )
+        .unwrap();
+        let store = tmp.path().display().to_string();
+        // signature line precedes the [defaults] table (TOML top-level key).
+        let head = format!("version = {version}\nrole_store = \"{store}\"\n");
+        let tail = format!(
+            "[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+        );
+        let payload = format!("{head}{tail}");
+        let sig_hex = hex::encode(sk.sign(payload.as_bytes()).to_bytes());
+        let full = format!("{head}signature = \"{sig_hex}\"\n{tail}");
+        let decl = Declaration::parse(&full).unwrap();
+        let anchor = tmp.path().join("trust.pub");
+        std::fs::write(&anchor, hex::encode(sk.verifying_key().to_bytes())).unwrap();
+        (tmp, full, decl, anchor)
+    }
+
+    fn managed_opts(anchor: PathBuf, persist: PathBuf) -> TrustOptions {
+        TrustOptions { trust_fs: false, trust_anchor_path: anchor, persist_dir: persist }
+    }
+
+    #[test]
+    fn managed_without_signature_refuses_before_snapshot() {
+        // Managed mode, declaration has no signature line → fail-closed.
+        let (_t, d) = decl("oper", 9010);
+        let st = fake_state(vec![]);
+        let mut p = FakeProvisioner::default();
+        let persist = tempfile::tempdir().unwrap();
+        let err = run(
+            ApplyInputs {
+                declaration: &d,
+                declaration_bytes: b"version = 5\n", // no signature line
+                state: &st,
+                trust: managed_opts(PathBuf::from("/nonexistent.pub"), persist.path().to_path_buf()),
+                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            },
+            &mut p,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApplyError::Trust(trust::TrustError::MissingSignature)));
+        assert!(!p.snapshotted, "managed-no-signature must refuse before snapshot");
+        assert!(p.calls.is_empty(), "no mutations");
+    }
+
+    #[test]
+    fn managed_valid_signature_runs_and_reports_managed_mode() {
+        let sk = SigningKey::from_bytes(&[11u8; 32]);
+        let persist = tempfile::tempdir().unwrap();
+        let (_t, raw, d, anchor) = signed_managed(&sk, 5, "oper", 9010);
+        let st = fake_state(vec![]);
+        let mut p = FakeProvisioner::default();
+        let report = run(
+            ApplyInputs {
+                declaration: &d,
+                declaration_bytes: raw.as_bytes(),
+                state: &st,
+                trust: managed_opts(anchor, persist.path().to_path_buf()),
+                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            },
+            &mut p,
+        )
+        .unwrap();
+        assert!(p.snapshotted);
+        assert_eq!(report.mutations, 1);
+        assert_eq!(report.trust_mode, TrustMode::Managed { version: 5 });
+    }
+
+    #[test]
+    fn managed_replayed_lower_version_refuses_before_snapshot() {
+        let sk = SigningKey::from_bytes(&[11u8; 32]);
+        let persist = tempfile::tempdir().unwrap();
+        // Persist a higher floor than the declaration version.
+        trust::persist_version(persist.path(), 9).unwrap();
+        let (_t, raw, d, anchor) = signed_managed(&sk, 5, "oper", 9010);
+        let st = fake_state(vec![]);
+        let mut p = FakeProvisioner::default();
+        let err = run(
+            ApplyInputs {
+                declaration: &d,
+                declaration_bytes: raw.as_bytes(),
+                state: &st,
+                trust: managed_opts(anchor, persist.path().to_path_buf()),
+                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            },
+            &mut p,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::Trust(trust::TrustError::Rollback { got: 5, floor: 9 })
+        ));
+        assert!(!p.snapshotted, "anti-rollback must refuse before snapshot");
+        assert!(p.calls.is_empty());
+    }
+
+    #[test]
+    fn managed_phase_failure_returns_err_so_caller_skips_persist() {
+        // The caller (cli) only persists on Ok; a phase failure yields Err and the
+        // persisted floor stays untouched.
+        let sk = SigningKey::from_bytes(&[11u8; 32]);
+        let persist = tempfile::tempdir().unwrap();
+        let (_t, raw, d, anchor) = signed_managed(&sk, 5, "oper", 9010);
+        let st = fake_state(vec![]);
+        let mut p = FakeProvisioner::failing("create");
+        let err = run(
+            ApplyInputs {
+                declaration: &d,
+                declaration_bytes: raw.as_bytes(),
+                state: &st,
+                trust: managed_opts(anchor, persist.path().to_path_buf()),
+                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            },
+            &mut p,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApplyError::Phase { .. }));
+        // Floor was never persisted by `run` (persist is the caller's job, only on Ok).
+        assert_eq!(trust::last_applied_version(persist.path()).unwrap(), None);
     }
 }

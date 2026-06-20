@@ -122,5 +122,64 @@ echo "== scenario 5: UNREACHABILITY (non-root su into oper) =="
 id probe >/dev/null 2>&1 || useradd -m -s /bin/bash probe
 assert_not "non-root su - oper succeeds"   "su probe -c 'su - oper -c true' >/dev/null 2>&1"
 
+echo "== scenario 6-8: MANAGED trust (Ed25519 signature, openssl-signed → dalek-verified) =="
+# Proves cross-impl interop: openssl signs, census (ed25519-dalek) verifies.
+MROOT="$ROOT/m"; MSTORE="$MROOT/roles"; MMAN="$MROOT/managed.toml"
+mkdir -p "$MSTORE" /etc/census /var/lib/census
+rm -f /var/lib/census/declaration.version
+cat > "$MSTORE/audit.toml" <<EOF
+role = "audit"
+version = 1
+os = "linux"
+name = "Audit"
+level = 1
+[payload]
+groups = ["staff"]
+EOF
+openssl genpkey -algorithm ed25519 -out "$MROOT/priv.pem" 2>/dev/null
+# trust-anchor = hex of the 32-byte raw Ed25519 public key (last 32 bytes of SPKI DER)
+openssl pkey -in "$MROOT/priv.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | od -An -tx1 | tr -d ' \n' > /etc/census/trust.pub
+
+build_unsigned() { # $1=outfile $2=version
+  cat > "$1" <<EOF
+version = $2
+role_store = "$MSTORE"
+[defaults]
+uid_range = [9000, 9999]
+shell = "/bin/bash"
+home_base = "/var/lib/census/home"
+[[role_account]]
+role = "audit"
+uid = 9030
+EOF
+}
+sign_decl() { # $1=unsigned-in $2=signed-out ; signs raw bytes; signature line is PREPENDED
+  # as a top-level key (before any [table]) so it stays valid TOML and census strips
+  # this first line back to the exact signed bytes.
+  local sig; openssl pkeyutl -sign -inkey "$MROOT/priv.pem" -rawin -in "$1" -out "$MROOT/sig.bin" 2>/dev/null
+  sig=$(od -An -tx1 "$MROOT/sig.bin" | tr -d ' \n')
+  { printf 'signature = "%s"\n' "$sig"; cat "$1"; } > "$2"
+}
+apply_managed() { "$CENSUS" apply --declaration "$1" --managed "$MMAN" --i-understand-no-rescue 2>&1; }
+
+echo "-- 6: valid signed declaration (no --trust-fs) applies --"
+build_unsigned "$MROOT/d10" 10
+sign_decl "$MROOT/d10" "$MROOT/d10.signed"
+out6="$(apply_managed "$MROOT/d10.signed")"; echo ":: $out6"
+assert     "signed managed apply creates audit"  "getent passwd audit >/dev/null"
+assert     "persisted version is 10"             "[ \"\$(cat /var/lib/census/declaration.version)\" = 10 ]"
+
+echo "-- 7: unsigned declaration without --trust-fs is refused --"
+out7="$(apply_managed "$MROOT/d10" 2>&1)"; rc7=$?
+assert     "unsigned managed apply fails"        "[ $rc7 -ne 0 ]"
+assert     "unsigned apply names missing sig"    "echo \"\$out7\" | grep -qiE 'signature|trust|refus|error'"
+
+echo "-- 8: rollback (lower version, validly signed) is refused --"
+build_unsigned "$MROOT/d5" 5
+sign_decl "$MROOT/d5" "$MROOT/d5.signed"
+out8="$(apply_managed "$MROOT/d5.signed" 2>&1)"; rc8=$?
+assert     "rollback to version 5 fails"         "[ $rc8 -ne 0 ]"
+assert     "persisted version still 10"          "[ \"\$(cat /var/lib/census/declaration.version)\" = 10 ]"
+
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]
