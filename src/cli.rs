@@ -7,6 +7,7 @@ use crate::inspect::LiveInspector;
 use crate::lockout::LockoutContext;
 use crate::model::ResolvedAccount;
 use crate::mutate::ShadowUtilsProvisioner;
+use crate::sessions::LiveSessionSource;
 use crate::state::SystemState;
 use crate::status;
 use crate::trust::{self, TrustMode, TrustOptions};
@@ -125,6 +126,10 @@ pub struct ApplyOpts<'a> {
     /// Directory holding the persisted anti-rollback version floor. Production
     /// default `/var/lib/census`; injectable for tests.
     pub persist_dir: PathBuf,
+    /// Path to Tessera's live-session registry (§12). Production default
+    /// `/run/tessera/sessions.json`; injectable for tests. A delete over an
+    /// account with a live session is deferred (not executed).
+    pub sessions_file: PathBuf,
 }
 
 /// Run `census apply`: verify trust → resolve → diff → lockout gate → snapshot
@@ -163,6 +168,7 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
     let mut backup = Backup::new(BackupTargets::auth_db_default(), opts.rollback_root.clone());
     let managed_now = state.managed_accounts();
     let inspector = LiveInspector::new();
+    let session_source = LiveSessionSource::new(opts.sessions_file.clone());
 
     let inputs = ApplyInputs {
         declaration: &decl,
@@ -181,6 +187,8 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
             risk_acknowledged: opts.risk_acknowledged,
         },
         sudoers_dir: PathBuf::from(crate::sudoers::SUDOERS_DIR),
+        session_source: &session_source,
+        sessions_file: opts.sessions_file.clone(),
     };
 
     // Scope the provisioner so its mutable borrow of `backup` ends before we
@@ -217,8 +225,31 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
                 }
             }
             backup.commit_success();
-            println!("applied: {} mutation(s)", report.mutations);
-            ExitCode::SUCCESS
+            // A deferred delete (live session present, §12) is a PARTIAL apply:
+            // the applied part and the registry update (with the deferred account
+            // retained) are committed above, but the destructive step did not
+            // complete. Signal that with a distinct non-zero exit so CI/monitoring
+            // sees the unfinished destructive work and a later run can complete it.
+            if !report.deferred_deletes.is_empty() {
+                let names: Vec<&str> = report
+                    .deferred_deletes
+                    .iter()
+                    .map(|d| d.name.as_str())
+                    .collect();
+                eprintln!(
+                    "census: deferred {} delete(s): {}",
+                    report.deferred_deletes.len(),
+                    names.join(", ")
+                );
+                println!(
+                    "applied: {} mutation(s), {} deferred",
+                    report.mutations,
+                    report.deferred_deletes.len()
+                );
+            } else {
+                println!("applied: {} mutation(s)", report.mutations);
+            }
+            apply_exit_code(report.deferred_deletes.len())
         }
         Err(e) => {
             eprintln!("error: {e}");
@@ -294,6 +325,18 @@ pub fn run_doctor(declaration: Option<&Path>, managed: &Path) -> ExitCode {
     let report = doctor::run_doctor(&state, &inspector, targets.as_deref());
     print!("{}", render_report(&report));
     doctor_exit_code(&report)
+}
+
+/// Map the count of deferred deletes to the apply exit code. Zero deferrals →
+/// `SUCCESS` (0). One or more → exit 3, a "partial apply — retry" signal that is
+/// distinguishable from a phase failure (`FAILURE` == 1). Extracted as a pure
+/// function so the exit-code policy is unit-testable.
+fn apply_exit_code(deferred: usize) -> ExitCode {
+    if deferred == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
+    }
 }
 
 /// Map a doctor report to its process exit code: non-zero iff it has errors.
@@ -386,6 +429,7 @@ mod tests {
             rollback_root: tmp.path().join("rollback"),
             trust_anchor_path: tmp.path().join("trust.pub"),
             persist_dir: tmp.path().to_path_buf(),
+            sessions_file: tmp.path().join("sessions.json"),
         });
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
 
@@ -452,6 +496,7 @@ mod tests {
             rollback_root: tmp.path().join("rollback"),
             trust_anchor_path: anchor,
             persist_dir: tmp.path().to_path_buf(),
+            sessions_file: tmp.path().join("sessions.json"),
         });
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
 
@@ -480,6 +525,7 @@ mod tests {
             rollback_root: tmp.path().join("rollback"),
             trust_anchor_path: anchor,
             persist_dir: tmp.path().to_path_buf(),
+            sessions_file: tmp.path().join("sessions.json"),
         });
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
         // Floor untouched by a refused apply.
@@ -503,6 +549,7 @@ mod tests {
             rollback_root: tmp.path().join("rollback"),
             trust_anchor_path: tmp.path().join("trust.pub"),
             persist_dir: tmp.path().to_path_buf(),
+            sessions_file: tmp.path().join("sessions.json"),
         });
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
         assert_eq!(
@@ -518,6 +565,20 @@ mod tests {
 
     fn finding(sev: Severity) -> Finding {
         Finding { severity: sev, check: "x", target: "t".into(), message: "m".into() }
+    }
+
+    #[test]
+    fn apply_exit_code_maps_deferrals() {
+        // No deferrals → success (0); any deferral → exit 3 (partial — retry),
+        // distinct from a phase failure (FAILURE == 1).
+        assert_eq!(
+            format!("{:?}", apply_exit_code(0)),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            format!("{:?}", apply_exit_code(2)),
+            format!("{:?}", ExitCode::from(3))
+        );
     }
 
     #[test]

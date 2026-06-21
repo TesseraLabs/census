@@ -10,6 +10,7 @@ pub mod model;
 pub mod mutate;
 pub mod plan;
 pub mod rolestore;
+pub mod sessions;
 pub mod state;
 pub mod status;
 pub mod sudoers;
