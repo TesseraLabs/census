@@ -55,6 +55,23 @@ pub enum ApplyError {
     /// fails closed rather than passing the name to `groupadd`.
     #[error(transparent)]
     Declaration(#[from] crate::declaration::DeclarationError),
+    /// The live-session registry is present but unreadable/corrupt, AND the plan
+    /// is destructive (≥1 Delete). We cannot prove no session is live, so we
+    /// fail closed BEFORE snapshot rather than risk tearing down a live session.
+    /// A non-destructive plan is never blocked by this (nothing to defer).
+    #[error("live-session registry unreadable and plan is destructive: {0}")]
+    SessionRegistry(String),
+}
+
+/// A `userdel` that was deferred because the account has a live Tessera session.
+/// Census skips the delete, retains ownership of the account, and reports it so
+/// the caller can signal a partial apply (non-zero exit).
+#[derive(Debug, Clone)]
+pub struct DeferredDelete {
+    /// Role-account name whose deletion was deferred.
+    pub name: String,
+    /// Its UID (from the managed registry).
+    pub uid: u32,
 }
 
 /// Result of attempting a rollback after a phase failure.
@@ -98,6 +115,12 @@ pub struct ApplyInputs<'a> {
     /// injectable for tests). Used to compute the touched fragment paths added
     /// to the backup set before snapshot, and must match the provisioner's dir.
     pub sudoers_dir: PathBuf,
+    /// Live-session source (§12). Consulted before the delete phase to DEFER
+    /// `userdel` for any role-account that currently has a live session.
+    pub session_source: &'a dyn crate::sessions::SessionSource,
+    /// The registry path `session_source` consults — for a log line only (so the
+    /// operator sees which file was read).
+    pub sessions_file: PathBuf,
 }
 
 /// Outcome of a successful apply: the new managed registry contents and the log
@@ -123,6 +146,10 @@ pub struct ApplyReport {
     /// anti-rollback version floor (only) when this is
     /// [`TrustMode::Managed`] AND the apply succeeded; standalone never persists.
     pub trust_mode: TrustMode,
+    /// Deletes deferred because the account has a live session (§12). Empty when
+    /// none were deferred. A non-empty list means the apply is a partial success
+    /// (the caller exits non-zero, distinguishably from a phase failure).
+    pub deferred_deletes: Vec<DeferredDelete>,
 }
 
 /// Run the apply orchestration over a provisioner. This is the unit-testable
@@ -161,12 +188,76 @@ pub fn run(
     // group registry + live system. A GID-pin conflict or managed-group GID
     // drift aborts HERE — before lockout, snapshot, or any mutation (Census
     // never renumbers; design §Безопасность).
-    let required_groups = crate::declaration::required_groups(inputs.declaration, &targets)?;
+    let mut required_groups = crate::declaration::required_groups(inputs.declaration, &targets)?;
     plan.group_actions = plan::diff_groups_via_inspector(
         &required_groups,
         &managed_groups_now,
         inputs.inspector,
     )?;
+
+    // 5c. Live-reconcile (§12): consult Tessera's live-session registry and DEFER
+    // `userdel` for any account with a live session. This runs BEFORE the
+    // anti-lockout gate on purpose: keeping an account (instead of deleting it)
+    // can only ADD login paths, so the gate sees an equal-or-safer plan and can
+    // never falsely trip because of a deferral.
+    //
+    // The read→partition→userdel sequence has a benign TOCTOU: the live set is a
+    // snapshot. If a session ends just AFTER the read, we retain an account that
+    // could have been deleted — at most one extra retain cycle, harmless. The
+    // dangerous direction (a session starting after the read, then its account
+    // torn down) cannot happen here: a Delete present in this plan was already
+    // matched against the snapshot, and Census never kills sessions regardless.
+    let plan_has_delete = plan.actions.iter().any(Action::is_destructive);
+    let live = match inputs.session_source.live() {
+        Ok(live) => live,
+        // Fail-closed only when destructive: an unreadable registry cannot prove
+        // "no live session", so a Delete must not proceed. A non-destructive plan
+        // has nothing to defer, so the read error is irrelevant — ignore it.
+        Err(e) if plan_has_delete => {
+            return Err(ApplyError::SessionRegistry(e.to_string()));
+        }
+        Err(_) => crate::sessions::LiveSessions::default(),
+    };
+    let deferred_deletes = reconcile_live_sessions(&mut plan, &managed_now, &live);
+    for d in &deferred_deletes {
+        log.push(format!(
+            "deferred delete of {} (uid {}): live session present (registry {})",
+            d.name,
+            d.uid,
+            inputs.sessions_file.display()
+        ));
+    }
+
+    // Deferring a `userdel` is not enough: when the declaration drops a role, its
+    // role-derived groups drop from the required set too and can become
+    // `GroupAction::Delete`s. Tearing those groups out from under a still-live
+    // session — supplementary groups, or worse the primary (role-named) group of
+    // the active uid where `groupdel` fails "busy" and rolls back the whole apply
+    // — defeats the partial-success design. So fold each deferred account's groups
+    // back into the required set: drop their pending group-deletes AND retain them
+    // in the registry (carried forward with their prior GID/from_version).
+    let deferred_group_names = deferred_group_names(&deferred_deletes, &managed_now);
+    if !deferred_group_names.is_empty() {
+        plan.group_actions.retain(|ga| match ga {
+            GroupAction::Delete { name } if deferred_group_names.contains(name) => {
+                let acct = deferred_deletes
+                    .iter()
+                    .find(|d| group_owned_by(&d.name, &managed_now, name))
+                    .map(|d| d.name.as_str())
+                    .unwrap_or("?");
+                log.push(format!(
+                    "deferred delete of group {name}: retained by live-session account {acct}"
+                ));
+                false
+            }
+            _ => true,
+        });
+        // Fold into the required set so `build_managed_groups` carries these
+        // groups forward from the prior registry (prior GID/from_version intact).
+        for name in &deferred_group_names {
+            required_groups.entry(name.clone()).or_insert(None);
+        }
+    }
 
     // 6. Anti-lockout gate (before snapshot / mutation).
     if inputs.lockout.risk_acknowledged {
@@ -176,10 +267,21 @@ pub fn run(
 
     // Idempotence: empty plan (no account AND no group actions) → zero mutations,
     // no snapshot, no registry churn (registry still reflects the in-sync set).
+    // NOTE: this branch is now also reachable when the ONLY planned change was a
+    // delete that we just deferred. In that case the registry already holds the
+    // deferred account (retained below with its prior from_version), so there are
+    // no OS mutations — but the registry MUST still record the retention, hence
+    // `registry_written` is forced true whenever a deferral happened (idempotent
+    // in content: from_version is preserved, but we must not drop ownership).
     if plan.is_empty() {
         log.push("plan is empty — no changes".to_owned());
         return Ok(ApplyReport {
-            managed: build_managed_set(&targets, inputs.declaration.version, &managed_now),
+            managed: build_managed_set(
+                &targets,
+                inputs.declaration.version,
+                &managed_now,
+                &deferred_deletes,
+            ),
             managed_group_records: build_managed_groups(
                 &required_groups,
                 &managed_groups_now,
@@ -189,8 +291,9 @@ pub fn run(
             ),
             log,
             mutations: 0,
-            registry_written: false,
+            registry_written: !deferred_deletes.is_empty(),
             trust_mode,
+            deferred_deletes,
         });
     }
 
@@ -296,7 +399,12 @@ pub fn run(
     // last) — we return the new managed account + group sets.
     log.push("all phases succeeded".to_owned());
     Ok(ApplyReport {
-        managed: build_managed_set(&targets, inputs.declaration.version, &managed_now),
+        managed: build_managed_set(
+            &targets,
+            inputs.declaration.version,
+            &managed_now,
+            &deferred_deletes,
+        ),
         managed_group_records: build_managed_groups(
             &required_groups,
             &managed_groups_now,
@@ -308,7 +416,82 @@ pub fn run(
         mutations,
         registry_written: true,
         trust_mode,
+        deferred_deletes,
     })
+}
+
+/// Partition the account plan against the live-session set: every `Delete` whose
+/// name OR uid has a live session is REMOVED from `plan.actions` (Census never
+/// kills a session — it skips its own destructive step) and returned as a
+/// [`DeferredDelete`]. The uid is read from `managed_now` (the deleted account's
+/// recorded record); a managed Delete always has a corresponding managed record.
+fn reconcile_live_sessions(
+    plan: &mut plan::Plan,
+    managed_now: &BTreeMap<String, ManagedAccount>,
+    live: &crate::sessions::LiveSessions,
+) -> Vec<DeferredDelete> {
+    let mut deferred = Vec::new();
+    plan.actions.retain(|action| {
+        let Action::Delete { name } = action else {
+            return true; // creates/updates are never deferred
+        };
+        // Every account `Delete` is produced by diffing the managed registry, so
+        // its record (and thus its uid) is always present in `managed_now`. A
+        // record with no managed entry could not be retained anyway
+        // (`build_managed_set` carries deferrals forward via `current.get(name)`),
+        // so a missing entry simply falls through as a normal delete.
+        let Some(record) = managed_now.get(name) else {
+            debug_assert!(false, "account Delete {name:?} has no managed record");
+            return true;
+        };
+        if live.matches(name, record.uid) {
+            deferred.push(DeferredDelete {
+                name: name.clone(),
+                uid: record.uid,
+            });
+            false // remove from the executed plan
+        } else {
+            true
+        }
+    });
+    deferred
+}
+
+/// The union of all group names that belong to a deferred-delete account: each
+/// account's recorded supplementary groups (`ManagedAccount.groups`) plus its
+/// primary group. `useradd` (no `-g`/`-N`) creates a user-private primary group
+/// named after the account/role, so the primary group name equals the account
+/// name. These groups must NOT be torn down while the account's session is live.
+fn deferred_group_names(
+    deferred: &[DeferredDelete],
+    managed_now: &BTreeMap<String, ManagedAccount>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for d in deferred {
+        // Primary (role-named) group — same name as the account.
+        names.insert(d.name.clone());
+        if let Some(record) = managed_now.get(&d.name) {
+            for g in &record.groups {
+                names.insert(g.clone());
+            }
+        }
+    }
+    names
+}
+
+/// Whether `group` is one of `account`'s groups (supplementary or its role-named
+/// primary). Used only to attribute a retained group to an account in the log.
+fn group_owned_by(
+    account: &str,
+    managed_now: &BTreeMap<String, ManagedAccount>,
+    group: &str,
+) -> bool {
+    if account == group {
+        return true; // primary (role-named) group
+    }
+    managed_now
+        .get(account)
+        .is_some_and(|m| m.groups.iter().any(|g| g == group))
 }
 
 /// Run the provisioner's restore after a phase failure and package the
@@ -368,12 +551,21 @@ fn action_label(action: &Action) -> String {
 /// Build the new managed registry set from the resolved targets, recording
 /// `from_version`. Accounts already managed and unchanged keep their recorded
 /// `from_version`; created/updated accounts get the declaration's version.
+///
+/// `deferred` are accounts whose deletion was skipped because they have a live
+/// session (§12). They are NOT in `targets` (the declaration dropped them), so
+/// without re-adding them here Census would forget it owns them: the account
+/// would become foreign and never be deleted on a later run. We therefore carry
+/// each deferred account forward from `current` with its PRIOR `from_version`
+/// intact, so the next apply (after the session closes) sees it as managed and
+/// completes the delete.
 fn build_managed_set(
     targets: &[crate::model::ResolvedAccount],
     version: u32,
     current: &std::collections::BTreeMap<String, ManagedAccount>,
+    deferred: &[DeferredDelete],
 ) -> Vec<ManagedAccount> {
-    targets
+    let mut out: Vec<ManagedAccount> = targets
         .iter()
         .map(|t| {
             let from_version = match current.get(&t.name) {
@@ -395,7 +587,17 @@ fn build_managed_set(
                 from_version,
             }
         })
-        .collect()
+        .collect();
+
+    // Retain deferred-delete accounts with their original record (prior
+    // from_version preserved). They are absent from `targets`, so there is no
+    // overlap to deduplicate.
+    for d in deferred {
+        if let Some(existing) = current.get(&d.name) {
+            out.push(existing.clone());
+        }
+    }
+    out
 }
 
 /// Build the new managed-group registry set. A group is recorded iff Census
@@ -614,6 +816,8 @@ mod tests {
                 trust: TrustOptions::default(), // no --trust-fs
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -646,6 +850,8 @@ mod tests {
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -675,6 +881,8 @@ mod tests {
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -705,6 +913,8 @@ mod tests {
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -738,6 +948,8 @@ mod tests {
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(), // no rescue, no risk-ack
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -778,6 +990,8 @@ mod tests {
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -823,6 +1037,8 @@ mod tests {
                 // Rescue present so the delete-only plan passes the lockout gate.
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -857,6 +1073,8 @@ mod tests {
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -961,6 +1179,8 @@ mod tests {
                 trust: managed_opts(PathBuf::from("/nonexistent.pub"), persist.path().to_path_buf()),
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -987,6 +1207,8 @@ mod tests {
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -1015,6 +1237,8 @@ mod tests {
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -1046,6 +1270,8 @@ mod tests {
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+                session_source: &crate::sessions::FakeSessionSource::empty(),
+                sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             },
             &mut p,
         )
@@ -1087,6 +1313,7 @@ mod tests {
         d: &'a Declaration,
         st: &'a FakeState,
         insp: &'a FakeInspector,
+        sessions: &'a dyn crate::sessions::SessionSource,
     ) -> ApplyInputs<'a> {
         ApplyInputs {
             declaration: d,
@@ -1096,6 +1323,8 @@ mod tests {
             trust: TrustOptions { trust_fs: true, ..Default::default() },
             lockout: LockoutContext { rescue_present: true, ..Default::default() },
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            session_source: sessions,
+            sessions_file: PathBuf::from("/run/tessera/sessions.json"),
         }
     }
 
@@ -1121,7 +1350,7 @@ mod tests {
         let st = FakeState::default();
         let insp = FakeInspector::default();
         let mut p = FakeProvisioner::default();
-        let report = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap();
+        let report = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap();
         let cg = p.calls.iter().position(|c| c == "create_group:atm-operators").expect("group create");
         let ca = p.calls.iter().position(|c| c == "create:oper").expect("account create");
         assert!(cg < ca, "group create must precede account create: {:?}", p.calls);
@@ -1150,7 +1379,7 @@ mod tests {
         let mut insp = FakeInspector::default();
         insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
         let mut p = FakeProvisioner::default();
-        let report = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap();
+        let report = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap();
         let da = p.calls.iter().position(|c| c == "delete:oper").expect("account delete");
         let dg = p.calls.iter().position(|c| c == "delete_group:atm-operators").expect("group delete");
         assert!(da < dg, "account delete must precede group delete: {:?}", p.calls);
@@ -1167,7 +1396,7 @@ mod tests {
         let mut insp = FakeInspector::default();
         insp.groups.insert("other".into(), GroupFacts { gid: 8010 });
         let mut p = FakeProvisioner::default();
-        let err = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap_err();
+        let err = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap_err();
         assert!(matches!(err, ApplyError::GroupPlan(_)), "expected GroupPlan error, got {err:?}");
         assert!(!p.snapshotted, "pin conflict must abort before snapshot");
         assert!(p.calls.is_empty(), "pin conflict must abort before any mutation");
@@ -1182,7 +1411,7 @@ mod tests {
         let mut insp = FakeInspector::default();
         insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
         let mut p = FakeProvisioner::default();
-        let report = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap();
+        let report = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap();
         assert!(
             !p.calls.iter().any(|c| c.starts_with("create_group")),
             "foreign group must not be created: {:?}", p.calls
@@ -1200,7 +1429,7 @@ mod tests {
         let st = FakeState::default();
         let insp = FakeInspector::default();
         let mut p = FakeProvisioner::failing("create_group");
-        let err = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap_err();
+        let err = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap_err();
         match err {
             ApplyError::Phase { phase, rollback, .. } => {
                 assert_eq!(phase, "create-group");
@@ -1211,5 +1440,299 @@ mod tests {
         assert!(p.restored, "group-create failure must trigger restore");
         // The account was never created (group phase failed first).
         assert!(!p.calls.iter().any(|c| c == "create:oper"));
+    }
+
+    // ---- live-reconcile (§12) ----
+
+    use crate::sessions::{FakeSessionSource, LiveSessions, SessionSource};
+
+    /// A declaration that declares NO role-accounts (so any managed account is a
+    /// delete in the plan). Returns (tempdir, declaration).
+    fn empty_decl() -> (tempfile::TempDir, Declaration) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().display().to_string();
+        let text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+        );
+        let d = Declaration::parse(&text).unwrap();
+        (tmp, d)
+    }
+
+    /// Build `ApplyInputs` for a `--trust-fs`, rescue-present run over the given
+    /// state + session source (the live-reconcile tests vary only those).
+    fn reconcile_inputs<'a>(
+        d: &'a Declaration,
+        st: &'a FakeState,
+        insp: &'a FakeInspector,
+        sessions: &'a dyn SessionSource,
+    ) -> ApplyInputs<'a> {
+        ApplyInputs {
+            declaration: d,
+            declaration_bytes: b"",
+            state: st,
+            inspector: insp,
+            trust: TrustOptions { trust_fs: true, ..Default::default() },
+            lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            session_source: sessions,
+            sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+        }
+    }
+
+    fn live_by_name(name: &str) -> FakeSessionSource {
+        let mut live = LiveSessions::default();
+        live.names.insert(name.to_owned());
+        FakeSessionSource::with_live(live)
+    }
+
+    fn live_by_uid(uid: u32) -> FakeSessionSource {
+        let mut live = LiveSessions::default();
+        live.uids.insert(uid);
+        FakeSessionSource::with_live(live)
+    }
+
+    #[test]
+    fn delete_with_live_session_by_name_is_deferred_and_retained() {
+        // Declaration drops `oper`; the registry owns it at from_version 4; a live
+        // session matches by name → userdel must NOT run and ownership is kept.
+        let (_t, d) = empty_decl();
+        let st = fake_state(vec![managed("oper", 9010, &[], 4)]);
+        let insp = FakeInspector::default();
+        let sessions = live_by_name("oper");
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        assert!(!p.calls.iter().any(|c| c == "delete:oper"), "userdel must be deferred: {:?}", p.calls);
+        assert_eq!(report.mutations, 0, "a deferred delete is not a mutation");
+        // Account retained in the managed set with its PRIOR from_version.
+        let oper = report.managed.iter().find(|m| m.name == "oper").expect("oper retained in managed");
+        assert_eq!(oper.from_version, 4, "deferred account keeps its prior from_version");
+        // Reported as a deferred delete (name + uid).
+        assert_eq!(report.deferred_deletes.len(), 1);
+        assert_eq!(report.deferred_deletes[0].name, "oper");
+        assert_eq!(report.deferred_deletes[0].uid, 9010);
+    }
+
+    #[test]
+    fn delete_with_live_session_by_uid_only_is_deferred() {
+        // Live set knows only the uid (e.g. the account was renamed live); the
+        // uid match alone must defer the delete.
+        let (_t, d) = empty_decl();
+        let st = fake_state(vec![managed("oper", 9010, &[], 4)]);
+        let insp = FakeInspector::default();
+        let sessions = live_by_uid(9010);
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        assert!(!p.calls.iter().any(|c| c == "delete:oper"), "uid match must defer userdel");
+        assert_eq!(report.deferred_deletes.len(), 1);
+        assert_eq!(report.deferred_deletes[0].uid, 9010);
+        assert!(report.managed.iter().any(|m| m.name == "oper"), "uid-deferred account retained");
+    }
+
+    #[test]
+    fn delete_without_live_session_executes_normally() {
+        // No session for `oper` → the delete runs as before.
+        let (_t, d) = empty_decl();
+        let st = fake_state(vec![managed("oper", 9010, &[], 4)]);
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::empty();
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        assert!(p.calls.iter().any(|c| c == "delete:oper"), "no session → userdel runs");
+        assert_eq!(report.mutations, 1);
+        assert!(report.deferred_deletes.is_empty());
+        assert!(!report.managed.iter().any(|m| m.name == "oper"), "deleted account leaves the registry");
+    }
+
+    #[test]
+    fn empty_live_set_executes_all_deletes() {
+        // Two managed accounts, both dropped, empty live set → both delete.
+        let (_t, d) = empty_decl();
+        let st = fake_state(vec![managed("oper", 9010, &[], 4), managed("serv", 9011, &[], 4)]);
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::empty();
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        assert!(p.calls.iter().any(|c| c == "delete:oper"));
+        assert!(p.calls.iter().any(|c| c == "delete:serv"));
+        assert_eq!(report.mutations, 2);
+        assert!(report.deferred_deletes.is_empty());
+        assert!(report.managed.is_empty(), "both accounts removed from the registry");
+    }
+
+    #[test]
+    fn plan_with_only_deferred_delete_does_no_mutations_but_retains() {
+        // The single planned change is a delete that gets deferred → the plan is
+        // empty after removal. No snapshot, no phase mutations, but the deferred
+        // account is retained and the registry write is requested (so the
+        // retention is persisted; from_version is preserved → idempotent content).
+        let (_t, d) = empty_decl();
+        let st = fake_state(vec![managed("oper", 9010, &[], 4)]);
+        let insp = FakeInspector::default();
+        let sessions = live_by_name("oper");
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        assert!(!p.snapshotted, "no snapshot when the only change was deferred");
+        assert!(p.calls.is_empty(), "no phase calls when the only change was deferred");
+        assert_eq!(report.mutations, 0);
+        assert!(report.registry_written, "retention of the deferred account must be persisted");
+        let oper = report.managed.iter().find(|m| m.name == "oper").expect("oper retained");
+        assert_eq!(oper.from_version, 4);
+        assert_eq!(report.deferred_deletes.len(), 1);
+    }
+
+    #[test]
+    fn non_delete_plan_ignores_session_read_error() {
+        // A create-only plan must NOT be blocked by an unreadable registry: there
+        // is nothing to defer, so the read error is irrelevant. Use a session
+        // source that errors and assert apply still succeeds.
+        let (_t, d) = decl("oper", 9010);
+        let st = fake_state(vec![]); // nothing managed → plan is a create
+        let insp = insp_with_wheel();
+        let sessions = FakeSessionSource::failing();
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        assert!(p.calls.iter().any(|c| c == "create:oper"), "create runs despite registry read error");
+        assert_eq!(report.mutations, 1);
+        assert!(report.deferred_deletes.is_empty());
+    }
+
+    #[test]
+    fn destructive_plan_fails_closed_on_unreadable_registry() {
+        // A delete plan + an unreadable registry → fail-closed BEFORE snapshot: we
+        // cannot prove no session is live, so we must not risk tearing one down.
+        let (_t, d) = empty_decl();
+        let st = fake_state(vec![managed("oper", 9010, &[], 4)]);
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::failing();
+        let mut p = FakeProvisioner::default();
+        let err = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap_err();
+
+        assert!(matches!(err, ApplyError::SessionRegistry(_)), "expected fail-closed, got {err:?}");
+        assert!(!p.snapshotted, "fail-closed must precede snapshot");
+        assert!(p.calls.is_empty(), "fail-closed must precede any mutation");
+    }
+
+    #[test]
+    fn deferral_precedes_anti_lockout_gate() {
+        // Delete-only plan with NO rescue and NO risk-ack would normally trip the
+        // anti-lockout gate. But the account has a live session, so the delete is
+        // deferred BEFORE the gate runs → the (now empty) plan passes, the account
+        // is kept, and no lockout error is raised.
+        let (_t, d) = empty_decl();
+        let st = fake_state(vec![managed("oper", 9010, &[], 4)]);
+        let insp = FakeInspector::default();
+        let sessions = live_by_name("oper");
+        let mut p = FakeProvisioner::default();
+        let inputs = ApplyInputs {
+            declaration: &d,
+            declaration_bytes: b"",
+            state: &st,
+            inspector: &insp,
+            trust: TrustOptions { trust_fs: true, ..Default::default() },
+            lockout: LockoutContext::default(), // no rescue, no risk-ack
+            sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            session_source: &sessions,
+            sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+        };
+        let report = run(inputs, &mut p).unwrap();
+        assert_eq!(report.deferred_deletes.len(), 1, "delete deferred before the gate");
+        assert!(report.managed.iter().any(|m| m.name == "oper"), "account kept");
+    }
+
+    #[test]
+    fn deferred_account_supplementary_group_is_retained_not_deleted() {
+        // `oper` (live) carries supplementary group `atm-operators`, which the
+        // registry owns. Dropping `oper` would delete both; the live session must
+        // defer the userdel AND keep the group (no groupdel, retained with its
+        // prior GID/from_version) so nothing is torn from under the session.
+        let (_t, d) = empty_decl();
+        let st = fake_state_with_groups(
+            vec![managed("oper", 9010, &["atm-operators"], 4)],
+            vec![managed_group("atm-operators", 8010, 4)],
+        );
+        // Group live at its recorded gid so the drift check passes.
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        let sessions = live_by_name("oper");
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        assert!(
+            !p.calls.iter().any(|c| c == "delete_group:atm-operators"),
+            "deferred account's group must not be deleted: {:?}",
+            p.calls
+        );
+        assert!(!p.calls.iter().any(|c| c == "delete:oper"), "userdel deferred");
+        // Group retained in the registry with its PRIOR gid + from_version.
+        let g = report
+            .managed_group_records
+            .iter()
+            .find(|g| g.name == "atm-operators")
+            .expect("group retained in registry");
+        assert_eq!(g.gid, 8010, "retained group keeps prior GID");
+        assert_eq!(g.from_version, 4, "retained group keeps prior from_version");
+    }
+
+    #[test]
+    fn deferred_account_primary_role_group_delete_is_dropped() {
+        // The role-named primary group (`useradd` user-private group, same name as
+        // the account) would be deleted when `oper` is dropped. With a live
+        // session, that delete must be dropped — never attempt `groupdel` on the
+        // active uid's primary group (would fail "busy" and roll back the apply).
+        let (_t, d) = empty_decl();
+        let st = fake_state_with_groups(
+            vec![managed("oper", 9010, &[], 4)],
+            vec![managed_group("oper", 9010, 4)],
+        );
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("oper".into(), GroupFacts { gid: 9010 });
+        let sessions = live_by_name("oper");
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        assert!(
+            !p.calls.iter().any(|c| c == "delete_group:oper"),
+            "primary group of a live account must not be groupdel'd: {:?}",
+            p.calls
+        );
+        assert!(
+            report.managed_group_records.iter().any(|g| g.name == "oper"),
+            "primary group retained"
+        );
+    }
+
+    #[test]
+    fn group_delete_unrelated_to_deferral_still_runs() {
+        // Two accounts dropped: `oper` (live) owns group `ga`; `serv` (no session)
+        // owns group `gb`. `oper`+`ga` defer; `serv`+`gb` must still be deleted —
+        // the retention is scoped to the deferred account's groups only.
+        let (_t, d) = empty_decl();
+        let st = fake_state_with_groups(
+            vec![
+                managed("oper", 9010, &["ga"], 4),
+                managed("serv", 9011, &["gb"], 4),
+            ],
+            vec![managed_group("ga", 8010, 4), managed_group("gb", 8011, 4)],
+        );
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("ga".into(), GroupFacts { gid: 8010 });
+        insp.groups.insert("gb".into(), GroupFacts { gid: 8011 });
+        let sessions = live_by_name("oper");
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        // oper deferred, ga retained; serv deleted, gb deleted.
+        assert!(!p.calls.iter().any(|c| c == "delete:oper"), "oper userdel deferred");
+        assert!(!p.calls.iter().any(|c| c == "delete_group:ga"), "ga retained");
+        assert!(p.calls.iter().any(|c| c == "delete:serv"), "serv deleted");
+        assert!(p.calls.iter().any(|c| c == "delete_group:gb"), "gb deleted");
+        assert!(report.managed_group_records.iter().any(|g| g.name == "ga"), "ga retained in registry");
+        assert!(!report.managed_group_records.iter().any(|g| g.name == "gb"), "gb dropped from registry");
     }
 }

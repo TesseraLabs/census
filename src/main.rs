@@ -32,6 +32,10 @@ enum Command {
         /// Proceed even if no rescue/break-glass login path is configured.
         #[arg(long)]
         i_understand_no_rescue: bool,
+        /// Path to Tessera's live-session registry. A delete over an account with
+        /// a live session is deferred (§12). Absent file → no live sessions.
+        #[arg(long, default_value = "/run/tessera/sessions.json")]
+        sessions_file: std::path::PathBuf,
     },
     /// Read-only diagnostics: verify the §4/§7/§8 invariants hold. Non-zero exit
     /// on any error-severity finding (for monitoring/CI).
@@ -64,6 +68,7 @@ fn main() -> std::process::ExitCode {
             managed,
             trust_fs,
             i_understand_no_rescue,
+            sessions_file,
         } => census::cli::run_apply(census::cli::ApplyOpts {
             declaration: &declaration,
             managed: &managed,
@@ -72,6 +77,7 @@ fn main() -> std::process::ExitCode {
             rollback_root: std::path::PathBuf::from("/var/lib/census/rollback"),
             trust_anchor_path: std::path::PathBuf::from(census::trust::DEFAULT_TRUST_ANCHOR),
             persist_dir: std::path::PathBuf::from(census::trust::DEFAULT_PERSIST_DIR),
+            sessions_file,
         }),
         Command::Doctor { declaration, managed } => {
             census::cli::run_doctor(declaration.as_deref(), &managed)

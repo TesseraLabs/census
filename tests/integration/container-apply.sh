@@ -276,5 +276,94 @@ userdel -r audit 2>/dev/null || true
 "$CENSUS" doctor --managed "$GMAN" >/dev/null 2>&1; rcgd=$?
 assert     "doctor clean on group state"    "[ $rcgd -eq 0 ]"
 
+echo "== scenario 19-21: LIVE-RECONCILE (defer userdel on live session; §12) =="
+# Isolated subtree so live-reconcile never collides with earlier managed state.
+# `lr` references ONLY the managed group census-lr (gid-pinned 8600) so the block
+# is self-contained — no base-group prerequisites. Standalone (--trust-fs) never
+# persists a version floor, so versions can be reused/rewound freely here.
+LROOT="$ROOT/lr"; LSTORE="$LROOT/roles"; LMAN="$LROOT/managed.toml"
+mkdir -p "$LSTORE"
+l_store() {
+  cat > "$LSTORE/lr.toml" <<EOF
+role = "lr"
+version = 1
+os = "linux"
+name = "LiveReconcile"
+level = 1
+[payload]
+groups = ["census-lr"]
+EOF
+}
+l_decl() { # $1=version $2=include-lr? (yes/no)
+  cat > "$LROOT/decl.toml" <<EOF
+version = $1
+role_store = "$LSTORE"
+[defaults]
+uid_range = [9000, 9999]
+shell = "/bin/bash"
+home_base = "/var/lib/census/home"
+EOF
+  if [ "$2" = "yes" ]; then
+    # Declare the group ONLY alongside its member account, so dropping lr makes
+    # census-lr a true orphan (not still-required) — exercising the H1 path where
+    # the group is retained BECAUSE its deferred member holds a live session.
+    cat >> "$LROOT/decl.toml" <<EOF
+[[group]]
+name = "census-lr"
+gid = 8600
+[[role_account]]
+role = "lr"
+uid = 9050
+EOF
+  fi
+}
+l_apply() { "$CENSUS" apply --declaration "$LROOT/decl.toml" --managed "$LMAN" \
+  --trust-fs --i-understand-no-rescue --sessions-file "$LROOT/sessions.json" 2>&1; }
+l_store
+
+echo "-- 19: live session defers userdel AND its group --"
+# First apply with NO sessions file present → account+group created normally.
+rm -f "$LROOT/sessions.json"
+l_decl 1 yes
+echo ":: $(l_apply)"
+assert     "lr account created"             "getent passwd lr >/dev/null"
+assert     "lr uid is 9050"                 "[ \"\$(id -u lr)\" = 9050 ]"
+assert     "census-lr group created"        "getent group census-lr >/dev/null"
+assert     "census-lr has pinned gid 8600"  "[ \"\$(getent group census-lr | cut -d: -f3)\" = 8600 ]"
+assert     "managed.toml lists lr"          "grep -q 'name = \"lr\"' $LMAN"
+assert     "managed.toml lists census-lr"   "grep -q 'name = \"census-lr\"' $LMAN"
+# Now lr has a live session → dropping it must defer both the userdel and the group.
+echo '[{"pam_user":"lr","uid":9050}]' > "$LROOT/sessions.json"
+l_decl 2 no
+out19="$(l_apply)"; rc19=$?; echo ":: $out19"
+assert     "lr account retained"            "getent passwd lr >/dev/null"
+assert     "census-lr group retained"       "getent group census-lr >/dev/null"
+assert     "managed.toml still lists lr"        "grep -q 'name = \"lr\"' $LMAN"
+assert     "managed.toml still lists census-lr" "grep -q 'name = \"census-lr\"' $LMAN"
+assert     "apply exit code is 3 (deferred)"    "[ $rc19 -eq 3 ]"
+assert     "output mentions deferred"           "echo \"\$out19\" | grep -qi deferred"
+
+echo "-- 20: re-apply after session ends completes the delete --"
+rm -f "$LROOT/sessions.json"                # file absent ⇒ no live sessions (standalone)
+l_decl 3 no
+out20="$(l_apply)"; rc20=$?; echo ":: $out20"
+assert_not "lr account now deleted"         "getent passwd lr >/dev/null"
+assert_not "census-lr group now deleted"    "getent group census-lr >/dev/null"
+assert     "apply exit code is 0"           "[ $rc20 -eq 0 ]"
+
+echo "-- 21: corrupt sessions registry + destructive plan fails closed --"
+# Recreate lr + census-lr (no sessions file → normal create).
+rm -f "$LROOT/sessions.json"
+l_decl 4 yes
+echo ":: $(l_apply)"
+assert     "lr recreated"                   "getent passwd lr >/dev/null"
+# Corrupt registry + a plan that DROPS lr (destructive) → hard fail-closed.
+printf '%s' '[{not valid json' > "$LROOT/sessions.json"
+l_decl 5 no
+out21="$(l_apply)"; rc21=$?; echo ":: $out21"
+assert     "corrupt registry + destructive plan fails" "[ $rc21 -ne 0 ] && [ $rc21 -ne 3 ]"
+assert     "lr account untouched by fail-closed"       "getent passwd lr >/dev/null"
+assert     "output names trust/registry/error"         "echo \"\$out21\" | grep -qiE 'registr|session|error|trust'"
+
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]
