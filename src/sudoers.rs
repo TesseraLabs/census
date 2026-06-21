@@ -205,12 +205,42 @@ fn set_mode_0440(_path: &Path) -> Result<(), SudoersError> {
 /// Build the sudoers.d file content for an account, or `None` if the role
 /// carries no sudo right (no file should exist).
 ///
-/// Convention (design "Открытые вопросы" resolved minimally): the account is
-/// granted sudo via membership semantics expressed as a per-user rule that
-/// defers the command set to the role-store-configured alias named by
-/// `sudo_role`. The rule references a `Cmnd_Alias` that the role-store/site
-/// provisions; Census does not invent command lists.
+/// Two render paths:
+/// * **Concrete commands** (preferred, permission-expanded): when
+///   `acct.sudo_commands` is non-empty, emit a single per-user rule listing
+///   those exact commands comma-joined — `<user> ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli`.
+///   `NOPASSWD` because role accounts have locked passwords (§8): there is no
+///   password to prompt for, so without `NOPASSWD` sudo would be unusable.
+///   Commands come from the catalog, where each value is validated at parse to
+///   be a single-line absolute path (control chars — including the newline that
+///   would inject a second directive line — are rejected there). As a second
+///   layer, every command is run through `escape_sudoers_command`, which
+///   neutralises the sudoers metacharacters `, : = \ ( ) !` so each entry
+///   renders as exactly one literal Cmnd and cannot split the list or act as a
+///   runas/negation directive.
+/// * **Escape-hatch alias** (legacy): when there are no concrete commands but a
+///   raw `sudo_role` is set, defer the command set to a site-provisioned
+///   `Cmnd_Alias` (the prior behaviour, unchanged).
+///
+/// When both are empty → `None` (no fragment file).
 pub fn build_sudoers_content(acct: &ResolvedAccount) -> Option<String> {
+    if !acct.sudo_commands.is_empty() {
+        let cmds = acct
+            .sudo_commands
+            .iter()
+            .map(|c| escape_sudoers_command(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "# Managed by Census — role {role}. Do not edit by hand.\n\
+             # Concrete commands expanded from the role's permissions.\n\
+             # NOPASSWD: role accounts have locked passwords (no password to prompt).\n\
+             {user} ALL=(ALL) NOPASSWD: {cmds}\n",
+            role = acct.name,
+            user = acct.name,
+        ));
+    }
+
     let sudo_role = acct.sudo_role.as_ref()?;
     Some(format!(
         "# Managed by Census — role {role}. Do not edit by hand.\n\
@@ -220,6 +250,28 @@ pub fn build_sudoers_content(acct: &ResolvedAccount) -> Option<String> {
         user = acct.name,
         alias = sudo_role_alias(sudo_role),
     ))
+}
+
+/// Escape a command string for inclusion in a comma-separated sudoers Cmnd list.
+///
+/// Control characters (notably a newline, which would split the rule into a
+/// second physical sudoers directive line) are rejected upstream at catalog
+/// parse, so a value reaching here is already a single-line absolute path. This
+/// escaper is the second layer: it neutralises the sudoers metacharacters
+/// `, : = \ ( ) !` by backslash-escaping each, so every entry renders as exactly
+/// one literal Cmnd. `,` is the Cmnd-list separator; `( )` open a per-command
+/// runas override; `!` is the negation operator; `: =` are rule punctuation.
+/// Without escaping, any of these in a command string could broaden the rule or
+/// alter its meaning rather than name a command.
+fn escape_sudoers_command(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    for ch in cmd.chars() {
+        if matches!(ch, ',' | ':' | '=' | '\\' | '(' | ')' | '!') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Map a role-store `sudo_role` string into a sudoers `Cmnd_Alias` token.
@@ -252,8 +304,18 @@ mod tests {
             home: PathBuf::from(format!("/var/lib/census/home/{name}")),
             groups: vec![],
             sudo_role: sudo_role.map(|s| s.to_owned()),
+            sudo_commands: Vec::new(),
             limits: Limits::default(),
             locked_password: true,
+        }
+    }
+
+    /// An account whose sudo right is a set of concrete commands (the
+    /// permission-expanded path).
+    fn acct_cmds(name: &str, cmds: &[&str]) -> ResolvedAccount {
+        ResolvedAccount {
+            sudo_commands: cmds.iter().map(|c| c.to_string()).collect(),
+            ..acct(name, None)
         }
     }
 
@@ -271,6 +333,79 @@ mod tests {
         for line in content.lines().filter(|l| !l.starts_with('#')) {
             assert!(line.contains("ALL=(ALL)"));
         }
+    }
+
+    #[test]
+    fn concrete_commands_render_nopasswd_rule() {
+        let content = build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+            .expect("concrete commands yield content");
+        // Single per-user NOPASSWD rule with comma-joined commands.
+        assert!(
+            content.contains("oper ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli"),
+            "got: {content}"
+        );
+        assert!(content.contains("Managed by Census"));
+        // NOPASSWD rationale documented (locked passwords).
+        assert!(content.contains("NOPASSWD"));
+        // No external Cmnd_Alias indirection on the concrete path.
+        assert!(!content.contains("CENSUS_"), "concrete path must not emit an alias: {content}");
+    }
+
+    #[test]
+    fn concrete_commands_win_over_sudo_role() {
+        // If both a raw sudo_role AND concrete commands are present, the concrete
+        // commands render (the expanded path is the source of truth).
+        let mut a = acct_cmds("oper", &["/usr/sbin/ip"]);
+        a.sudo_role = Some("ops".to_owned());
+        let content = build_sudoers_content(&a).unwrap();
+        assert!(content.contains("NOPASSWD: /usr/sbin/ip"));
+        assert!(!content.contains("CENSUS_OPS"), "concrete commands take precedence");
+    }
+
+    #[test]
+    fn concrete_rule_has_valid_sudoers_shape() {
+        // Every non-comment line is a single rule with the expected `ALL=(ALL)`
+        // run-spec and a NOPASSWD tag; no stray separators that would break it.
+        let content = build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"])).unwrap();
+        let rule_lines: Vec<&str> = content.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();
+        assert_eq!(rule_lines.len(), 1, "exactly one rule line: {content}");
+        let line = rule_lines[0];
+        assert!(line.starts_with("oper ALL=(ALL) NOPASSWD: "));
+        // The user field is a single token (no embedded space before ALL).
+        assert_eq!(line.split_whitespace().next(), Some("oper"));
+    }
+
+    #[test]
+    fn comma_in_command_is_escaped_so_it_is_not_a_list_separator() {
+        // A (contrived) command containing a literal comma must be escaped as
+        // `\,` so sudoers treats it as one Cmnd, not two.
+        let content = build_sudoers_content(&acct_cmds("oper", &["/usr/bin/odd,name"])).unwrap();
+        assert!(content.contains(r"/usr/bin/odd\,name"), "comma must be escaped: {content}");
+    }
+
+    #[test]
+    fn runas_metacharacters_are_escaped() {
+        // sudoers `(`/`)` open a per-command runas override and `!` is the
+        // negation operator. The catalog gate rejects such values upstream, but
+        // the escaper is the second layer: if one ever reached the renderer it
+        // must be neutralised, not act as a directive. Render a contrived value
+        // and assert each metacharacter is backslash-escaped (one literal Cmnd).
+        let content =
+            build_sudoers_content(&acct_cmds("oper", &["(root) /bin/sh", "/bin/x!y"])).unwrap();
+        assert!(content.contains(r"\(root\) /bin/sh"), "runas parens must be escaped: {content}");
+        assert!(content.contains(r"/bin/x\!y"), "negation bang must be escaped: {content}");
+        // No bare `(` / `)` / `!` survive on the rule line.
+        for line in content.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+            assert!(
+                !line.contains("(root)") && !line.contains("x!y"),
+                "unescaped metacharacter leaked: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_sudo_commands_and_no_role_yields_no_file() {
+        assert!(build_sudoers_content(&acct("oper", None)).is_none());
     }
 
     #[test]
@@ -331,6 +466,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), content);
         // No temp file left behind.
         assert!(!dir.path().join(".census-oper.tmp").exists());
+    }
+
+    #[test]
+    fn write_sudoers_validates_concrete_command_fragment() {
+        // The concrete-command NOPASSWD fragment must pass `visudo -c`.
+        if !visudo_available() {
+            eprintln!("skipping concrete-command visudo test: visudo not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let content = build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+            .expect("concrete commands yield content");
+        write_sudoers(dir.path(), "oper", &content).unwrap();
+        let dest = sudoers_path(dir.path(), "oper");
+        assert!(dest.exists(), "validated concrete fragment must be activated");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), content);
     }
 
     #[cfg(unix)]

@@ -401,6 +401,7 @@ mod tests {
             home: PathBuf::from(format!("/var/lib/census/home/{name}")),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
+            sudo_commands: Vec::new(),
             limits: Limits::default(),
             locked_password: true,
         }
@@ -413,6 +414,7 @@ mod tests {
             shell: shell.to_owned(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
+            sudo_commands: Vec::new(),
             from_version: 1,
         }
     }

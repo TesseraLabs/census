@@ -95,6 +95,7 @@ mod tests {
             home: PathBuf::from("/var/lib/census/home/x"),
             groups: vec![],
             sudo_role: None,
+            sudo_commands: Vec::new(),
             limits: Limits::default(),
             locked_password: true,
         }

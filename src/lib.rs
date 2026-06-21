@@ -1,10 +1,12 @@
 //! Census core: declaration → role-store composition → plan → apply.
 pub mod apply;
 pub mod backup;
+pub mod catalog;
 pub mod cli;
 pub mod declaration;
 pub mod doctor;
 pub mod inspect;
+pub mod l10n;
 pub mod lockout;
 pub mod model;
 pub mod mutate;

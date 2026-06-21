@@ -26,6 +26,14 @@ pub struct ManagedAccount {
     /// is visible to the plan diff (otherwise a revoked fragment leaks).
     #[serde(default)]
     pub sudo_role: Option<String>,
+    /// Recorded concrete sudo commands (permission-expanded). Persisted so that
+    /// granting or revoking a permission which changes the sudo command set is
+    /// visible to the plan diff — the same privilege-revocation correctness that
+    /// `sudo_role` gets, but for the concrete-command path (otherwise a stale
+    /// NOPASSWD rule would leak after a permission is dropped). `#[serde(default)]`
+    /// so a registry written before this field existed still reads (empty set).
+    #[serde(default)]
+    pub sudo_commands: Vec<String>,
     /// Declaration `version` this account was created/updated from.
     pub from_version: u32,
 }
@@ -186,6 +194,43 @@ from_version = 3
         assert_eq!(oper.uid, 9010);
         assert_eq!(oper.groups, vec!["wheel"]);
         assert_eq!(oper.from_version, 3);
+    }
+
+    #[test]
+    fn reads_recorded_sudo_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[account]]
+name = "oper"
+uid = 9010
+shell = "/bin/bash"
+groups = ["wheel"]
+sudo_commands = ["/usr/sbin/ip", "/usr/bin/nmcli"]
+from_version = 3
+"#,
+        )
+        .unwrap();
+        let st = RegistryState::load(&path).unwrap();
+        let oper = &st.managed_accounts()["oper"];
+        assert_eq!(oper.sudo_commands, vec!["/usr/sbin/ip", "/usr/bin/nmcli"]);
+    }
+
+    #[test]
+    fn old_registry_without_sudo_commands_reads_as_empty() {
+        // Back-compat: a registry written before sudo_commands existed must still
+        // load (serde default = empty), not be rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            "[[account]]\nname = \"oper\"\nuid = 9010\nshell = \"/bin/bash\"\ngroups = [\"wheel\"]\nfrom_version = 3\n",
+        )
+        .unwrap();
+        let st = RegistryState::load(&path).unwrap();
+        assert!(st.managed_accounts()["oper"].sudo_commands.is_empty());
     }
 
     #[test]

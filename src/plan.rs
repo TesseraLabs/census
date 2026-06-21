@@ -140,6 +140,20 @@ fn diff_fields(target: &ResolvedAccount, current: &ManagedAccount) -> Vec<String
     if target.sudo_role != current.sudo_role {
         changes.push(format!("sudo {:?} -> {:?}", current.sudo_role, target.sudo_role));
     }
+    // Concrete sudo commands: compared set-equal (order-insensitive), mirroring
+    // groups/sudo_role. Granting or revoking a permission that changes the
+    // command set must produce an Update so the NOPASSWD fragment is rewritten —
+    // otherwise a revoked command would leak as a stale rule.
+    let mut tc = target.sudo_commands.clone();
+    let mut cc = current.sudo_commands.clone();
+    tc.sort();
+    cc.sort();
+    if tc != cc {
+        changes.push(format!(
+            "sudo-commands {:?} -> {:?}",
+            current.sudo_commands, target.sudo_commands
+        ));
+    }
     changes
 }
 
@@ -319,6 +333,7 @@ mod tests {
             home: PathBuf::from(format!("/var/lib/census/home/{name}")),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
+            sudo_commands: Vec::new(),
             limits: Limits::default(),
             locked_password: true,
         }
@@ -331,6 +346,7 @@ mod tests {
             shell: shell.to_owned(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
+            sudo_commands: Vec::new(),
             from_version: v,
         }
     }
@@ -479,6 +495,39 @@ mod tests {
         )]);
         let plan = diff(&targets, &st);
         assert!(plan.is_empty(), "identical sudo_role must produce no actions");
+    }
+
+    #[test]
+    fn sudo_commands_change_yields_update() {
+        // Same account otherwise; the permission set expanded a different sudo
+        // command set → must be an Update with a change line mentioning it.
+        let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
+        t.sudo_commands = vec!["/usr/sbin/ip".into(), "/usr/bin/nmcli".into()];
+        let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
+        m.sudo_commands = vec!["/usr/sbin/ip".into()];
+        let plan = diff(&[t], &state_of(vec![m]));
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            Action::Update { changes, .. } => {
+                assert_eq!(changes.len(), 1, "only sudo-commands should differ");
+                assert!(
+                    changes[0].contains("sudo-commands"),
+                    "change must mention sudo-commands: {changes:?}"
+                );
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identical_sudo_commands_order_insensitive_is_idempotent() {
+        // Same command set in a different order must NOT produce an action.
+        let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
+        t.sudo_commands = vec!["/usr/sbin/ip".into(), "/usr/bin/nmcli".into()];
+        let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
+        m.sudo_commands = vec!["/usr/bin/nmcli".into(), "/usr/sbin/ip".into()];
+        let plan = diff(&[t], &state_of(vec![m]));
+        assert!(plan.is_empty(), "same command set in different order is in sync");
     }
 
     // ---- group diff (task 3) ----

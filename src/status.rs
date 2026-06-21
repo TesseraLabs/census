@@ -76,6 +76,7 @@ mod tests {
             shell: "/bin/bash".to_owned(),
             groups: vec![],
             sudo_role: None,
+            sudo_commands: Vec::new(),
             from_version,
         }
     }
@@ -88,6 +89,7 @@ mod tests {
             home: PathBuf::from("/h"),
             groups: vec![],
             sudo_role: None,
+            sudo_commands: Vec::new(),
             limits: Limits::default(),
             locked_password: true,
         }
