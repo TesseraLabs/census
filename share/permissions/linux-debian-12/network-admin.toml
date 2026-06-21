@@ -1,0 +1,5 @@
+id        = "network-admin"
+# Debian 12 ships netplan as the default renderer; append its apply tool to the
+# family base (which states the portable ip/nmcli set). `.append` keeps the base
+# list intact rather than restating it.
+sudo.append = ["/usr/sbin/netplan apply"]

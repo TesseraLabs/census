@@ -1,0 +1,6 @@
+id       = "app-config-edit"
+risk     = "contained"
+category = "app"
+# Parametrized site-config editor: the role supplies `path = "..."` (or a list).
+# Census renders one sudoers Cmnd per concrete path via the editor wrapper.
+sudo     = ["/usr/bin/sensible-editor {path}"]

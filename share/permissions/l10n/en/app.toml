@@ -1,0 +1,4 @@
+[app-config-edit]
+title     = "Application config editing"
+summary   = "Edit specific application config files via a wrapped editor (parameter: path)."
+risk_note = "Risk depends on the file: editing a security-relevant config can be escalation-capable."

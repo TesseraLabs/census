@@ -911,7 +911,26 @@ pub enum CatalogError {
         /// The second list param that triggered the error.
         second: String,
     },
+    /// Bundle expansion recursed deeper than [`MAX_INCLUDE_DEPTH`]. The cycle
+    /// detector already terminates on looping include graphs; this guards the
+    /// remaining case of a pathologically long *acyclic* include chain, which
+    /// would otherwise grow the native stack one frame per level and risk a
+    /// stack overflow before any cycle could be found. The bound is generous
+    /// enough that no legitimate catalog reaches it.
+    #[error("permission {id} include chain exceeds maximum depth {depth}")]
+    IncludeTooDeep {
+        /// The id being expanded when the limit was hit.
+        id: String,
+        /// The depth at which expansion was refused.
+        depth: usize,
+    },
 }
+
+/// Maximum number of nested bundle includes expanded from a single root before
+/// resolution is refused with [`CatalogError::IncludeTooDeep`]. Deliberately
+/// generous: real catalogs nest only a handful of levels, so any chain this
+/// long is an accident or an attack, not a legitimate composition.
+const MAX_INCLUDE_DEPTH: usize = 64;
 
 /// Resolve a single permission id against the OS layer chain, bottom→top.
 ///
@@ -1132,6 +1151,19 @@ fn resolve_inner(
         let mut cycle: Vec<String> = path[start..].to_vec();
         cycle.push(id.to_owned());
         return Err(CatalogError::Cycle(cycle));
+    }
+
+    // Depth bound: the cycle check above terminates on looping graphs, but an
+    // acyclic chain of distinct ids (a -> b -> c -> …) still recurses one native
+    // frame per level. The path stack's current length is exactly the number of
+    // bundles open above this one, so refuse before adding another frame once the
+    // chain grows past a generous bound — turning a would-be stack overflow into
+    // a clean, reportable error.
+    if path.len() >= MAX_INCLUDE_DEPTH {
+        return Err(CatalogError::IncludeTooDeep {
+            id: id.to_owned(),
+            depth: path.len(),
+        });
     }
 
     let chain = os.layer_names();
@@ -2142,6 +2174,63 @@ include_categories = ["network"]
             }
             other => panic!("expected Cycle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deep_acyclic_include_chain_is_rejected_not_overflowed() {
+        // A chain of distinct ids p0 -> p1 -> … -> pN, each including the next,
+        // is acyclic so the cycle detector never fires; without the depth bound
+        // it would recurse one native frame per link. Build a chain longer than
+        // MAX_INCLUDE_DEPTH and assert it is refused cleanly.
+        let len = MAX_INCLUDE_DEPTH + 5;
+        let mut cat = FakeCatalog::new();
+        for i in 0..len {
+            let id = format!("p{i}");
+            let def = if i + 1 < len {
+                PermissionDef {
+                    includes: vec![format!("p{}", i + 1)],
+                    ..def(&id)
+                }
+            } else {
+                // Leaf at the bottom of the chain.
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                    ..def(&id)
+                }
+            };
+            cat = cat.with("linux", def);
+        }
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve("p0", &os, &cat, &ctx()).unwrap_err();
+        match err {
+            CatalogError::IncludeTooDeep { depth, .. } => {
+                assert!(depth >= MAX_INCLUDE_DEPTH, "depth {depth} below bound");
+            }
+            other => panic!("expected IncludeTooDeep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shallow_bundle_resolves_under_depth_bound() {
+        // A normal two-level bundle is well under the bound and resolves fine.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                    ..def("leaf")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    includes: vec!["leaf".to_owned()],
+                    ..def("bundle")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (r, _) = resolve("bundle", &os, &cat, &ctx()).unwrap();
+        assert_eq!(values(&r.sudo), vec!["/usr/sbin/ip"]);
     }
 
     // --- 2.2 categories (include_categories) ---

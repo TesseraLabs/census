@@ -1,0 +1,4 @@
+id       = "network-diag"
+risk     = "contained"
+category = "network"
+sudo     = ["/usr/bin/ss", "/usr/sbin/ip", "/usr/bin/mtr", "/usr/bin/ping"]

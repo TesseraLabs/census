@@ -1,0 +1,4 @@
+id       = "boot-config"
+risk     = "escalation-capable"
+category = "boot"
+sudo     = ["/usr/sbin/update-grub", "/usr/sbin/grub-install"]

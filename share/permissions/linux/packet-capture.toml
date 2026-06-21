@@ -1,0 +1,4 @@
+id       = "packet-capture"
+risk     = "escalation-capable"
+category = "network"
+sudo     = ["/usr/bin/tcpdump", "/usr/bin/tshark"]

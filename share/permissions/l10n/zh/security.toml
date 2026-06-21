@@ -1,0 +1,24 @@
+[apparmor-admin]
+title     = "AppArmor 管理"
+summary   = "加载并切换 AppArmor 配置文件（aa-enforce、aa-complain、apparmor_parser）。"
+risk_note = "将配置文件设为 complain/disabled 会移除服务周围的限制屏障。"
+
+[ca-trust-admin]
+title     = "CA 信任管理"
+summary   = "更新系统受信任 CA 存储（update-ca-certificates）。"
+risk_note = "添加 CA 可使伪造的 TLS 证书在全主机受信任——中间人攻击的助推器。"
+
+[udev-config]
+title     = "udev 配置"
+summary   = "管理设备规则并重载 udev（udevadm）。"
+risk_note = "udev 规则可在设备事件时以 root 运行命令——一种持久化/提权向量。"
+
+[selinux-admin]
+title     = "SELinux 管理"
+summary   = "管理 SELinux 模式和策略（setenforce、semanage、setsebool）。"
+risk_note = "setenforce 0 会在全主机禁用强制访问控制。"
+
+[firmware-secureboot]
+title     = "Secure Boot 密钥管理"
+summary   = "管理 Secure Boot MOK 登记（mokutil）。"
+risk_note = "登记密钥可使未签名/攻击者的代码通过 Secure Boot 校验。"

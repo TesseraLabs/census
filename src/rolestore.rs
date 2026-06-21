@@ -14,18 +14,21 @@ use std::path::{Path, PathBuf};
 /// a bare id string (`"network-admin"`), or a table with an `id` key plus
 /// arbitrary parameters (`{ id = "service-restart", units = ["nginx"] }`).
 ///
-/// Slice 3 expands only the *id* — the captured `params` are parsed (so a
-/// parametrized slice is accepted, not rejected) but inert: parameter
-/// substitution (templating the catalog record against `params`) is a separate
-/// follow-up. Capturing the params now keeps the role-slice schema stable so
-/// that follow-up needs no re-parse change.
+/// The `id` selects the catalog record; the `params` parameterize how that
+/// record expands. A catalog permission may carry `{placeholder}` templates
+/// (e.g. a `service-restart` whose sudo command names a unit, or a config-path
+/// grant) that are meaningless without per-role values. The role supplies those
+/// values here, and they are substituted into the matching placeholders at
+/// resolve time (see `catalog::resolve_with_params`). Capturing them in the
+/// parsed shape is what lets one catalog record serve many roles with different
+/// units or paths.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionRef {
     /// The permission id to resolve against the catalog.
     pub id: String,
     /// Parameters from the table form (`units`, `path`, …). Empty for the bare
-    /// string form. Inert this slice (templating is a follow-up); retained so
-    /// the parsed shape is complete.
+    /// string form. These fill the catalog record's `{placeholder}` templates
+    /// during resolution, so a single record can be specialized per role.
     pub params: BTreeMap<String, toml::Value>,
 }
 

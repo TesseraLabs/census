@@ -1,0 +1,4 @@
+id       = "atm-peripheral"
+risk     = "contained"
+category = "peripheral"
+groups   = ["dialout", "plugdev"]

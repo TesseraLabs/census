@@ -1,0 +1,4 @@
+id       = "logind-config"
+risk     = "contained"
+category = "os-config"
+sudo     = ["/usr/bin/systemctl restart systemd-logind"]

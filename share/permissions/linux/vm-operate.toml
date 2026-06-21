@@ -1,0 +1,5 @@
+id       = "vm-operate"
+risk     = "contained"
+category = "virt"
+groups   = ["libvirt"]
+sudo     = ["/usr/bin/virsh"]

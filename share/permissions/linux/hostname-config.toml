@@ -1,0 +1,4 @@
+id       = "hostname-config"
+risk     = "contained"
+category = "os-config"
+sudo     = ["/usr/bin/hostnamectl"]

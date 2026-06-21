@@ -1,0 +1,34 @@
+[network-diag]
+title     = "Network diagnostics"
+summary   = "Read-only inspection of sockets, links and reachability (ss, ip, mtr, ping)."
+risk_note = "Read-only: exposes state and counters but changes nothing."
+
+[network-admin]
+title     = "Network administration"
+summary   = "Configure interfaces, addresses, links and connections (ip, nmcli)."
+risk_note = "Effectively root: `ip netns exec` runs arbitrary commands in a namespace."
+
+[firewall-admin]
+title     = "Firewall administration"
+summary   = "Manage packet-filter rules (nft, iptables/ip6tables, restore)."
+risk_note = "Rewriting rules can disable or bypass the host's network policy."
+
+[packet-capture]
+title     = "Packet capture"
+summary   = "Capture and dissect traffic on interfaces (tcpdump, tshark)."
+risk_note = "tcpdump `-z postrotate` executes a command — a path to arbitrary code as root."
+
+[dns-config]
+title     = "DNS resolver configuration"
+summary   = "Set resolver state and per-link DNS (resolvectl)."
+risk_note = "Redirecting resolution is a MITM vector for every name lookup on the host."
+
+[vpn-admin]
+title     = "VPN administration"
+summary   = "Bring up and configure WireGuard tunnels (wg, wg-quick, resolvectl)."
+risk_note = "Tunnel config can reroute traffic and override DNS for the whole host."
+
+[route-admin]
+title     = "Routing administration"
+summary   = "Manage the kernel routing table (ip route)."
+risk_note = "Adding routes can silently divert traffic to an attacker-controlled hop."

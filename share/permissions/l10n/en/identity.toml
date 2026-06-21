@@ -1,0 +1,39 @@
+[admin]
+title     = "Administrator"
+summary   = "Grant the platform admin group (sudo); distro layers add OS-specific admin groups."
+risk_note = "Full administrative authority — a curatorial decision, never a default."
+
+[console-access]
+title     = "Local console access"
+summary   = "Grant local-console membership; distro layers add the OS console group."
+risk_note = "Contained: physical/local console only, no remote or privileged commands by itself."
+
+[ssh-admin]
+title     = "SSH administration"
+summary   = "Manage and restart the SSH daemon (sshd, systemctl restart ssh)."
+risk_note = "Opens remote entry — runs against the offline-by-design posture of the fleet."
+
+[user-admin]
+title     = "User administration"
+summary   = "Create, modify and delete users and passwords (useradd, usermod, passwd)."
+risk_note = "Conflicts with Census's role-accounts model: lets one bypass the managed accounts — strong lint warning, not for ordinary roles."
+
+[sudo-config]
+title     = "sudoers configuration"
+summary   = "Edit the sudoers policy (visudo)."
+risk_note = "A direct path to root: can grant itself unrestricted sudo — almost never issued."
+
+[pam-config]
+title     = "PAM configuration"
+summary   = "Manage the PAM authentication stack (pam-auth-update, faillock)."
+risk_note = "Controls how authentication works — can weaken or bypass login checks."
+
+[nss-config]
+title     = "NSS / directory configuration"
+summary   = "Configure name resolution and SSSD/Kerberos (sssctl, restart sssd, kinit)."
+risk_note = "Redefining identity sources can change who maps to which uid/groups."
+
+[polkit-config]
+title     = "Polkit configuration"
+summary   = "Inspect and reload polkit authorization (pkaction, restart polkit)."
+risk_note = "Polkit rules govern privileged actions — a permissive rule is an escalation path."

@@ -1,0 +1,49 @@
+[log-read]
+title     = "Чтение логов"
+summary   = "Чтение /var/log и журнала (группы adm, systemd-journal)."
+risk_note = "Логи могут протекать секретами (токены, пароли), попавшими в вывод служб."
+
+[log-admin]
+title     = "Администрирование логов"
+summary   = "Ротация и очистка логов (logrotate, journalctl)."
+risk_note = "Очистка или ротация логов может стереть журнал аудита — заметание следов."
+
+[journald-config]
+title     = "Настройка journald"
+summary   = "Перезапуск systemd-journald для применения настроек журнала."
+risk_note = "Contained: перезапускает службу журнала."
+
+[coredump-config]
+title     = "Настройка core dump"
+summary   = "Осмотр и управление дампами памяти (coredumpctl)."
+risk_note = "Contained, но дампы привилегированных процессов могут содержать секреты из памяти."
+
+[audit-config]
+title     = "Настройка аудита"
+summary   = "Управление правилами аудита ядра (auditctl, augenrules)."
+risk_note = "Отключение правил аудита срывает подотчётность — ослепляет монитор безопасности."
+
+[syslog-admin]
+title     = "Администрирование syslog"
+summary   = "Перезапуск демона syslog для применения настроек (rsyslog)."
+risk_note = "Contained: перезапускает rsyslog; правка конфигов — отдельно."
+
+[process-inspect]
+title     = "Осмотр процессов"
+summary   = "Просмотр процессов всех пользователей (ps, top, lsof)."
+risk_note = "Contained, но раскрывает командные строки и открытые файлы чужих процессов."
+
+[process-control]
+title     = "Управление процессами"
+summary   = "Сигналы и приоритеты любого процесса (kill, renice, pkill)."
+risk_note = "Может слать сигналы процессам любого uid — отказ в обслуживании системных служб."
+
+[perf-trace]
+title     = "Трассировка производительности"
+summary   = "Трассировка системных вызовов и профилирование (strace, perf, bpftrace, ltrace)."
+risk_note = "strace цепляется через ptrace к любому процессу — кража кредов и инъекция кода."
+
+[metrics-export]
+title     = "Экспорт метрик"
+summary   = "Запуск node exporter (группа prometheus, перезапуск node-exporter)."
+risk_note = "Contained: отдаёт метрики хоста стеку мониторинга."

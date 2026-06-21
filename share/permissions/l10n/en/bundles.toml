@@ -1,0 +1,34 @@
+[network-config]
+title     = "Network configuration (bundle)"
+summary   = "Diagnostics + interface, firewall, DNS and routing administration."
+risk_note = "Escalation-capable: inherits network-admin's `ip netns exec` root path."
+
+[storage-admin]
+title     = "Storage administration (bundle)"
+summary   = "Mount, partition, swap, fstab, quota and LUKS administration."
+risk_note = "Escalation-capable and destructive: full control over block devices and mounts."
+
+[observability]
+title     = "Observability (bundle)"
+summary   = "Log read/admin, journald, process inspect, metrics and tracing."
+risk_note = "Escalation-capable: inherits perf-trace (ptrace) and log-admin (trail erasure)."
+
+[host-hardening]
+title     = "Host hardening (bundle)"
+summary   = "AppArmor, audit, sysctl, PAM, CA trust and udev administration."
+risk_note = "Escalation-capable: each member can weaken a host security control."
+
+[boot-admin]
+title     = "Boot administration (bundle)"
+summary   = "Bootloader, kernel cmdline, initramfs, TPM and LUKS administration."
+risk_note = "Escalation-capable: controls what runs before and during boot."
+
+[device-operator]
+title     = "Device operator (bundle)"
+summary   = "Serial, USB, bus and video device access plus udev configuration."
+risk_note = "Escalation-capable via the included udev-config (root command on device events)."
+
+[peripheral-operator]
+title     = "Peripheral operator (bundle)"
+summary   = "Print, audio, display, UPS and ATM-peripheral access."
+risk_note = "Contained: all members are device/peripheral access, no host privilege gain."

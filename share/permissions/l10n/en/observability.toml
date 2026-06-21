@@ -1,0 +1,49 @@
+[log-read]
+title     = "Log reading"
+summary   = "Read /var/log and the journal (adm, systemd-journal groups)."
+risk_note = "Logs may leak secrets (tokens, passwords) captured in service output."
+
+[log-admin]
+title     = "Log administration"
+summary   = "Rotate and vacuum logs (logrotate, journalctl)."
+risk_note = "Clearing or rotating logs can erase the audit trail — covers tracks."
+
+[journald-config]
+title     = "journald configuration"
+summary   = "Restart systemd-journald to apply journal settings."
+risk_note = "Contained: restarts the journal service."
+
+[coredump-config]
+title     = "Core dump configuration"
+summary   = "Inspect and manage core dumps (coredumpctl)."
+risk_note = "Contained, but core dumps of privileged processes can contain in-memory secrets."
+
+[audit-config]
+title     = "Audit configuration"
+summary   = "Manage kernel audit rules (auditctl, augenrules)."
+risk_note = "Disabling audit rules defeats accountability — blinds the security monitor."
+
+[syslog-admin]
+title     = "Syslog administration"
+summary   = "Restart the syslog daemon to apply logging config (rsyslog)."
+risk_note = "Contained: restarts rsyslog; config edits land elsewhere."
+
+[process-inspect]
+title     = "Process inspection"
+summary   = "View processes across all users (ps, top, lsof)."
+risk_note = "Contained, but reveals other users' command lines and open files."
+
+[process-control]
+title     = "Process control"
+summary   = "Signal and reprioritize any process (kill, renice, pkill)."
+risk_note = "Can signal processes of any uid — denial of service against system services."
+
+[perf-trace]
+title     = "Performance tracing"
+summary   = "Trace syscalls and profile processes (strace, perf, bpftrace, ltrace)."
+risk_note = "strace attaches via ptrace to any process — credential theft and code injection."
+
+[metrics-export]
+title     = "Metrics export"
+summary   = "Run the node exporter (prometheus group, restart node-exporter)."
+risk_note = "Contained: exposes host metrics to the monitoring stack."

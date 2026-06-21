@@ -1,0 +1,14 @@
+["docker.ps"]
+title     = "Docker inspect"
+summary   = "List and inspect containers via the docker group."
+risk_note = "The docker group equals root: the daemon socket can mount the host and run privileged containers."
+
+["docker.compose"]
+title     = "Docker Compose"
+summary   = "Run docker-compose stacks via the docker group."
+risk_note = "The docker group equals root: compose can bind-mount host paths and gain full control."
+
+["docker.admin"]
+title     = "Docker administration (bundle)"
+summary   = "Inspect and Compose plus restarting the Docker daemon."
+risk_note = "The docker group equals root: managing the daemon is full host compromise."

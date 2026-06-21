@@ -1,0 +1,5 @@
+id     = "device-serial"
+# On Astra the serial/modem device nodes are owned by uucp in addition to
+# dialout (matches the live atm-ansible udev layer). Replace the base group set
+# with the Astra-correct pair.
+groups = ["dialout", "uucp"]

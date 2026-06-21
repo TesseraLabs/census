@@ -1,0 +1,5 @@
+id       = "print-admin"
+risk     = "contained"
+category = "peripheral"
+groups   = ["lpadmin"]
+sudo     = ["/usr/sbin/cupsctl", "/usr/sbin/lpadmin"]

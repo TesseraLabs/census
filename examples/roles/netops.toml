@@ -1,0 +1,16 @@
+role    = "netops"
+version = 1
+os      = "linux"
+name    = "Network operator"
+level   = 5
+
+[payload]
+# A bundle plus a couple of standalone permissions, plus a parametrized
+# service-restart scoped to named units. Exercises bundle expansion, leaf
+# resolve, and per-unit templating in one role.
+permissions = [
+    "network-config",
+    "log-read",
+    "packet-capture",
+    { id = "service-restart", units = ["nginx", "wg-quick@wg0"] },
+]

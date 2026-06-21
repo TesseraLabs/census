@@ -1,0 +1,4 @@
+id       = "display-config"
+risk     = "contained"
+category = "peripheral"
+sudo     = ["/usr/bin/xrandr"]

@@ -1,0 +1,4 @@
+id       = "package-query"
+risk     = "contained"
+category = "packages"
+sudo     = ["/usr/bin/apt", "/usr/bin/dpkg"]

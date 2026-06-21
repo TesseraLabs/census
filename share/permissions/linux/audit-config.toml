@@ -1,0 +1,4 @@
+id       = "audit-config"
+risk     = "escalation-capable"
+category = "observability"
+sudo     = ["/usr/sbin/auditctl", "/usr/sbin/augenrules"]

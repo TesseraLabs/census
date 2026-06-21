@@ -1,0 +1,4 @@
+id       = "apparmor-admin"
+risk     = "escalation-capable"
+category = "security"
+sudo     = ["/usr/sbin/aa-enforce", "/usr/sbin/aa-complain", "/usr/sbin/apparmor_parser", "/usr/sbin/aa-status"]

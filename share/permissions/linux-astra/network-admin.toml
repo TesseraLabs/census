@@ -1,0 +1,4 @@
+id        = "network-admin"
+# Astra (Orel/Smolensk) uses classic ifupdown rather than netplan; append the
+# legacy interface up/down tools to the family base.
+sudo.append = ["/usr/sbin/ifup", "/usr/sbin/ifdown"]

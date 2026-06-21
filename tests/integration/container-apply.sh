@@ -365,5 +365,73 @@ assert     "corrupt registry + destructive plan fails" "[ $rc21 -ne 0 ] && [ $rc
 assert     "lr account untouched by fail-closed"       "getent passwd lr >/dev/null"
 assert     "output names trust/registry/error"         "echo \"\$out21\" | grep -qiE 'registr|session|error|trust'"
 
+echo "== scenario 22-24: PERMISSION CATALOG (permissions[] → expanded groups + concrete sudoers) =="
+# Isolated subtree. Roles carry `permissions = [...]` (catalog ids), NOT raw
+# groups/sudo_role; `census apply --catalog-dir /work/share/permissions` expands
+# them per OS target. Container is debian/bookworm → resolves linux + linux-debian
+# + linux-debian-12 layers. Real catalog facts asserted on (from share/permissions):
+#   network-admin → groups=[netdev], sudo=[/usr/sbin/ip,/usr/bin/nmcli]
+#                   (+ debian-12 delta: /usr/sbin/netplan apply)
+#   log-read      → groups=[adm,systemd-journal], no sudo
+CROOT="$ROOT/cat"; CSTORE="$CROOT/roles"; CMAN="$CROOT/managed.toml"
+mkdir -p "$CSTORE"
+# Catalog-expanded groups must pre-exist (Census manages member accounts, not the
+# base groups the catalog references; useradd -G requires them present).
+groupadd -f netdev; groupadd -f adm; groupadd -f systemd-journal
+c_store() { # $1 = permissions array contents (e.g. '"network-admin", "log-read"')
+  cat > "$CSTORE/netop.toml" <<EOF
+role = "netop"
+version = 1
+os = "linux"
+name = "NetOperator"
+level = 5
+[payload]
+permissions = [$1]
+EOF
+}
+c_decl() { # $1 = version
+  cat > "$CROOT/decl.toml" <<EOF
+version = $1
+role_store = "$CSTORE"
+[defaults]
+uid_range = [9000, 9999]
+shell = "/bin/bash"
+home_base = "/var/lib/census/home"
+[[role_account]]
+role = "netop"
+uid = 9060
+EOF
+}
+c_apply() { "$CENSUS" apply --declaration "$CROOT/decl.toml" --managed "$CMAN" --trust-fs --i-understand-no-rescue --catalog-dir /work/share/permissions 2>&1; }
+
+echo "-- 22: permission-authored role materializes catalog-expanded groups + concrete sudoers --"
+c_store '"network-admin", "log-read"'
+c_decl 1
+echo ":: $(c_apply)"
+assert     "netop account exists"               "getent passwd netop >/dev/null"
+assert     "netop in group netdev (network-admin)"        "id -nG netop | grep -qw netdev"
+assert     "netop in group adm (log-read)"                "id -nG netop | grep -qw adm"
+assert     "netop in group systemd-journal (log-read)"    "id -nG netop | grep -qw systemd-journal"
+assert     "census-netop sudoers present"       "test -f $SUDOERS/census-netop"
+assert     "census-netop passes visudo"         "visudo -c -f $SUDOERS/census-netop >/dev/null 2>&1"
+assert     "sudoers has concrete /usr/sbin/ip"  "grep -q '/usr/sbin/ip' $SUDOERS/census-netop"
+assert     "sudoers has NOPASSWD"               "grep -q 'NOPASSWD' $SUDOERS/census-netop"
+assert     "managed.toml lists netop"           "grep -q 'name = \"netop\"' $CMAN"
+assert     "managed.toml records sudo_commands" "grep -q 'sudo_commands' $CMAN"
+
+echo "-- 23: IDEMPOTENT re-apply (no changes) --"
+out23="$(c_apply)"; echo ":: $out23"
+assert     "second catalog apply is no-op"      "echo \"\$out23\" | grep -qiE 'no changes|plan is empty|0 mutation'"
+
+echo "-- 24: REVOCATION rewrites sudoers (drop network-admin) --"
+c_store '"log-read"'                             # network-admin removed; only log-read (no sudo)
+c_decl 2                                         # bump version
+echo ":: $(c_apply)"
+# log-read declares no sudo, so the fragment may be removed entirely; either way the
+# revoked permission's concrete command must be gone — proving permission revocation
+# rewrites the concrete command set, not just group membership.
+assert_not "revoked /usr/sbin/ip absent from sudoers" "test -f $SUDOERS/census-netop && grep -q '/usr/sbin/ip' $SUDOERS/census-netop"
+assert     "netop account retained"             "getent passwd netop >/dev/null"
+
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

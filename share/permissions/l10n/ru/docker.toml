@@ -1,0 +1,14 @@
+["docker.ps"]
+title     = "Осмотр Docker"
+summary   = "Перечисление и осмотр контейнеров через группу docker."
+risk_note = "Группа docker = root: сокет демона позволяет смонтировать хост и запустить привилегированный контейнер."
+
+["docker.compose"]
+title     = "Docker Compose"
+summary   = "Запуск стеков docker-compose через группу docker."
+risk_note = "Группа docker = root: compose может смонтировать пути хоста и получить полный контроль."
+
+["docker.admin"]
+title     = "Администрирование Docker (бандл)"
+summary   = "Осмотр и Compose плюс перезапуск демона Docker."
+risk_note = "Группа docker = root: управление демоном — полная компрометация хоста."

@@ -1,0 +1,14 @@
+["docker.ps"]
+title     = "Docker 查看"
+summary   = "通过 docker 组列出并查看容器。"
+risk_note = "docker 组等同 root：守护进程套接字可挂载主机并运行特权容器。"
+
+["docker.compose"]
+title     = "Docker Compose"
+summary   = "通过 docker 组运行 docker-compose 栈。"
+risk_note = "docker 组等同 root：compose 可绑定挂载主机路径并取得完全控制。"
+
+["docker.admin"]
+title     = "Docker 管理（捆绑）"
+summary   = "查看与 Compose，并重启 Docker 守护进程。"
+risk_note = "docker 组等同 root：管理守护进程即完全控制主机。"

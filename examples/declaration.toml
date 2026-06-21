@@ -1,0 +1,36 @@
+# Example Census declaration for the starter permission catalog.
+#
+# It binds one role-account per example role. Run compile/show against it with
+# the in-repo catalog, e.g.:
+#
+#   census compile netops \
+#     --declaration examples/declaration.toml \
+#     --catalog-dir share/permissions \
+#     --os-target linux-debian-12 --lint
+#
+# `role_store` is relative to the working directory (run from the census/ repo
+# root). Override the OS target with --os-target to see per-distro deltas
+# (linux-debian-12, linux-ubuntu-22.04, linux-astra-1.8).
+version    = 1
+role_store = "examples/roles"
+
+[defaults]
+uid_range = [9000, 9999]
+shell     = "/bin/bash"
+home_base = "/var/lib/census/home"
+
+[[role_account]]
+role = "netops"
+uid  = 9001
+
+[[role_account]]
+role = "hostadmin"
+uid  = 9002
+
+[[role_account]]
+role = "deviceop"
+uid  = 9003
+
+[[role_account]]
+role = "dockerop"
+uid  = 9004

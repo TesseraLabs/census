@@ -1,0 +1,8 @@
+id       = "admin"
+risk     = "escalation-capable"
+category = "identity"
+# Generic "administrator" capability. The OS-family base grants the portable
+# admin group; distro layers expand it with their OS-specific admin groups
+# (e.g. astra adds astra-admin). Issuing this is a curatorial decision, never a
+# default (admin-by-design).
+groups   = ["sudo"]

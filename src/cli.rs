@@ -800,6 +800,12 @@ fn json_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // U+2028 (line separator) and U+2029 (paragraph separator) are valid
+            // JSON but are line terminators in ECMAScript: left literal, they
+            // break any consumer that embeds this output in a JS/JSONP string.
+            // Escape them so `compile --json` is safe to splice into JS.
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
@@ -1122,6 +1128,22 @@ pub fn lint_role(
 mod tests {
     use super::*;
     use std::process::ExitCode;
+
+    #[test]
+    fn json_str_escapes_structural_and_control_chars() {
+        assert_eq!(json_str("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(json_str("a\nb\tc\r"), r#""a\nb\tc\r""#);
+        // U+0000..U+001F other than the named ones use the \uXXXX form.
+        assert_eq!(json_str("\u{0001}"), "\"\\u0001\"");
+    }
+
+    #[test]
+    fn json_str_escapes_js_line_terminators() {
+        // U+2028 / U+2029 are valid JSON but ECMAScript line terminators; they
+        // must be escaped so the output is safe to embed in a JS/JSONP string.
+        assert_eq!(json_str("a\u{2028}b"), "\"a\\u2028b\"");
+        assert_eq!(json_str("a\u{2029}b"), "\"a\\u2029b\"");
+    }
 
     /// Write a role-store slice + a declaration whose single role-account, once
     /// resolved, exactly matches the managed record below (→ empty plan). The

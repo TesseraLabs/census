@@ -1,0 +1,3 @@
+id          = "console-access"
+# Astra-specific local-console group.
+groups.append = ["astra-console"]

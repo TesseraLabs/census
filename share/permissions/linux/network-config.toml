@@ -1,0 +1,4 @@
+id       = "network-config"
+risk     = "escalation-capable"
+category = "network"
+includes = ["network-diag", "network-admin", "firewall-admin", "dns-config", "route-admin"]

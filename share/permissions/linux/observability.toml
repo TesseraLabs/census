@@ -1,0 +1,4 @@
+id       = "observability"
+risk     = "escalation-capable"
+category = "observability"
+includes = ["log-read", "log-admin", "journald-config", "process-inspect", "metrics-export", "perf-trace"]
