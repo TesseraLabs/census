@@ -2,9 +2,13 @@
 
 use crate::apply::{self, ApplyInputs};
 use crate::backup::{Backup, BackupTargets};
+use crate::doctor::{self, DoctorReport};
+use crate::inspect::LiveInspector;
 use crate::lockout::LockoutContext;
+use crate::model::ResolvedAccount;
 use crate::mutate::ShadowUtilsProvisioner;
 use crate::state::SystemState;
+use crate::status;
 use crate::trust::{self, TrustMode, TrustOptions};
 use crate::{declaration::Declaration, model, plan, state::RegistryState};
 use std::path::{Path, PathBuf};
@@ -188,6 +192,107 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
     }
 }
 
+/// Render a doctor report as human-readable lines (one per finding).
+pub fn render_report(report: &DoctorReport) -> String {
+    if report.findings.is_empty() {
+        return "doctor: no findings — invariants hold\n".to_owned();
+    }
+    let mut out = String::new();
+    for f in &report.findings {
+        out.push_str(&format!(
+            "{} [{}] {}: {}\n",
+            f.severity.tag(),
+            f.check,
+            f.target,
+            f.message
+        ));
+    }
+    out
+}
+
+/// Resolve the declaration at `path` into target accounts for the optional
+/// drift check. Returns `None` (and logs to stderr) on any read/parse/resolve
+/// error — a doctor/status run continues without drift rather than aborting.
+fn resolve_targets(path: &Path) -> Option<Vec<ResolvedAccount>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("warning: cannot read declaration {}: {e}", path.display());
+            return None;
+        }
+    };
+    let decl = match Declaration::parse(&text) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("warning: declaration invalid: {e}");
+            return None;
+        }
+    };
+    match model::resolve(&decl) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("warning: cannot resolve declaration: {e}");
+            None
+        }
+    }
+}
+
+/// Run `census doctor`: read-only diagnostics over the live system + registry,
+/// optionally checking declaration drift. Exits NON-ZERO if any Error-severity
+/// finding is present, else 0. Never mutates anything.
+pub fn run_doctor(declaration: Option<&Path>, managed: &Path) -> ExitCode {
+    let state = match RegistryState::load(managed) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let targets = declaration.and_then(resolve_targets);
+    let inspector = LiveInspector::new();
+    let report = doctor::run_doctor(&state, &inspector, targets.as_deref());
+    print!("{}", render_report(&report));
+    doctor_exit_code(&report)
+}
+
+/// Map a doctor report to its process exit code: non-zero iff it has errors.
+/// Extracted as a pure function so the exit-code policy is unit-testable
+/// without a live system.
+fn doctor_exit_code(report: &DoctorReport) -> ExitCode {
+    if report.has_errors() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Run `census status`: read-only summary of managed accounts, the persisted
+/// declaration version, and optional drift. ALWAYS exits 0.
+pub fn run_status(declaration: Option<&Path>, managed: &Path, persist_dir: &Path) -> ExitCode {
+    let state = match RegistryState::load(managed) {
+        Ok(s) => s,
+        Err(e) => {
+            // status never fails the exit code; surface the error and print an
+            // empty summary by falling back to an absent registry.
+            eprintln!("warning: {e}");
+            print!("{}", status::render_status(&RegistryState::default_empty(), None, None));
+            return ExitCode::SUCCESS;
+        }
+    };
+    let persisted = match trust::last_applied_version(persist_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("warning: cannot read persisted version: {e}");
+            None
+        }
+    };
+    let drift = declaration
+        .and_then(resolve_targets)
+        .map(|targets| plan::diff(&targets, &state));
+    print!("{}", status::render_status(&state, persisted, drift.as_ref()));
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +466,72 @@ mod tests {
             None,
             "refused apply must not persist a floor"
         );
+    }
+
+    // ---- doctor / status CLI-level (tasks 4.4) ----
+
+    use crate::doctor::{DoctorReport, Finding, Severity};
+
+    fn finding(sev: Severity) -> Finding {
+        Finding { severity: sev, check: "x", target: "t".into(), message: "m".into() }
+    }
+
+    #[test]
+    fn doctor_exit_non_zero_when_errors() {
+        let report = DoctorReport { findings: vec![finding(Severity::Error)] };
+        assert_eq!(
+            format!("{:?}", doctor_exit_code(&report)),
+            format!("{:?}", ExitCode::FAILURE)
+        );
+    }
+
+    #[test]
+    fn doctor_exit_zero_when_clean() {
+        let report = DoctorReport::default();
+        assert_eq!(
+            format!("{:?}", doctor_exit_code(&report)),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+    }
+
+    #[test]
+    fn doctor_exit_zero_when_only_warnings() {
+        let report = DoctorReport { findings: vec![finding(Severity::Warn)] };
+        assert_eq!(
+            format!("{:?}", doctor_exit_code(&report)),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+    }
+
+    #[test]
+    fn render_report_clean_and_tagged() {
+        assert!(render_report(&DoctorReport::default()).contains("no findings"));
+        let report = DoctorReport {
+            findings: vec![finding(Severity::Error), finding(Severity::Warn)],
+        };
+        let text = render_report(&report);
+        assert!(text.contains("ERROR ["));
+        assert!(text.contains("WARN ["));
+    }
+
+    #[test]
+    fn status_always_exits_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No declaration, no managed file, no persisted version → still 0.
+        let code = run_status(None, &tmp.path().join("absent.toml"), tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn status_with_declaration_exits_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (decl, managed) = fixtures(tmp.path());
+        std::fs::write(
+            &managed,
+            "[[account]]\nname = \"oper\"\nuid = 9010\nshell = \"/bin/bash\"\ngroups = [\"wheel\"]\nfrom_version = 5\n",
+        )
+        .unwrap();
+        let code = run_status(Some(&decl), &managed, tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }
 }

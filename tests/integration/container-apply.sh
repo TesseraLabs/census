@@ -181,5 +181,40 @@ out8="$(apply_managed "$MROOT/d5.signed" 2>&1)"; rc8=$?
 assert     "rollback to version 5 fails"         "[ $rc8 -ne 0 ]"
 assert     "persisted version still 10"          "[ \"\$(cat /var/lib/census/declaration.version)\" = 10 ]"
 
+echo "== scenario 9-13: DOCTOR + STATUS (read-only diagnostics) =="
+# Isolate doctor on the managed state $MMAN (audit). Remove the scenario 1-5
+# census-marked account so it isn't seen as an orphan marker against $MMAN.
+userdel -r oper 2>/dev/null || true
+doctor() { "$CENSUS" doctor --managed "$MMAN" 2>&1; }
+
+echo "-- 9: doctor clean on managed state → exit 0 --"
+out9="$(doctor)"; rc9=$?; echo ":: $out9"
+assert     "doctor clean exits 0"          "[ $rc9 -eq 0 ]"
+
+echo "-- 10: unlocked password → doctor Error (non-zero) --"
+passwd -d audit >/dev/null 2>&1            # clear password (now login-capable w/o auth)
+doctor >/dev/null 2>&1; rc10=$?
+assert     "doctor flags unlocked pw"      "[ $rc10 -ne 0 ]"
+passwd -l audit >/dev/null 2>&1            # restore lock
+
+echo "-- 11: authorized_keys present → doctor Error --"
+mkdir -p /var/lib/census/home/audit/.ssh && echo "ssh-ed25519 AAAA test" > /var/lib/census/home/audit/.ssh/authorized_keys
+doctor >/dev/null 2>&1; rc11=$?
+assert     "doctor flags authorized_keys"  "[ $rc11 -ne 0 ]"
+rm -rf /var/lib/census/home/audit/.ssh
+
+echo "-- 12: GECOS-spoof (census marker on non-registry account) → doctor Error --"
+useradd -M -s /usr/sbin/nologin -c "census-role-ghost" ghost 2>/dev/null
+doctor >/dev/null 2>&1; rc12=$?
+assert     "doctor flags GECOS spoof"      "[ $rc12 -ne 0 ]"
+userdel ghost 2>/dev/null || true
+
+echo "-- 13: doctor clean again after restore; status exits 0 --"
+doctor >/dev/null 2>&1; rc13=$?
+assert     "doctor clean after restore"    "[ $rc13 -eq 0 ]"
+"$CENSUS" status --managed "$MMAN" >/dev/null 2>&1; rcs=$?
+assert     "status exits 0"                "[ $rcs -eq 0 ]"
+assert     "status prints audit + version" "\"$CENSUS\" status --managed \"$MMAN\" 2>&1 | grep -qE 'audit|version|10'"
+
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

@@ -61,6 +61,12 @@ pub enum StateError {
 }
 
 impl RegistryState {
+    /// An empty registry (no managed accounts). Useful as a read-only fallback
+    /// when the on-disk registry cannot be loaded and the caller must not fail.
+    pub fn default_empty() -> Self {
+        RegistryState { accounts: BTreeMap::new() }
+    }
+
     /// Load the registry. A missing file yields an empty (no-managed) state.
     pub fn load(path: &Path) -> Result<Self, StateError> {
         if !path.exists() {

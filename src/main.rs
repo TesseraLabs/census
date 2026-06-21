@@ -33,6 +33,26 @@ enum Command {
         #[arg(long)]
         i_understand_no_rescue: bool,
     },
+    /// Read-only diagnostics: verify the §4/§7/§8 invariants hold. Non-zero exit
+    /// on any error-severity finding (for monitoring/CI).
+    Doctor {
+        /// Optional declaration TOML; enables the drift check when present.
+        #[arg(long)]
+        declaration: Option<std::path::PathBuf>,
+        /// Path to the managed registry (current Census-managed state).
+        #[arg(long, default_value = "/var/lib/census/managed.toml")]
+        managed: std::path::PathBuf,
+    },
+    /// Read-only state summary: managed accounts, persisted version, drift.
+    /// Always exits 0.
+    Status {
+        /// Optional declaration TOML; enables the drift summary when present.
+        #[arg(long)]
+        declaration: Option<std::path::PathBuf>,
+        /// Path to the managed registry (current Census-managed state).
+        #[arg(long, default_value = "/var/lib/census/managed.toml")]
+        managed: std::path::PathBuf,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -53,5 +73,13 @@ fn main() -> std::process::ExitCode {
             trust_anchor_path: std::path::PathBuf::from(census::trust::DEFAULT_TRUST_ANCHOR),
             persist_dir: std::path::PathBuf::from(census::trust::DEFAULT_PERSIST_DIR),
         }),
+        Command::Doctor { declaration, managed } => {
+            census::cli::run_doctor(declaration.as_deref(), &managed)
+        }
+        Command::Status { declaration, managed } => census::cli::run_status(
+            declaration.as_deref(),
+            &managed,
+            std::path::Path::new(census::trust::DEFAULT_PERSIST_DIR),
+        ),
     }
 }
