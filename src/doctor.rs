@@ -65,6 +65,7 @@ impl DoctorReport {
 
 /// Check identifiers (stable strings for output / tests / monitoring).
 const CHECK_REGISTRY: &str = "registry-integrity";
+const CHECK_GROUP_REGISTRY: &str = "group-registry-integrity";
 const CHECK_UNREACHABLE: &str = "unreachability";
 const CHECK_ANTILOCKOUT: &str = "anti-lockout";
 const CHECK_DRIFT: &str = "drift";
@@ -135,6 +136,34 @@ pub fn run_doctor(
                           (possible spoof; registry is authoritative)"
                     .to_owned(),
             });
+        }
+    }
+
+    // --- §4 managed-group integrity (Error) ---
+    // A Census-owned group recorded in the registry must still exist live, with
+    // the recorded GID. A vanished managed group or a GID that drifted from the
+    // record is a broken invariant (Census never renumbers on the fly).
+    for (name, record) in &managed.managed_groups() {
+        match inspector.group(name) {
+            None => findings.push(Finding {
+                severity: Severity::Error,
+                check: CHECK_GROUP_REGISTRY,
+                target: name.clone(),
+                message: "registry group has no live group (managed group vanished)".to_owned(),
+            }),
+            Some(facts) => {
+                if facts.gid != record.gid {
+                    findings.push(Finding {
+                        severity: Severity::Error,
+                        check: CHECK_GROUP_REGISTRY,
+                        target: name.clone(),
+                        message: format!(
+                            "live gid {} != registry gid {} (managed group renumbered out of band)",
+                            facts.gid, record.gid
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -225,7 +254,6 @@ mod tests {
     use crate::inspect::{AccountFacts, FakeInspector};
     use crate::rolestore::Limits;
     use crate::state::{FakeState, ManagedAccount};
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn managed_acct(name: &str, uid: u32, shell: &str, groups: &[&str]) -> ManagedAccount {
@@ -242,6 +270,7 @@ mod tests {
     fn state_of(accts: Vec<ManagedAccount>) -> FakeState {
         FakeState {
             accounts: accts.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            ..Default::default()
         }
     }
 
@@ -364,6 +393,74 @@ mod tests {
             "group order must not be a diff: {:?}",
             report.findings
         );
+    }
+
+    // ---- §4 managed-group integrity ----
+
+    use crate::inspect::GroupFacts;
+    use crate::state::ManagedGroup;
+
+    fn state_with_group(accts: Vec<ManagedAccount>, groups: Vec<ManagedGroup>) -> FakeState {
+        FakeState {
+            accounts: accts.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            groups: groups.into_iter().map(|g| (g.name.clone(), g)).collect(),
+        }
+    }
+
+    fn mgroup(name: &str, gid: u32) -> ManagedGroup {
+        ManagedGroup { name: name.to_owned(), gid, from_version: 1 }
+    }
+
+    #[test]
+    fn managed_group_present_and_matching_is_clean() {
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![mgroup("atm-operators", 8010)],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        let report = run_doctor(&st, &insp, None);
+        assert!(
+            !report.findings.iter().any(|f| f.check == CHECK_GROUP_REGISTRY),
+            "matching managed group must be clean: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn managed_group_missing_from_system_is_error() {
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![mgroup("atm-operators", 8010)],
+        );
+        // Inspector has NO atm-operators group → vanished.
+        let insp = healthy_inspector();
+        let report = run_doctor(&st, &insp, None);
+        assert!(report.has_errors());
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_GROUP_REGISTRY && f.target == "atm-operators")
+            .expect("vanished group finding");
+        assert!(f.message.contains("vanished"));
+    }
+
+    #[test]
+    fn managed_group_gid_drift_is_error() {
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![mgroup("atm-operators", 8010)],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8099 });
+        let report = run_doctor(&st, &insp, None);
+        assert!(report.has_errors());
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_GROUP_REGISTRY && f.target == "atm-operators")
+            .expect("gid drift finding");
+        assert!(f.message.contains("gid"));
     }
 
     // ---- §8 unreachability ----
@@ -490,7 +587,7 @@ mod tests {
 
     #[test]
     fn empty_registry_with_rescue_is_clean() {
-        let st = FakeState { accounts: BTreeMap::new() };
+        let st = FakeState::default();
         let mut insp = FakeInspector::default();
         insp.login_capable.insert("root".into());
         let report = run_doctor(&st, &insp, None);

@@ -13,10 +13,12 @@
 //! path, phase-failure → restore + no registry write, and idempotent empty plan.
 
 use crate::declaration::Declaration;
+use crate::inspect::SystemInspector;
 use crate::mutate::{Provisioner, ProvisionError};
-use crate::plan::{self, Action};
-use crate::state::{ManagedAccount, SystemState};
+use crate::plan::{self, Action, GroupAction};
+use crate::state::{ManagedAccount, ManagedGroup, SystemState};
 use crate::trust::{self, TrustMode, TrustOptions};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Errors that abort apply (each maps to a non-zero exit upstream).
@@ -44,6 +46,15 @@ pub enum ApplyError {
     /// Writing the managed registry (last, atomic) failed after success.
     #[error("registry write failed: {0}")]
     Registry(String),
+    /// Group planning failed (GID-pin conflict or managed-group GID drift). This
+    /// is surfaced BEFORE any snapshot/mutation — Census never renumbers.
+    #[error("group plan rejected: {0}")]
+    GroupPlan(#[from] plan::GroupPlanError),
+    /// The required group set contains an invalid name (e.g. a malformed
+    /// role-store `payload.groups` entry). Surfaced before any mutation so apply
+    /// fails closed rather than passing the name to `groupadd`.
+    #[error(transparent)]
+    Declaration(#[from] crate::declaration::DeclarationError),
 }
 
 /// Result of attempting a rollback after a phase failure.
@@ -76,6 +87,9 @@ pub struct ApplyInputs<'a> {
     pub declaration_bytes: &'a [u8],
     /// Current managed state (registry-backed in production).
     pub state: &'a dyn SystemState,
+    /// Read-only live-system inspector, used to plan group actions (does a
+    /// required group already exist? its GID?). Read-only — never mutates.
+    pub inspector: &'a dyn SystemInspector,
     /// Trust options (`--trust-fs`, trust-anchor path, anti-rollback persist dir).
     pub trust: TrustOptions,
     /// Anti-lockout context (`rescue_present`, `--i-understand-no-rescue`).
@@ -92,6 +106,10 @@ pub struct ApplyInputs<'a> {
 pub struct ApplyReport {
     /// New managed accounts (to write to the registry, atomic & last).
     pub managed: Vec<ManagedAccount>,
+    /// New managed groups (to write to the registry alongside accounts). Only
+    /// groups Census created (went through `create_group`) and still-present
+    /// owned groups are recorded; deleted orphans are dropped.
+    pub managed_group_records: Vec<ManagedGroup>,
     /// Lines worth logging (trust decision, risk-ack, per-phase actions).
     pub log: Vec<LogLine>,
     /// Number of mutating operations performed (0 == idempotent no-op).
@@ -134,9 +152,21 @@ pub fn run(
     let targets = crate::model::resolve(inputs.declaration)
         .map_err(|e| ApplyError::Registry(e.to_string()))?;
 
-    // 4-5. Diff vs managed state.
+    // 4-5. Diff vs managed state (accounts).
     let managed_now = inputs.state.managed_accounts();
-    let plan = plan::diff(&targets, inputs.state);
+    let managed_groups_now = inputs.state.managed_groups();
+    let mut plan = plan::diff(&targets, inputs.state);
+
+    // 5b. Group plan: required set (role groups ∪ [[group]]) vs the managed
+    // group registry + live system. A GID-pin conflict or managed-group GID
+    // drift aborts HERE — before lockout, snapshot, or any mutation (Census
+    // never renumbers; design §Безопасность).
+    let required_groups = crate::declaration::required_groups(inputs.declaration, &targets)?;
+    plan.group_actions = plan::diff_groups_via_inspector(
+        &required_groups,
+        &managed_groups_now,
+        inputs.inspector,
+    )?;
 
     // 6. Anti-lockout gate (before snapshot / mutation).
     if inputs.lockout.risk_acknowledged {
@@ -144,12 +174,19 @@ pub fn run(
     }
     crate::lockout::gate(&plan, inputs.lockout)?;
 
-    // Idempotence: empty plan → zero mutations, no snapshot, no registry churn
-    // (but registry still reflects the in-sync target set, identical to before).
+    // Idempotence: empty plan (no account AND no group actions) → zero mutations,
+    // no snapshot, no registry churn (registry still reflects the in-sync set).
     if plan.is_empty() {
         log.push("plan is empty — no changes".to_owned());
         return Ok(ApplyReport {
             managed: build_managed_set(&targets, inputs.declaration.version, &managed_now),
+            managed_group_records: build_managed_groups(
+                &required_groups,
+                &managed_groups_now,
+                &[],
+                inputs.declaration.version,
+                inputs.inspector,
+            ),
             log,
             mutations: 0,
             registry_written: false,
@@ -175,10 +212,37 @@ pub fn run(
             rollback: RollbackOutcome::Restored, // nothing mutated yet
         })?;
 
-    // 8. Apply phases create → update → delete. On any error: restore, abort.
-    // Each create/update also materializes (or clears) its sudoers fragment;
-    // each delete first removes the role's fragment, then the account.
+    // 8. Apply phases in order (design Р4):
+    //   (1) create missing groups   — BEFORE accounts (membership needs them)
+    //   (2) create/update accounts + sudoers
+    //   (3) delete vanished accounts (sudoers fragment first, then userdel)
+    //   (4) delete orphan managed groups — AFTER accounts (no members left)
+    // On any error: restore from the snapshot, abort. `/etc/group`+`/etc/gshadow`
+    // are in the full-file backup set (BackupTargets::auth_db_default), so a
+    // failed group phase rolls back atomically with the rest.
     let mut mutations = 0usize;
+    let mut created_groups: Vec<(String, Option<u32>)> = Vec::new();
+
+    // Phase 1: create missing groups.
+    for ga in &plan.group_actions {
+        if let GroupAction::Create { name, gid } = ga {
+            match provisioner.create_group(name, *gid) {
+                Ok(()) => {
+                    mutations += 1;
+                    created_groups.push((name.clone(), *gid));
+                    let pin = gid.map(|g| g.to_string()).unwrap_or_else(|| "auto".to_owned());
+                    log.push(format!("create-group: {name} (gid {pin})"));
+                }
+                Err(source) => {
+                    return Err(phase_failure(provisioner, "create-group", source));
+                }
+            }
+        }
+    }
+
+    // Phases 2 & 3: account creates/updates, then deletes. The account `plan`
+    // already orders creates/updates before deletes (plan::diff), so a single
+    // pass preserves "deletes last" among accounts; group deletes come after.
     for action in &plan.actions {
         let (phase, result) = match action {
             Action::Create(acct) => (
@@ -206,25 +270,59 @@ pub fn run(
                 log.push(format!("{phase}: {}", action_label(action)));
             }
             Err(source) => {
-                let rollback = match provisioner.restore() {
-                    Ok(()) => RollbackOutcome::Restored,
-                    Err(e) => RollbackOutcome::Failed(e.to_string()),
-                };
-                return Err(ApplyError::Phase { phase, source, rollback });
+                return Err(phase_failure(provisioner, phase, source));
+            }
+        }
+    }
+
+    // Phase 4: delete orphan managed groups (after account deletes). The
+    // deleted groups are dropped from the registry by `build_managed_groups`
+    // (they are no longer in the required set), so nothing to record here.
+    for ga in &plan.group_actions {
+        if let GroupAction::Delete { name } = ga {
+            match provisioner.delete_group(name) {
+                Ok(()) => {
+                    mutations += 1;
+                    log.push(format!("delete-group: {name}"));
+                }
+                Err(source) => {
+                    return Err(phase_failure(provisioner, "delete-group", source));
+                }
             }
         }
     }
 
     // 9. Success: drop the snapshot. Registry write is the caller's job (atomic,
-    // last) — we return the new managed set with from_version recorded.
+    // last) — we return the new managed account + group sets.
     log.push("all phases succeeded".to_owned());
     Ok(ApplyReport {
         managed: build_managed_set(&targets, inputs.declaration.version, &managed_now),
+        managed_group_records: build_managed_groups(
+            &required_groups,
+            &managed_groups_now,
+            &created_groups,
+            inputs.declaration.version,
+            inputs.inspector,
+        ),
         log,
         mutations,
         registry_written: true,
         trust_mode,
     })
+}
+
+/// Run the provisioner's restore after a phase failure and package the
+/// resulting [`ApplyError::Phase`] (shared by every phase arm).
+fn phase_failure(
+    provisioner: &mut dyn Provisioner,
+    phase: &'static str,
+    source: ProvisionError,
+) -> ApplyError {
+    let rollback = match provisioner.restore() {
+        Ok(()) => RollbackOutcome::Restored,
+        Err(e) => RollbackOutcome::Failed(e.to_string()),
+    };
+    ApplyError::Phase { phase, source, rollback }
 }
 
 /// Compute the set of `census-<role>` sudoers fragment paths the plan will
@@ -300,6 +398,55 @@ fn build_managed_set(
         .collect()
 }
 
+/// Build the new managed-group registry set. A group is recorded iff Census
+/// OWNS it — it was already in the registry (carried forward) or Census created
+/// it this run (`created` carries the names + optional pins). Deleted orphans
+/// (in the old registry but no longer required) are dropped. The recorded GID
+/// is the pin when known; otherwise the live GID read back via `inspector`
+/// (OS-assigned). A carried-forward group keeps its prior GID record.
+///
+/// `required` is the required set (name → pin); `prior` is the old registry;
+/// `created` is the list of (name, pin) Census created this run.
+fn build_managed_groups(
+    required: &BTreeMap<String, Option<u32>>,
+    prior: &BTreeMap<String, ManagedGroup>,
+    created: &[(String, Option<u32>)],
+    version: u32,
+    inspector: &dyn SystemInspector,
+) -> Vec<ManagedGroup> {
+    let mut out = Vec::new();
+
+    // Carry forward prior-registry groups that are still required (owned, kept).
+    for (name, mg) in prior {
+        if required.contains_key(name) {
+            out.push(mg.clone());
+        }
+        // else: orphan — was deleted this run, drop from the registry.
+    }
+
+    // Add newly-created groups (not already carried forward).
+    for (name, pin) in created {
+        if prior.contains_key(name) {
+            continue; // already carried forward above
+        }
+        // Prefer the pin; otherwise read the OS-assigned GID back from the live
+        // system. If the read-back fails (should not happen right after a
+        // successful groupadd), fall back to 0 rather than panicking — doctor
+        // will flag a divergence on the next run.
+        let gid = pin
+            .or_else(|| inspector.group(name).map(|f| f.gid))
+            .unwrap_or(0);
+        out.push(ManagedGroup {
+            name: name.clone(),
+            gid,
+            from_version: version,
+        });
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 fn groups_equal(a: &[String], b: &[String]) -> bool {
     let mut a = a.to_vec();
     let mut b = b.to_vec();
@@ -308,10 +455,18 @@ fn groups_equal(a: &[String], b: &[String]) -> bool {
     a == b
 }
 
-/// Serialize a managed set to TOML and write it atomically (temp + rename) to
-/// `path`. Used by the CLI as the final step after a successful [`run`].
-pub fn write_registry(path: &Path, managed: &[ManagedAccount]) -> Result<(), ApplyError> {
-    let doc = RegistryDoc { account: managed.to_vec() };
+/// Serialize a managed set (accounts + groups) to TOML and write it atomically
+/// (temp + rename) to `path`. Used by the CLI as the final step after a
+/// successful [`run`].
+pub fn write_registry(
+    path: &Path,
+    managed: &[ManagedAccount],
+    groups: &[ManagedGroup],
+) -> Result<(), ApplyError> {
+    let doc = RegistryDoc {
+        account: managed.to_vec(),
+        group: groups.to_vec(),
+    };
     let text = toml::to_string(&doc).map_err(|e| ApplyError::Registry(e.to_string()))?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp: PathBuf = parent.join(".census-managed.toml.tmp");
@@ -325,14 +480,17 @@ pub fn write_registry(path: &Path, managed: &[ManagedAccount]) -> Result<(), App
 #[derive(serde::Serialize)]
 struct RegistryDoc {
     account: Vec<ManagedAccount>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    group: Vec<ManagedGroup>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inspect::{FakeInspector, GroupFacts};
     use crate::lockout::LockoutContext;
     use crate::model::ResolvedAccount;
-    use crate::state::FakeState;
+    use crate::state::{FakeState, ManagedGroup};
 
     /// Records every call and can be told to fail at a given phase.
     #[derive(Default)]
@@ -370,6 +528,12 @@ mod tests {
         fn delete(&mut self, name: &str) -> Result<(), ProvisionError> {
             self.maybe_fail("delete", name)
         }
+        fn create_group(&mut self, name: &str, _gid: Option<u32>) -> Result<(), ProvisionError> {
+            self.maybe_fail("create_group", name)
+        }
+        fn delete_group(&mut self, name: &str) -> Result<(), ProvisionError> {
+            self.maybe_fail("delete_group", name)
+        }
         fn apply_sudoers(&mut self, acct: &ResolvedAccount) -> Result<(), ProvisionError> {
             self.maybe_fail("apply_sudoers", &acct.name)
         }
@@ -390,6 +554,16 @@ mod tests {
             self.calls.push("restore".to_owned());
             Ok(())
         }
+    }
+
+    /// A FakeInspector reporting `wheel` as a pre-existing (foreign) system
+    /// group. The default test role references `wheel`; without this the group
+    /// plan would try to CREATE it. A pre-existing group is skipped (not
+    /// adopted), so the account-only assertions in legacy tests hold.
+    fn insp_with_wheel() -> FakeInspector {
+        let mut f = FakeInspector::default();
+        f.groups.insert("wheel".into(), GroupFacts { gid: 10 });
+        f
     }
 
     fn decl(role: &str, uid: u32) -> (tempfile::TempDir, Declaration) {
@@ -421,6 +595,7 @@ mod tests {
     fn fake_state(accts: Vec<ManagedAccount>) -> FakeState {
         FakeState {
             accounts: accts.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            ..Default::default()
         }
     }
 
@@ -429,11 +604,13 @@ mod tests {
         let (_t, d) = decl("oper", 9010);
         let st = fake_state(vec![]);
         let mut p = FakeProvisioner::default();
+        let insp = FakeInspector::default();
         let err = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"",
                 state: &st,
+                inspector: &insp,
                 trust: TrustOptions::default(), // no --trust-fs
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -459,11 +636,13 @@ mod tests {
         let (_t, d) = decl("oper", 9010);
         let st = fake_state(vec![]);
         let mut p = FakeProvisioner::default();
+        let insp = insp_with_wheel();
         let report = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"",
                 state: &st,
+                inspector: &insp,
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -486,11 +665,13 @@ mod tests {
         let (_t, d) = decl("oper", 9010);
         let st = fake_state(vec![]);
         let mut p = FakeProvisioner::failing("create");
+        let insp = FakeInspector::default();
         let err = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"",
                 state: &st,
+                inspector: &insp,
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -514,11 +695,13 @@ mod tests {
         let (_t, d) = decl("oper", 9010);
         let st = fake_state(vec![managed("oper", 9010, &["wheel"], 5)]);
         let mut p = FakeProvisioner::default();
+        let insp = insp_with_wheel();
         let report = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"",
                 state: &st,
+                inspector: &insp,
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -545,11 +728,13 @@ mod tests {
         let d = Declaration::parse(&text).unwrap();
         let st = fake_state(vec![managed("oper", 9010, &["wheel"], 5)]);
         let mut p = FakeProvisioner::default();
+        let insp = FakeInspector::default();
         let err = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"",
                 state: &st,
+                inspector: &insp,
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(), // no rescue, no risk-ack
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -583,11 +768,13 @@ mod tests {
         let (_t, d) = decl_with_sudo("oper", 9010);
         let st = fake_state(vec![]);
         let mut p = FakeProvisioner::default();
+        let insp = insp_with_wheel();
         let report = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"",
                 state: &st,
+                inspector: &insp,
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -625,11 +812,13 @@ mod tests {
         let d = Declaration::parse(&text).unwrap();
         let st = fake_state(vec![managed("oper", 9010, &["wheel"], 5)]);
         let mut p = FakeProvisioner::default();
+        let insp = FakeInspector::default();
         let report = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"",
                 state: &st,
+                inspector: &insp,
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 // Rescue present so the delete-only plan passes the lockout gate.
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
@@ -658,11 +847,13 @@ mod tests {
         let st = fake_state(vec![]);
         // Account creation succeeds; the sudoers materialization fails.
         let mut p = FakeProvisioner::failing("apply_sudoers");
+        let insp = FakeInspector::default();
         let err = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"",
                 state: &st,
+                inspector: &insp,
                 trust: TrustOptions { trust_fs: true, ..Default::default() },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -696,7 +887,12 @@ mod tests {
         let mut sudo_acct = managed("oper", 9010, &["wheel"], 5);
         sudo_acct.sudo_role = Some("ops".to_owned());
         let set = vec![sudo_acct, managed("plain", 9011, &[], 5)];
-        write_registry(&path, &set).unwrap();
+        let groups = vec![ManagedGroup {
+            name: "atm-operators".to_owned(),
+            gid: 8010,
+            from_version: 5,
+        }];
+        write_registry(&path, &set, &groups).unwrap();
         let reloaded = crate::state::RegistryState::load(&path).unwrap();
         let accts = reloaded.managed_accounts();
         assert_eq!(accts["oper"].uid, 9010);
@@ -704,6 +900,10 @@ mod tests {
         // sudo_role must survive the registry roundtrip (the privilege-retention fix).
         assert_eq!(accts["oper"].sudo_role.as_deref(), Some("ops"));
         assert_eq!(accts["plain"].sudo_role, None);
+        // managed groups round-trip alongside accounts.
+        let grps = reloaded.managed_groups();
+        assert_eq!(grps["atm-operators"].gid, 8010);
+        assert_eq!(grps["atm-operators"].from_version, 5);
     }
 
     // ---- managed-mode integration (task 4.4) ----
@@ -750,12 +950,14 @@ mod tests {
         let (_t, d) = decl("oper", 9010);
         let st = fake_state(vec![]);
         let mut p = FakeProvisioner::default();
+        let insp = FakeInspector::default();
         let persist = tempfile::tempdir().unwrap();
         let err = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: b"version = 5\n", // no signature line
                 state: &st,
+                inspector: &insp,
                 trust: managed_opts(PathBuf::from("/nonexistent.pub"), persist.path().to_path_buf()),
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -775,11 +977,13 @@ mod tests {
         let (_t, raw, d, anchor) = signed_managed(&sk, 5, "oper", 9010);
         let st = fake_state(vec![]);
         let mut p = FakeProvisioner::default();
+        let insp = insp_with_wheel();
         let report = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: raw.as_bytes(),
                 state: &st,
+                inspector: &insp,
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -801,11 +1005,13 @@ mod tests {
         let (_t, raw, d, anchor) = signed_managed(&sk, 5, "oper", 9010);
         let st = fake_state(vec![]);
         let mut p = FakeProvisioner::default();
+        let insp = FakeInspector::default();
         let err = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: raw.as_bytes(),
                 state: &st,
+                inspector: &insp,
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -830,11 +1036,13 @@ mod tests {
         let (_t, raw, d, anchor) = signed_managed(&sk, 5, "oper", 9010);
         let st = fake_state(vec![]);
         let mut p = FakeProvisioner::failing("create");
+        let insp = FakeInspector::default();
         let err = run(
             ApplyInputs {
                 declaration: &d,
                 declaration_bytes: raw.as_bytes(),
                 state: &st,
+                inspector: &insp,
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
                 lockout: LockoutContext { rescue_present: true, ..Default::default() },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
@@ -845,5 +1053,163 @@ mod tests {
         assert!(matches!(err, ApplyError::Phase { .. }));
         // Floor was never persisted by `run` (persist is the caller's job, only on Ok).
         assert_eq!(trust::last_applied_version(persist.path()).unwrap(), None);
+    }
+
+    // ---- group provisioning phase ordering / safety (task 4.4) ----
+
+    /// Build a `--trust-fs` declaration whose role references `group` as a
+    /// supplementary group, optionally pinning it via a `[[group]]` block.
+    /// Returns (tempdir, parsed declaration).
+    fn decl_with_group(
+        role: &str,
+        uid: u32,
+        group: &str,
+        pin: Option<u32>,
+    ) -> (tempfile::TempDir, Declaration) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{role}.toml")),
+            format!("role = \"{role}\"\nversion = 1\nos = \"linux\"\nname = \"X\"\nlevel = 0\n[payload]\ngroups = [\"{group}\"]\n"),
+        )
+        .unwrap();
+        let store = tmp.path().display().to_string();
+        let mut text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+        );
+        if let Some(g) = pin {
+            text.push_str(&format!("[[group]]\nname = \"{group}\"\ngid = {g}\n"));
+        }
+        let d = Declaration::parse(&text).unwrap();
+        (tmp, d)
+    }
+
+    fn trust_fs_inputs<'a>(
+        d: &'a Declaration,
+        st: &'a FakeState,
+        insp: &'a FakeInspector,
+    ) -> ApplyInputs<'a> {
+        ApplyInputs {
+            declaration: d,
+            declaration_bytes: b"",
+            state: st,
+            inspector: insp,
+            trust: TrustOptions { trust_fs: true, ..Default::default() },
+            lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+        }
+    }
+
+    fn managed_group(name: &str, gid: u32, v: u32) -> ManagedGroup {
+        ManagedGroup { name: name.to_owned(), gid, from_version: v }
+    }
+
+    fn fake_state_with_groups(
+        accts: Vec<ManagedAccount>,
+        groups: Vec<ManagedGroup>,
+    ) -> FakeState {
+        FakeState {
+            accounts: accts.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            groups: groups.into_iter().map(|g| (g.name.clone(), g)).collect(),
+        }
+    }
+
+    #[test]
+    fn group_create_precedes_account_create() {
+        // Role references a group absent from the system → it must be created
+        // BEFORE the account (membership needs it). Inspector reports no groups.
+        let (_t, d) = decl_with_group("oper", 9010, "atm-operators", Some(8010));
+        let st = FakeState::default();
+        let insp = FakeInspector::default();
+        let mut p = FakeProvisioner::default();
+        let report = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap();
+        let cg = p.calls.iter().position(|c| c == "create_group:atm-operators").expect("group create");
+        let ca = p.calls.iter().position(|c| c == "create:oper").expect("account create");
+        assert!(cg < ca, "group create must precede account create: {:?}", p.calls);
+        // Registry records the created group with its pinned GID.
+        assert_eq!(report.managed_group_records.len(), 1);
+        assert_eq!(report.managed_group_records[0].name, "atm-operators");
+        assert_eq!(report.managed_group_records[0].gid, 8010);
+        assert_eq!(report.managed_group_records[0].from_version, 5);
+    }
+
+    #[test]
+    fn group_delete_follows_account_delete() {
+        // Declaration with no accounts/groups; registry owns an account AND a
+        // group → both vanish. Account delete must precede group delete.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().display().to_string();
+        let text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+        );
+        let d = Declaration::parse(&text).unwrap();
+        let st = fake_state_with_groups(
+            vec![managed("oper", 9010, &[], 5)],
+            vec![managed_group("atm-operators", 8010, 5)],
+        );
+        // Group still live (so drift check passes) at its recorded gid.
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        let mut p = FakeProvisioner::default();
+        let report = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap();
+        let da = p.calls.iter().position(|c| c == "delete:oper").expect("account delete");
+        let dg = p.calls.iter().position(|c| c == "delete_group:atm-operators").expect("group delete");
+        assert!(da < dg, "account delete must precede group delete: {:?}", p.calls);
+        // The orphan group is dropped from the registry.
+        assert!(report.managed_group_records.is_empty(), "orphan group must leave the registry");
+    }
+
+    #[test]
+    fn pin_conflict_aborts_before_any_mutation() {
+        // Pin gid 8010 for atm-operators, but gid 8010 already belongs to a
+        // DIFFERENT live group. Apply must refuse before snapshot/mutation.
+        let (_t, d) = decl_with_group("oper", 9010, "atm-operators", Some(8010));
+        let st = FakeState::default();
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("other".into(), GroupFacts { gid: 8010 });
+        let mut p = FakeProvisioner::default();
+        let err = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap_err();
+        assert!(matches!(err, ApplyError::GroupPlan(_)), "expected GroupPlan error, got {err:?}");
+        assert!(!p.snapshotted, "pin conflict must abort before snapshot");
+        assert!(p.calls.is_empty(), "pin conflict must abort before any mutation");
+    }
+
+    #[test]
+    fn foreign_existing_group_is_never_created_or_deleted() {
+        // Role references `wheel`, which exists live but is NOT in the registry
+        // (foreign). It must be neither created nor deleted nor recorded.
+        let (_t, d) = decl_with_group("oper", 9010, "wheel", None);
+        let st = FakeState::default();
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
+        let mut p = FakeProvisioner::default();
+        let report = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap();
+        assert!(
+            !p.calls.iter().any(|c| c.starts_with("create_group")),
+            "foreign group must not be created: {:?}", p.calls
+        );
+        assert!(
+            !p.calls.iter().any(|c| c.starts_with("delete_group")),
+            "foreign group must not be deleted: {:?}", p.calls
+        );
+        assert!(report.managed_group_records.is_empty(), "foreign group must not enter the registry");
+    }
+
+    #[test]
+    fn group_create_failure_triggers_restore() {
+        let (_t, d) = decl_with_group("oper", 9010, "atm-operators", Some(8010));
+        let st = FakeState::default();
+        let insp = FakeInspector::default();
+        let mut p = FakeProvisioner::failing("create_group");
+        let err = run(trust_fs_inputs(&d, &st, &insp), &mut p).unwrap_err();
+        match err {
+            ApplyError::Phase { phase, rollback, .. } => {
+                assert_eq!(phase, "create-group");
+                assert_eq!(rollback, RollbackOutcome::Restored);
+            }
+            other => panic!("expected Phase error, got {other:?}"),
+        }
+        assert!(p.restored, "group-create failure must trigger restore");
+        // The account was never created (group phase failed first).
+        assert!(!p.calls.iter().any(|c| c == "create:oper"));
     }
 }

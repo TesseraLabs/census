@@ -29,11 +29,25 @@ pub struct AccountFacts {
     pub groups: Vec<String>,
 }
 
+/// Facts about one live group, as read from `getent group`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupFacts {
+    /// Numeric GID.
+    pub gid: u32,
+}
+
 /// Read-only view of the live system for diagnostics. Every method is
 /// non-mutating; implementations MUST NOT change OS state.
 pub trait SystemInspector {
     /// Facts for `name`, or `None` if the account is not present.
     fn account(&self, name: &str) -> Option<AccountFacts>;
+    /// Facts for group `name`, or `None` if the group is not present. Used by
+    /// the group diff (does it exist? its GID?) and doctor (GID drift).
+    fn group(&self, name: &str) -> Option<GroupFacts>;
+    /// The name of the group currently owning `gid`, or `None` if `gid` is
+    /// free. Used to detect a GID-pin conflict against a DIFFERENT existing
+    /// group (the pinned GID is already taken). Read-only.
+    fn group_name_by_gid(&self, gid: u32) -> Option<String>;
     /// `Some(true)` if the shadow password field is locked (starts with `!` or
     /// `*`), `Some(false)` if unlocked, `None` if the account/shadow entry is
     /// absent or unreadable.
@@ -90,6 +104,17 @@ impl LiveInspector {
         }
         let uid = f[2].parse::<u32>().ok()?;
         Some((f[0].to_owned(), uid, f[5].to_owned(), f[6].to_owned()))
+    }
+
+    /// Parse one `group` line (`name:passwd:gid:members`) into `(name, gid)`.
+    /// Returns `None` on a malformed line (short / non-numeric gid).
+    fn parse_group_line(line: &str) -> Option<(String, u32)> {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() < 3 {
+            return None;
+        }
+        let gid = f[2].parse::<u32>().ok()?;
+        Some((f[0].to_owned(), gid))
     }
 
     /// Supplementary groups for `name` from `getent group` output. A group line
@@ -150,6 +175,21 @@ impl SystemInspector for LiveInspector {
             home: std::path::PathBuf::from(home),
             groups: Self::groups_for(name),
         })
+    }
+
+    fn group(&self, name: &str) -> Option<GroupFacts> {
+        let text = Self::getent("group", Some(name))?;
+        let line = text.lines().next()?;
+        let (_n, gid) = Self::parse_group_line(line)?;
+        Some(GroupFacts { gid })
+    }
+
+    fn group_name_by_gid(&self, gid: u32) -> Option<String> {
+        // `getent group <gid>` resolves the group owning a numeric GID.
+        let text = Self::getent("group", Some(&gid.to_string()))?;
+        let line = text.lines().next()?;
+        let (name, _gid) = Self::parse_group_line(line)?;
+        Some(name)
     }
 
     fn password_locked(&self, name: &str) -> Option<bool> {
@@ -220,6 +260,8 @@ impl SystemInspector for LiveInspector {
 pub struct FakeInspector {
     /// Live accounts keyed by name.
     pub accounts: std::collections::BTreeMap<String, AccountFacts>,
+    /// Live groups keyed by name.
+    pub groups: std::collections::BTreeMap<String, GroupFacts>,
     /// Per-account password lock state (absent = `None`).
     pub locked: std::collections::BTreeMap<String, bool>,
     /// Accounts that have `authorized_keys`.
@@ -234,6 +276,17 @@ pub struct FakeInspector {
 impl SystemInspector for FakeInspector {
     fn account(&self, name: &str) -> Option<AccountFacts> {
         self.accounts.get(name).cloned()
+    }
+
+    fn group(&self, name: &str) -> Option<GroupFacts> {
+        self.groups.get(name).cloned()
+    }
+
+    fn group_name_by_gid(&self, gid: u32) -> Option<String> {
+        self.groups
+            .iter()
+            .find(|(_, f)| f.gid == gid)
+            .map(|(n, _)| n.clone())
     }
 
     fn password_locked(&self, name: &str) -> Option<bool> {
@@ -274,6 +327,34 @@ mod tests {
     #[test]
     fn parse_passwd_line_rejects_short_line() {
         assert!(LiveInspector::parse_passwd_line("oper:x:9010").is_none());
+    }
+
+    #[test]
+    fn parse_group_line_extracts_gid() {
+        let (name, gid) = LiveInspector::parse_group_line("wheel:x:10:oper,serv").unwrap();
+        assert_eq!(name, "wheel");
+        assert_eq!(gid, 10);
+        // member-less line is still valid (3 fields).
+        let (n2, g2) = LiveInspector::parse_group_line("tellers:x:8011:").unwrap();
+        assert_eq!(n2, "tellers");
+        assert_eq!(g2, 8011);
+    }
+
+    #[test]
+    fn parse_group_line_rejects_bad() {
+        assert!(LiveInspector::parse_group_line("wheel:x").is_none());
+        assert!(LiveInspector::parse_group_line("wheel:x:notnum:").is_none());
+    }
+
+    #[test]
+    fn fake_group_round_trips() {
+        let mut fake = FakeInspector::default();
+        fake.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        assert_eq!(fake.group("atm-operators"), Some(GroupFacts { gid: 8010 }));
+        assert_eq!(fake.group("absent"), None);
+        // reverse lookup by gid (pin-conflict detection).
+        assert_eq!(fake.group_name_by_gid(8010).as_deref(), Some("atm-operators"));
+        assert_eq!(fake.group_name_by_gid(9999), None);
     }
 
     #[test]

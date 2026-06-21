@@ -60,12 +60,12 @@ mod tests {
     use crate::rolestore::Limits;
     use crate::state::{FakeState, ManagedAccount};
     use crate::model::ResolvedAccount;
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn state_of(accts: Vec<ManagedAccount>) -> FakeState {
         FakeState {
             accounts: accts.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            ..Default::default()
         }
     }
 
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn empty_managed_and_no_version() {
-        let st = FakeState { accounts: BTreeMap::new() };
+        let st = FakeState::default();
         let out = render_status(&st, None, None);
         assert!(out.contains("(none)"));
         assert!(out.contains("declaration version (persisted): none"));
@@ -119,6 +119,7 @@ mod tests {
                 Action::Update { account: target("oper"), changes: vec!["x".into()] },
                 Action::Delete { name: "old".into() },
             ],
+            ..Default::default()
         };
         let out = render_status(&st, Some(3), Some(&plan));
         assert!(out.contains("drift: 1 create(s), 1 update(s), 1 delete(s)"));

@@ -62,6 +62,12 @@ pub fn gate(plan: &Plan, ctx: LockoutContext) -> Result<(), LockoutError> {
     if plan.is_empty() {
         return Ok(());
     }
+    // A plan that touches no account cannot remove a login path. Group actions
+    // (e.g. an orphan `groupdel`) do not affect login reachability, so a
+    // group-only plan can never cause a lockout — pass regardless of rescue/ack.
+    if plan.actions.is_empty() {
+        return Ok(());
+    }
     if ctx.rescue_present {
         return Ok(());
     }
@@ -97,6 +103,7 @@ mod tests {
     fn delete_only_plan() -> Plan {
         Plan {
             actions: vec![Action::Delete { name: "oper".into() }],
+            ..Default::default()
         }
     }
 
@@ -122,6 +129,7 @@ mod tests {
                 Action::Create(acct("admin")),
                 Action::Delete { name: "oper".into() },
             ],
+            ..Default::default()
         };
         assert!(gate(&plan, LockoutContext::default()).is_ok());
     }
@@ -135,5 +143,17 @@ mod tests {
     #[test]
     fn empty_plan_is_noop_and_allowed() {
         assert!(gate(&Plan::default(), LockoutContext::default()).is_ok());
+    }
+
+    #[test]
+    fn group_only_plan_is_allowed_without_rescue_or_ack() {
+        // A plan with ONLY group actions (e.g. an orphan groupdel) and no
+        // account actions touches no login path → must PASS even with no rescue
+        // and no risk-ack.
+        let plan = Plan {
+            actions: vec![],
+            group_actions: vec![crate::plan::GroupAction::Delete { name: "orphan".into() }],
+        };
+        assert!(gate(&plan, LockoutContext::default()).is_ok());
     }
 }

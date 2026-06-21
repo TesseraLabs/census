@@ -4,8 +4,10 @@
 //! accounts is an apply-time concern, not modelled here), deletes are flagged
 //! as destructive. No mutation happens here.
 
+use crate::inspect::GroupFacts;
 use crate::model::ResolvedAccount;
-use crate::state::{ManagedAccount, SystemState};
+use crate::state::{ManagedAccount, ManagedGroup, SystemState};
+use std::collections::BTreeMap;
 
 /// A single planned change.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,17 +35,88 @@ impl Action {
     }
 }
 
+/// A single planned group change. Computed from the required set vs the managed
+/// group registry + live facts (design Р3). Census only ever creates or deletes
+/// groups it owns (in the registry); pre-existing/foreign groups are skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupAction {
+    /// Group is required but not present in the system — create it (with the
+    /// pinned GID if the declaration pinned one, else OS-assigned).
+    Create {
+        /// Group name to create.
+        name: String,
+        /// Pinned GID, if declared.
+        gid: Option<u32>,
+    },
+    /// Group is in the registry (Census-owned) but no longer required and not
+    /// declared — delete it (destructive). Sequenced after account deletes.
+    Delete {
+        /// Group name to remove.
+        name: String,
+    },
+}
+
+impl GroupAction {
+    /// Whether this action is destructive (delete).
+    pub fn is_destructive(&self) -> bool {
+        matches!(self, GroupAction::Delete { .. })
+    }
+}
+
+/// A planning error that must abort before any mutation (design §Безопасность).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GroupPlanError {
+    /// A declaration pinned a GID that already belongs to a DIFFERENT existing
+    /// group. Census refuses rather than renumbering (destructive for file
+    /// owners). `existing_name` is the live group currently holding `gid`.
+    #[error("group {group:?} pins gid {gid} but that gid already belongs to group {existing_name:?}; refusing to renumber")]
+    GidPinConflict {
+        /// The required group whose pin conflicts.
+        group: String,
+        /// The pinned GID.
+        gid: u32,
+        /// The live group that already owns the GID.
+        existing_name: String,
+    },
+    /// A required group already exists with a GID that differs from its pin
+    /// (Census would have to renumber an existing group in place — refused).
+    #[error("group {group:?} exists with gid {live} but declaration pins gid {pinned}; refusing to renumber in place")]
+    PinnedGidMismatch {
+        /// The required group.
+        group: String,
+        /// The live GID.
+        live: u32,
+        /// The pinned GID.
+        pinned: u32,
+    },
+    /// A managed (registry) group's live GID diverges from the recorded GID —
+    /// surfaced as a planning error (not renumbered on the fly).
+    #[error("managed group {group:?} has live gid {live} but registry recorded {recorded}; refusing to renumber")]
+    ManagedGidDrift {
+        /// The managed group.
+        group: String,
+        /// The live GID.
+        live: u32,
+        /// The registry-recorded GID.
+        recorded: u32,
+    },
+}
+
 /// An ordered set of actions: creates, then updates, then deletes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
-    /// Ordered actions.
+    /// Ordered account actions.
     pub actions: Vec<Action>,
+    /// Ordered group actions (creates first, then deletes). Applied around the
+    /// account phases: creates BEFORE account create, deletes AFTER account
+    /// delete (design Р4).
+    pub group_actions: Vec<GroupAction>,
 }
 
 impl Plan {
-    /// True if nothing needs to change.
+    /// True if nothing needs to change (no account AND no group actions).
     pub fn is_empty(&self) -> bool {
-        self.actions.is_empty()
+        self.actions.is_empty() && self.group_actions.is_empty()
     }
 }
 
@@ -101,7 +174,134 @@ pub fn diff(targets: &[ResolvedAccount], state: &dyn SystemState) -> Plan {
         }
     }
 
-    Plan { actions }
+    Plan { actions, group_actions: Vec::new() }
+}
+
+/// Compute the group actions (design Р3). Pure logic over three inputs:
+/// * `required` — the required group set (name → optional pinned GID) from
+///   [`crate::declaration::required_groups`];
+/// * `managed_groups` — the Census-owned groups recorded in the registry;
+/// * `live` — live group facts by name (existence + GID), pre-collected by the
+///   caller from a [`crate::inspect::SystemInspector`] for every name that
+///   appears in `required` or `managed_groups`.
+///
+/// Rules (per design):
+/// * required & not present in system → `Create` (with pinned GID if any);
+/// * required & present but NOT in the registry (pre-existing/foreign) → SKIP
+///   (no create, no adopt) — Census did not create it, so it never owns it;
+/// * in registry & no longer required → `Delete` (orphan, Census-owned);
+/// * required, pinned GID conflicts with a different live group, or differs
+///   from an existing same-named group's GID, or a managed group's live GID
+///   diverges from the registry → `Err` (abort before mutation; never renumber).
+///
+/// Creates are emitted in `required` (BTreeMap) order, then deletes in registry
+/// order — deterministic, stable plan output.
+pub fn diff_groups(
+    required: &BTreeMap<String, Option<u32>>,
+    managed_groups: &BTreeMap<String, ManagedGroup>,
+    live: &BTreeMap<String, GroupFacts>,
+    gid_owners: &BTreeMap<u32, String>,
+) -> Result<Vec<GroupAction>, GroupPlanError> {
+    // `gid_owners` maps a pinned GID to the live group that owns it (if any),
+    // for pin-conflict detection against a DIFFERENT existing group. The caller
+    // collects it (live group facts only cover required/managed names, which is
+    // not enough to spot a foreign group already holding a pinned GID).
+    let mut creates = Vec::new();
+    for (name, pin) in required {
+        match live.get(name) {
+            // Already present in the system.
+            Some(facts) => {
+                if let Some(pinned) = pin {
+                    if *pinned != facts.gid {
+                        // Same-named group exists with a different GID than the
+                        // pin → refuse (would require in-place renumber).
+                        return Err(GroupPlanError::PinnedGidMismatch {
+                            group: name.clone(),
+                            live: facts.gid,
+                            pinned: *pinned,
+                        });
+                    }
+                }
+                // Present (registry or foreign) and GID consistent → nothing to
+                // create. Foreign groups are never adopted; membership is still
+                // assigned by the account phase. Managed-group GID drift is
+                // checked separately below.
+            }
+            // Not present → create (honoring the pin, with conflict check).
+            None => {
+                if let Some(pinned) = pin {
+                    if let Some(owner) = gid_owners.get(pinned) {
+                        if owner != name {
+                            return Err(GroupPlanError::GidPinConflict {
+                                group: name.clone(),
+                                gid: *pinned,
+                                existing_name: owner.clone(),
+                            });
+                        }
+                    }
+                }
+                creates.push(GroupAction::Create {
+                    name: name.clone(),
+                    gid: *pin,
+                });
+            }
+        }
+    }
+
+    // Managed-group GID drift: a registry group still present but whose live GID
+    // no longer matches the recorded GID. Refuse (do not renumber on the fly).
+    for (name, mg) in managed_groups {
+        if let Some(facts) = live.get(name) {
+            if facts.gid != mg.gid {
+                return Err(GroupPlanError::ManagedGidDrift {
+                    group: name.clone(),
+                    live: facts.gid,
+                    recorded: mg.gid,
+                });
+            }
+        }
+    }
+
+    // Deletes: registry (Census-owned) groups no longer required (BTreeMap order).
+    let mut deletes = Vec::new();
+    for name in managed_groups.keys() {
+        if !required.contains_key(name) {
+            deletes.push(GroupAction::Delete { name: name.clone() });
+        }
+    }
+
+    creates.extend(deletes);
+    Ok(creates)
+}
+
+/// Collect live group facts for every name in `required` or `managed_groups`
+/// from `inspector`, then run [`diff_groups`]. A thin orchestration helper so
+/// CLI (`plan`) and apply share one collection path. Read-only.
+pub fn diff_groups_via_inspector(
+    required: &BTreeMap<String, Option<u32>>,
+    managed_groups: &BTreeMap<String, ManagedGroup>,
+    inspector: &dyn crate::inspect::SystemInspector,
+) -> Result<Vec<GroupAction>, GroupPlanError> {
+    let mut live: BTreeMap<String, GroupFacts> = BTreeMap::new();
+    for name in required.keys().chain(managed_groups.keys()) {
+        if live.contains_key(name) {
+            continue;
+        }
+        if let Some(facts) = inspector.group(name) {
+            live.insert(name.clone(), facts);
+        }
+    }
+    // For each pinned GID, find the live group (if any) that already owns it,
+    // so a conflict against a DIFFERENT existing group is caught.
+    let mut gid_owners: BTreeMap<u32, String> = BTreeMap::new();
+    for pin in required.values().flatten() {
+        if let std::collections::btree_map::Entry::Vacant(e) = gid_owners.entry(*pin) {
+            if let Some(owner) = inspector.group_name_by_gid(*pin) {
+                e.insert(owner);
+            }
+        }
+    }
+    diff_groups(required, managed_groups, &live, &gid_owners)
 }
 
 #[cfg(test)]
@@ -109,7 +309,6 @@ mod tests {
     use super::*;
     use crate::rolestore::Limits;
     use crate::state::{FakeState, ManagedAccount};
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn target(name: &str, uid: u32, shell: &str, groups: &[&str]) -> ResolvedAccount {
@@ -166,13 +365,14 @@ mod tests {
     fn state_of(accts: Vec<ManagedAccount>) -> FakeState {
         FakeState {
             accounts: accts.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            ..Default::default()
         }
     }
 
     #[test]
     fn create_when_absent() {
         let targets = vec![target("oper", 9010, "/bin/bash", &["wheel"])];
-        let st = FakeState { accounts: BTreeMap::new() };
+        let st = FakeState::default();
         let plan = diff(&targets, &st);
         assert_eq!(plan.actions.len(), 1);
         assert!(matches!(plan.actions[0], Action::Create(_)));
@@ -279,6 +479,146 @@ mod tests {
         )]);
         let plan = diff(&targets, &st);
         assert!(plan.is_empty(), "identical sudo_role must produce no actions");
+    }
+
+    // ---- group diff (task 3) ----
+
+    use crate::inspect::GroupFacts;
+    use crate::state::ManagedGroup;
+
+    fn req(pairs: &[(&str, Option<u32>)]) -> BTreeMap<String, Option<u32>> {
+        pairs.iter().map(|(n, g)| (n.to_string(), *g)).collect()
+    }
+
+    fn mgroup(name: &str, gid: u32) -> ManagedGroup {
+        ManagedGroup { name: name.to_owned(), gid, from_version: 1 }
+    }
+
+    fn managed_groups(gs: &[ManagedGroup]) -> BTreeMap<String, ManagedGroup> {
+        gs.iter().map(|g| (g.name.clone(), g.clone())).collect()
+    }
+
+    fn live_groups(pairs: &[(&str, u32)]) -> BTreeMap<String, GroupFacts> {
+        pairs
+            .iter()
+            .map(|(n, gid)| (n.to_string(), GroupFacts { gid: *gid }))
+            .collect()
+    }
+
+    fn owners(pairs: &[(u32, &str)]) -> BTreeMap<u32, String> {
+        pairs.iter().map(|(g, n)| (*g, n.to_string())).collect()
+    }
+
+    fn no_owners() -> BTreeMap<u32, String> {
+        BTreeMap::new()
+    }
+
+    #[test]
+    fn group_create_when_missing() {
+        // required atm-operators (pinned 8010), not in system, not in registry.
+        let required = req(&[("atm-operators", Some(8010))]);
+        let actions =
+            diff_groups(&required, &BTreeMap::new(), &BTreeMap::new(), &no_owners()).unwrap();
+        assert_eq!(
+            actions,
+            vec![GroupAction::Create {
+                name: "atm-operators".into(),
+                gid: Some(8010)
+            }]
+        );
+    }
+
+    #[test]
+    fn group_create_without_pin() {
+        let required = req(&[("tellers", None)]);
+        let actions =
+            diff_groups(&required, &BTreeMap::new(), &BTreeMap::new(), &no_owners()).unwrap();
+        assert_eq!(actions, vec![GroupAction::Create { name: "tellers".into(), gid: None }]);
+    }
+
+    #[test]
+    fn group_skip_foreign_existing() {
+        // required wheel, already present in system but NOT in registry → SKIP.
+        let required = req(&[("wheel", None)]);
+        let live = live_groups(&[("wheel", 10)]);
+        let actions = diff_groups(&required, &BTreeMap::new(), &live, &no_owners()).unwrap();
+        assert!(actions.is_empty(), "foreign existing group must not be created or adopted");
+    }
+
+    #[test]
+    fn group_delete_orphan_in_registry() {
+        // Registry owns atm-operators; no longer required → Delete.
+        let required = req(&[]);
+        let registry = managed_groups(&[mgroup("atm-operators", 8010)]);
+        let live = live_groups(&[("atm-operators", 8010)]);
+        let actions = diff_groups(&required, &registry, &live, &no_owners()).unwrap();
+        assert_eq!(actions, vec![GroupAction::Delete { name: "atm-operators".into() }]);
+        assert!(actions[0].is_destructive());
+    }
+
+    #[test]
+    fn group_in_registry_still_required_no_action() {
+        let required = req(&[("atm-operators", Some(8010))]);
+        let registry = managed_groups(&[mgroup("atm-operators", 8010)]);
+        let live = live_groups(&[("atm-operators", 8010)]);
+        let actions = diff_groups(&required, &registry, &live, &no_owners()).unwrap();
+        assert!(actions.is_empty(), "still-required managed group needs no action");
+    }
+
+    #[test]
+    fn group_pin_conflict_with_different_group_errors() {
+        // Pin gid 8010 for atm-operators, but gid 8010 already belongs to a
+        // DIFFERENT live group `other` (and atm-operators itself is absent).
+        let required = req(&[("atm-operators", Some(8010))]);
+        // atm-operators itself is absent; gid 8010 is owned by foreign `other`.
+        let err = diff_groups(
+            &required,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &owners(&[(8010, "other")]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            GroupPlanError::GidPinConflict { ref existing_name, gid: 8010, .. } if existing_name == "other"
+        ));
+    }
+
+    #[test]
+    fn group_pin_mismatch_with_same_name_errors() {
+        // atm-operators exists live with gid 9999 but declaration pins 8010.
+        let required = req(&[("atm-operators", Some(8010))]);
+        let live = live_groups(&[("atm-operators", 9999)]);
+        let err = diff_groups(&required, &BTreeMap::new(), &live, &no_owners()).unwrap_err();
+        assert!(matches!(
+            err,
+            GroupPlanError::PinnedGidMismatch { live: 9999, pinned: 8010, .. }
+        ));
+    }
+
+    #[test]
+    fn managed_group_gid_drift_errors() {
+        // Registry recorded gid 8010, but live shows 8099 → refuse.
+        let required = req(&[("atm-operators", None)]);
+        let registry = managed_groups(&[mgroup("atm-operators", 8010)]);
+        let live = live_groups(&[("atm-operators", 8099)]);
+        let err = diff_groups(&required, &registry, &live, &no_owners()).unwrap_err();
+        assert!(matches!(
+            err,
+            GroupPlanError::ManagedGidDrift { live: 8099, recorded: 8010, .. }
+        ));
+    }
+
+    #[test]
+    fn group_create_and_delete_ordering() {
+        // new group required; old managed group orphaned. Create precedes delete.
+        let required = req(&[("new-grp", None)]);
+        let registry = managed_groups(&[mgroup("old-grp", 8010)]);
+        let live = live_groups(&[("old-grp", 8010)]);
+        let actions = diff_groups(&required, &registry, &live, &no_owners()).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions[0], GroupAction::Create { .. }));
+        assert!(matches!(actions[1], GroupAction::Delete { .. }));
     }
 
     #[test]

@@ -14,12 +14,23 @@ use crate::{declaration::Declaration, model, plan, state::RegistryState};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Render a plan as human-readable lines.
+/// Render a plan as human-readable lines. Group actions print first (creates,
+/// which precede account creation at apply time), then account actions, then
+/// group deletes (which follow account deletion at apply time).
 pub fn render_plan(p: &plan::Plan) -> String {
     if p.is_empty() {
         return "in sync — no changes\n".to_owned();
     }
     let mut out = String::new();
+    // Group creates (applied before accounts).
+    for ga in &p.group_actions {
+        if let plan::GroupAction::Create { name, gid } = ga {
+            match gid {
+                Some(g) => out.push_str(&format!("CREATE GROUP {name} (gid {g})\n")),
+                None => out.push_str(&format!("CREATE GROUP {name} (gid auto)\n")),
+            }
+        }
+    }
     for action in &p.actions {
         match action {
             plan::Action::Create(a) => {
@@ -31,6 +42,12 @@ pub fn render_plan(p: &plan::Plan) -> String {
             plan::Action::Delete { name } => {
                 out.push_str(&format!("DELETE {} (destructive)\n", name));
             }
+        }
+    }
+    // Group deletes (applied after account deletes).
+    for ga in &p.group_actions {
+        if let plan::GroupAction::Delete { name } = ga {
+            out.push_str(&format!("DELETE GROUP {name} (destructive)\n"));
         }
     }
     out
@@ -67,7 +84,25 @@ pub fn run_plan(declaration: &Path, managed: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let p = plan::diff(&targets, &state);
+    let mut p = plan::diff(&targets, &state);
+    // Group plan: union of role groups ∪ [[group]], diffed against the managed
+    // group registry + live system (read-only via getent group). A GID-pin
+    // conflict (or managed-group GID drift) surfaces here, before any apply.
+    let required = match crate::declaration::required_groups(&decl, &targets) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let inspector = LiveInspector::new();
+    match plan::diff_groups_via_inspector(&required, &state.managed_groups(), &inspector) {
+        Ok(group_actions) => p.group_actions = group_actions,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     print!("{}", render_plan(&p));
     ExitCode::SUCCESS
 }
@@ -127,11 +162,13 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
     // before the snapshot, so a later-phase failure rolls them back too (R2).
     let mut backup = Backup::new(BackupTargets::auth_db_default(), opts.rollback_root.clone());
     let managed_now = state.managed_accounts();
+    let inspector = LiveInspector::new();
 
     let inputs = ApplyInputs {
         declaration: &decl,
         declaration_bytes: text.as_bytes(),
         state: &state,
+        inspector: &inspector,
         trust: TrustOptions {
             trust_fs: opts.trust_fs,
             trust_anchor_path: opts.trust_anchor_path.clone(),
@@ -162,7 +199,11 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
             // Skip the registry rewrite on an empty (idempotent no-op) plan so a
             // byte-identical rewrite does not bump mtime (spec R8: zero mutations).
             if report.registry_written {
-                if let Err(e) = apply::write_registry(opts.managed, &report.managed) {
+                if let Err(e) = apply::write_registry(
+                    opts.managed,
+                    &report.managed,
+                    &report.managed_group_records,
+                ) {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
@@ -299,13 +340,16 @@ mod tests {
     use std::process::ExitCode;
 
     /// Write a role-store slice + a declaration whose single role-account, once
-    /// resolved, exactly matches the managed record below (→ empty plan).
+    /// resolved, exactly matches the managed record below (→ empty plan). The
+    /// role declares NO supplementary groups so the group plan is empty
+    /// independent of the host's `getent` (these tests exercise account/registry
+    /// behavior, not group provisioning).
     fn fixtures(dir: &Path) -> (PathBuf, PathBuf) {
         let store = dir.join("roles");
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(
             store.join("oper.toml"),
-            "role = \"oper\"\nversion = 1\nos = \"linux\"\nname = \"Operator\"\nlevel = 5\n[payload]\ngroups = [\"wheel\"]\n",
+            "role = \"oper\"\nversion = 1\nos = \"linux\"\nname = \"Operator\"\nlevel = 5\n[payload]\ngroups = []\n",
         )
         .unwrap();
         let decl = dir.join("declaration.toml");
@@ -328,7 +372,7 @@ mod tests {
         // Managed registry already matches the resolved target → empty plan.
         std::fs::write(
             &managed,
-            "[[account]]\nname = \"oper\"\nuid = 9010\nshell = \"/bin/bash\"\ngroups = [\"wheel\"]\nfrom_version = 5\n",
+            "[[account]]\nname = \"oper\"\nuid = 9010\nshell = \"/bin/bash\"\ngroups = []\nfrom_version = 5\n",
         )
         .unwrap();
         let before = std::fs::read(&managed).unwrap();
@@ -374,7 +418,7 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(
             store.join("oper.toml"),
-            "role = \"oper\"\nversion = 1\nos = \"linux\"\nname = \"Operator\"\nlevel = 5\n[payload]\ngroups = [\"wheel\"]\n",
+            "role = \"oper\"\nversion = 1\nos = \"linux\"\nname = \"Operator\"\nlevel = 5\n[payload]\ngroups = []\n",
         )
         .unwrap();
         let head = format!("version = {version}\nrole_store = \"{}\"\n", store.display());
@@ -396,7 +440,7 @@ mod tests {
         // Managed registry already matches → empty plan (no real mutations).
         std::fs::write(
             &managed,
-            "[[account]]\nname = \"oper\"\nuid = 9010\nshell = \"/bin/bash\"\ngroups = [\"wheel\"]\nfrom_version = 5\n",
+            "[[account]]\nname = \"oper\"\nuid = 9010\nshell = \"/bin/bash\"\ngroups = []\nfrom_version = 5\n",
         )
         .unwrap();
 

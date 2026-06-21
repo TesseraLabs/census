@@ -216,5 +216,65 @@ assert     "doctor clean after restore"    "[ $rc13 -eq 0 ]"
 assert     "status exits 0"                "[ $rcs -eq 0 ]"
 assert     "status prints audit + version" "\"$CENSUS\" status --managed \"$MMAN\" 2>&1 | grep -qE 'audit|version|10'"
 
+echo "== scenario 14-18: GROUP provisioning (create / pin-gid / orphan-delete / foreign-safe) =="
+GROOT="$ROOT/g"; GSTORE="$GROOT/roles"; GMAN="$GROOT/managed.toml"
+mkdir -p "$GSTORE"
+g_decl() { # $1=version $2=group-line-for-role ("" none) $3=group-block ("" none)
+  cat > "$GSTORE/gtest.toml" <<EOF
+role = "gtest"
+version = 1
+os = "linux"
+name = "GroupTest"
+level = 1
+[payload]
+groups = [$2]
+EOF
+  cat > "$GROOT/decl.toml" <<EOF
+version = $1
+role_store = "$GSTORE"
+[defaults]
+uid_range = [9000, 9999]
+shell = "/bin/bash"
+home_base = "/var/lib/census/home"
+$3
+[[role_account]]
+role = "gtest"
+uid = 9040
+EOF
+}
+g_apply() { "$CENSUS" apply --declaration "$GROOT/decl.toml" --managed "$GMAN" --trust-fs --i-understand-no-rescue 2>&1; }
+
+echo "-- 14: create new group with pinned GID + member account --"
+g_decl 1 '"census-grp"' $'[[group]]\nname = "census-grp"\ngid = 8500'
+echo ":: $(g_apply)"
+assert     "census-grp group created"      "getent group census-grp >/dev/null"
+assert     "census-grp has pinned gid 8500" "[ \"\$(getent group census-grp | cut -d: -f3)\" = 8500 ]"
+assert     "gtest is member of census-grp"  "id -nG gtest | grep -qw census-grp"
+
+echo "-- 15: orphan managed group is deleted when no longer referenced --"
+g_decl 2 '' ''                              # role drops group, block removed
+echo ":: $(g_apply)"
+assert     "orphan census-grp removed"      "! getent group census-grp >/dev/null"
+assert     "gtest account retained"         "getent passwd gtest >/dev/null"
+
+echo "-- 16: pre-existing FOREIGN group is adopted-as-member but never deleted --"
+groupadd foreign-grp                        # created OUTSIDE census
+g_decl 3 '"foreign-grp"' ''
+echo ":: $(g_apply)"
+assert     "gtest member of foreign-grp"    "id -nG gtest | grep -qw foreign-grp"
+assert     "foreign-grp not a managed group" "! grep -q 'name = \"foreign-grp\"' $GMAN"
+
+echo "-- 17: foreign group survives unreference (Census never deletes it) --"
+g_decl 4 '' ''
+echo ":: $(g_apply)"
+assert     "foreign-grp still exists"       "getent group foreign-grp >/dev/null"
+
+echo "-- 18: doctor clean on group state --"
+# Isolate: remove census-marked accounts from other managed states (audit from sc.6)
+# so doctor --managed $GMAN sees only gtest as census-marked.
+userdel -r audit 2>/dev/null || true
+"$CENSUS" doctor --managed "$GMAN" >/dev/null 2>&1; rcgd=$?
+assert     "doctor clean on group state"    "[ $rcgd -eq 0 ]"
+
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

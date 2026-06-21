@@ -19,6 +19,19 @@ pub struct Defaults {
     pub home_base: PathBuf,
 }
 
+/// A declared group: an optional GID pin for stability across the fleet
+/// (audit/NFS). `gid = None` lets the OS assign the GID at creation time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupSpec {
+    /// POSIX group name (the key used to reference / create the group).
+    pub name: String,
+    /// Optional pinned GID. When present, `groupadd -g <gid>`; on conflict
+    /// (GID already belongs to a different group) apply refuses, never renumbers.
+    #[serde(default)]
+    pub gid: Option<u32>,
+}
+
 /// One role account: the projection of a role into a Unix account.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +61,10 @@ pub struct Declaration {
     /// Role accounts (TOML `[[role_account]]`).
     #[serde(default, rename = "role_account")]
     pub role_accounts: Vec<RoleAccount>,
+    /// Declared groups with optional GID pins (TOML `[[group]]`). The required
+    /// set unions these names with every role's `payload.groups`.
+    #[serde(default, rename = "group")]
+    pub groups: Vec<GroupSpec>,
     /// Detached Ed25519 signature over the declaration bytes minus this line
     /// (hex of 64 bytes). Present in managed mode; absent under `--trust-fs`.
     /// The field exists so the strict (`deny_unknown_fields`) parser accepts a
@@ -84,6 +101,42 @@ pub enum DeclarationError {
          and contain only a-z, 0-9, or '-'"
     )]
     RoleIdInvalid { value: String },
+    /// A declared `[[group]]` name is not a valid POSIX group name.
+    #[error(
+        "group {value:?} is not a valid group name: must be 1-32 chars, start with a \
+         lowercase letter or '_', and contain only a-z, 0-9, '_', or '-'"
+    )]
+    GroupNameInvalid { value: String },
+    /// Two `[[group]]` blocks declare the same name.
+    #[error("group {0:?} is declared more than once")]
+    DuplicateGroup(String),
+    /// A group name in the required set is not a valid POSIX group name. Unlike
+    /// [`Self::GroupNameInvalid`] (a declared `[[group]]` caught at parse), this
+    /// covers names that flow in from a role-store's `payload.groups` and would
+    /// otherwise reach `groupadd <name>` unvalidated. Apply fails closed.
+    #[error(
+        "required group {value:?} is not a valid group name: must be 1-32 chars, start with \
+         a lowercase letter or '_', and contain only a-z, 0-9, '_', or '-'"
+    )]
+    InvalidGroupName { value: String },
+}
+
+/// True if `name` is a valid POSIX group name as Census accepts it:
+/// 1-32 chars, first char a lowercase letter or `_`, rest `a-z`/`0-9`/`_`/`-`.
+/// Deliberately stricter than the full POSIX-portable set (rejects upper-case
+/// and leading digits) so created group names stay predictable across the fleet.
+fn is_valid_group_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_lowercase() || first == b'_') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 /// True if `id` matches Tessera's RoleId rule: `^[a-z][a-z0-9-]{0,15}$`.
@@ -147,6 +200,18 @@ impl Declaration {
             }
             seen_uid.push((acct.uid, acct.role.clone()));
         }
+        let mut seen_group: Vec<String> = Vec::new();
+        for g in &self.groups {
+            if !is_valid_group_name(&g.name) {
+                return Err(DeclarationError::GroupNameInvalid {
+                    value: g.name.clone(),
+                });
+            }
+            if seen_group.contains(&g.name) {
+                return Err(DeclarationError::DuplicateGroup(g.name.clone()));
+            }
+            seen_group.push(g.name.clone());
+        }
         Ok(())
     }
 
@@ -161,6 +226,50 @@ impl Declaration {
             .clone()
             .unwrap_or_else(|| self.defaults.home_base.join(&acct.role))
     }
+}
+
+/// Compute the **required group set**: the union of every resolved account's
+/// supplementary groups (`payload.groups`, via [`crate::model::ResolvedAccount`])
+/// with the names declared in `[[group]]`. The value is the pinned GID taken
+/// from the matching `[[group]]` block (else `None`). A group named only by a
+/// role (not in `[[group]]`) is required with no pin.
+///
+/// Returned as a `BTreeMap` so iteration order is deterministic (stable plan /
+/// apply output). A name appearing both in a role and in `[[group]]` takes the
+/// declared pin.
+///
+/// Every name in the resulting set is validated against [`is_valid_group_name`],
+/// not only the `[[group]]`-declared ones. Declared names are already checked at
+/// parse, but role-derived names (from `payload.groups`) are not — they would
+/// otherwise reach `groupadd <name>` unvalidated. An invalid name (from either
+/// source) fails closed with [`DeclarationError::InvalidGroupName`] so apply
+/// never passes a malformed role-store group name to the OS.
+pub fn required_groups(
+    decl: &Declaration,
+    resolved: &[crate::model::ResolvedAccount],
+) -> Result<std::collections::BTreeMap<String, Option<u32>>, DeclarationError> {
+    let mut out: std::collections::BTreeMap<String, Option<u32>> =
+        std::collections::BTreeMap::new();
+    // Role composition first (no pin from this source).
+    for acct in resolved {
+        for g in &acct.groups {
+            out.entry(g.clone()).or_insert(None);
+        }
+    }
+    // Declared groups override/insert the pin (authoritative for GID).
+    for g in &decl.groups {
+        out.insert(g.name.clone(), g.gid);
+    }
+    // Defense-in-depth: validate EVERY required name symmetrically (role-derived
+    // and declared). Fail closed on the first invalid one.
+    for name in out.keys() {
+        if !is_valid_group_name(name) {
+            return Err(DeclarationError::InvalidGroupName {
+                value: name.clone(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -296,5 +405,123 @@ uid = 9020
             Declaration::parse(&doc).unwrap_err(),
             DeclarationError::UidRangeInverted(9999, 9000)
         ));
+    }
+
+    // ---- [[group]] parsing + required-set (task 1) ----
+
+    fn resolved(name: &str, groups: &[&str]) -> crate::model::ResolvedAccount {
+        crate::model::ResolvedAccount {
+            name: name.to_owned(),
+            uid: 9010,
+            shell: "/bin/bash".to_owned(),
+            home: PathBuf::from(format!("/var/lib/census/home/{name}")),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            sudo_role: None,
+            limits: crate::rolestore::Limits::default(),
+            locked_password: true,
+        }
+    }
+
+    #[test]
+    fn group_block_with_pin_parses() {
+        let doc = format!(
+            "{SAMPLE}\n[[group]]\nname = \"atm-operators\"\ngid = 8010\n[[group]]\nname = \"tellers\"\n"
+        );
+        let d = Declaration::parse(&doc).unwrap();
+        assert_eq!(d.groups.len(), 2);
+        assert_eq!(d.groups[0].name, "atm-operators");
+        assert_eq!(d.groups[0].gid, Some(8010));
+        assert_eq!(d.groups[1].name, "tellers");
+        assert_eq!(d.groups[1].gid, None);
+    }
+
+    #[test]
+    fn group_block_unknown_field_rejected() {
+        let doc = format!("{SAMPLE}\n[[group]]\nname = \"g\"\nbogus = 1\n");
+        assert!(matches!(
+            Declaration::parse(&doc).unwrap_err(),
+            DeclarationError::TomlParse(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_group_names_rejected() {
+        for bad in ["", " ", "Bad", "1g", "a b", "with:colon"] {
+            let doc = format!("{SAMPLE}\n[[group]]\nname = {bad:?}\n");
+            assert!(
+                matches!(
+                    Declaration::parse(&doc).unwrap_err(),
+                    DeclarationError::GroupNameInvalid { .. }
+                ),
+                "group name {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_group_names_pass() {
+        for good in ["wheel", "atm-operators", "_sys", "g9"] {
+            let doc = format!("{SAMPLE}\n[[group]]\nname = {good:?}\n");
+            assert!(
+                Declaration::parse(&doc).is_ok(),
+                "group name {good:?} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_group_rejected() {
+        let doc = format!("{SAMPLE}\n[[group]]\nname = \"g\"\n[[group]]\nname = \"g\"\n");
+        assert!(matches!(
+            Declaration::parse(&doc).unwrap_err(),
+            DeclarationError::DuplicateGroup(_)
+        ));
+    }
+
+    #[test]
+    fn required_groups_unions_roles_and_blocks() {
+        let doc = format!(
+            "{SAMPLE}\n[[group]]\nname = \"atm-operators\"\ngid = 8010\n[[group]]\nname = \"wheel\"\n"
+        );
+        let d = Declaration::parse(&doc).unwrap();
+        let res = vec![resolved("oper", &["wheel", "docker"]), resolved("serv", &["wheel"])];
+        let req = required_groups(&d, &res).unwrap();
+        // union of role groups {wheel, docker} ∪ declared {atm-operators, wheel}
+        assert_eq!(req.len(), 3);
+        assert!(req.contains_key("wheel"));
+        assert!(req.contains_key("docker"));
+        assert!(req.contains_key("atm-operators"));
+        // pin from [[group]]
+        assert_eq!(req["atm-operators"], Some(8010));
+        // role-only group has no pin
+        assert_eq!(req["docker"], None);
+        // wheel appears in roles AND declared (no pin) → None
+        assert_eq!(req["wheel"], None);
+    }
+
+    #[test]
+    fn required_groups_declared_pin_wins_over_role_mention() {
+        // A group named by a role AND pinned in [[group]] keeps the pin.
+        let doc = format!("{SAMPLE}\n[[group]]\nname = \"wheel\"\ngid = 7000\n");
+        let d = Declaration::parse(&doc).unwrap();
+        let res = vec![resolved("oper", &["wheel"])];
+        let req = required_groups(&d, &res).unwrap();
+        assert_eq!(req["wheel"], Some(7000));
+    }
+
+    #[test]
+    fn required_groups_rejects_invalid_role_derived_name() {
+        // A name coming from a role's payload.groups (not a [[group]] block) that
+        // is not a valid POSIX group name must fail the required-set computation
+        // rather than reaching `groupadd`.
+        let d = Declaration::parse(SAMPLE).unwrap();
+        for bad in ["Bad Name", "", "1g", "with:colon"] {
+            let res = vec![resolved("oper", &[bad])];
+            let err = required_groups(&d, &res).unwrap_err();
+            assert!(
+                matches!(err, DeclarationError::InvalidGroupName { ref value } if value == bad),
+                "role-derived group name {bad:?} must be rejected, got {err:?}"
+            );
+        }
     }
 }

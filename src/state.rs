@@ -30,16 +30,37 @@ pub struct ManagedAccount {
     pub from_version: u32,
 }
 
+/// A single managed group as last recorded by Census. Only groups Census
+/// itself created (`groupadd`) are recorded here; pre-existing/foreign groups
+/// are never adopted, so the registry is authoritative for "what Census owns".
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedGroup {
+    /// Group name.
+    pub name: String,
+    /// Recorded GID (the GID the group had when Census created it — pinned or
+    /// OS-assigned). Doctor flags a live GID that diverges from this.
+    pub gid: u32,
+    /// Declaration `version` this group was created from.
+    pub from_version: u32,
+}
+
 /// Read-only view of the current managed state.
 pub trait SystemState {
     /// Managed accounts keyed by name.
     fn managed_accounts(&self) -> BTreeMap<String, ManagedAccount>;
+    /// Managed groups keyed by name. Default empty so existing fakes / callers
+    /// that predate group-provisioning keep compiling with no group state.
+    fn managed_groups(&self) -> BTreeMap<String, ManagedGroup> {
+        BTreeMap::new()
+    }
 }
 
 /// Registry-backed state read from `managed.toml`. Absent file = empty state.
 #[derive(Debug)]
 pub struct RegistryState {
     accounts: BTreeMap<String, ManagedAccount>,
+    groups: BTreeMap<String, ManagedGroup>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -47,6 +68,8 @@ pub struct RegistryState {
 struct RegistryFile {
     #[serde(default, rename = "account")]
     accounts: Vec<ManagedAccount>,
+    #[serde(default, rename = "group")]
+    groups: Vec<ManagedGroup>,
 }
 
 /// Errors reading the managed registry.
@@ -64,13 +87,16 @@ impl RegistryState {
     /// An empty registry (no managed accounts). Useful as a read-only fallback
     /// when the on-disk registry cannot be loaded and the caller must not fail.
     pub fn default_empty() -> Self {
-        RegistryState { accounts: BTreeMap::new() }
+        RegistryState {
+            accounts: BTreeMap::new(),
+            groups: BTreeMap::new(),
+        }
     }
 
     /// Load the registry. A missing file yields an empty (no-managed) state.
     pub fn load(path: &Path) -> Result<Self, StateError> {
         if !path.exists() {
-            return Ok(RegistryState { accounts: BTreeMap::new() });
+            return Ok(RegistryState::default_empty());
         }
         let text = std::fs::read_to_string(path).map_err(|e| StateError::Io {
             path: path.to_path_buf(),
@@ -85,7 +111,12 @@ impl RegistryState {
             .into_iter()
             .map(|a| (a.name.clone(), a))
             .collect();
-        Ok(RegistryState { accounts })
+        let groups = file
+            .groups
+            .into_iter()
+            .map(|g| (g.name.clone(), g))
+            .collect();
+        Ok(RegistryState { accounts, groups })
     }
 }
 
@@ -93,19 +124,30 @@ impl SystemState for RegistryState {
     fn managed_accounts(&self) -> BTreeMap<String, ManagedAccount> {
         self.accounts.clone()
     }
+
+    fn managed_groups(&self) -> BTreeMap<String, ManagedGroup> {
+        self.groups.clone()
+    }
 }
 
 /// In-memory state for tests.
 #[cfg(test)]
+#[derive(Default)]
 pub struct FakeState {
     /// The managed accounts this fake reports.
     pub accounts: BTreeMap<String, ManagedAccount>,
+    /// The managed groups this fake reports.
+    pub groups: BTreeMap<String, ManagedGroup>,
 }
 
 #[cfg(test)]
 impl SystemState for FakeState {
     fn managed_accounts(&self) -> BTreeMap<String, ManagedAccount> {
         self.accounts.clone()
+    }
+
+    fn managed_groups(&self) -> BTreeMap<String, ManagedGroup> {
+        self.groups.clone()
     }
 }
 
@@ -178,5 +220,70 @@ bogus = "nope"
             RegistryState::load(&path).unwrap_err(),
             StateError::TomlParse { .. }
         ));
+    }
+
+    #[test]
+    fn reads_recorded_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[account]]
+name = "oper"
+uid = 9010
+shell = "/bin/bash"
+groups = ["atm-operators"]
+from_version = 3
+
+[[group]]
+name = "atm-operators"
+gid = 8010
+from_version = 3
+"#,
+        )
+        .unwrap();
+        let st = RegistryState::load(&path).unwrap();
+        let groups = st.managed_groups();
+        assert_eq!(groups.len(), 1);
+        let g = &groups["atm-operators"];
+        assert_eq!(g.gid, 8010);
+        assert_eq!(g.from_version, 3);
+        // accounts still load alongside.
+        assert_eq!(st.managed_accounts().len(), 1);
+    }
+
+    #[test]
+    fn group_unknown_field_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[group]]
+name = "g"
+gid = 8010
+from_version = 3
+bogus = "nope"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            RegistryState::load(&path).unwrap_err(),
+            StateError::TomlParse { .. }
+        ));
+    }
+
+    #[test]
+    fn absent_group_section_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            "[[account]]\nname = \"oper\"\nuid = 9010\nshell = \"/bin/bash\"\nfrom_version = 3\n",
+        )
+        .unwrap();
+        let st = RegistryState::load(&path).unwrap();
+        assert!(st.managed_groups().is_empty());
     }
 }

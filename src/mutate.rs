@@ -187,6 +187,26 @@ pub fn build_delete_argv(name: &str) -> Vec<Vec<String>> {
     ]]
 }
 
+/// Build the argv to **create** a group: `groupadd [-g <gid>] <name>`. The
+/// `-g` flag pins the GID when the declaration requested one (else the OS
+/// assigns it). argv array — no shell, no injection surface.
+pub fn build_create_group_argv(name: &str, gid: Option<u32>) -> Vec<Vec<String>> {
+    let mut cmd = vec!["groupadd".to_owned()];
+    if let Some(g) = gid {
+        cmd.push("-g".to_owned());
+        cmd.push(g.to_string());
+    }
+    cmd.push(name.to_owned());
+    vec![cmd]
+}
+
+/// Build the argv to **delete** a group: `groupdel <name>`. The OS refuses if
+/// the group is the primary group of any account — Census only deletes groups
+/// it created (registry-owned) and only after its accounts are removed.
+pub fn build_delete_group_argv(name: &str) -> Vec<Vec<String>> {
+    vec![vec!["groupdel".to_owned(), name.to_owned()]]
+}
+
 /// Backup/restore hook used by the orchestrator for atomicity (spec R2).
 ///
 /// The orchestrator wraps mutation in `snapshot()` … (phases) … and on any
@@ -202,6 +222,13 @@ pub trait Provisioner {
         -> Result<(), ProvisionError>;
     /// Delete a managed account by name.
     fn delete(&mut self, name: &str) -> Result<(), ProvisionError>;
+    /// Create a group via `groupadd` (pinning the GID when `gid` is `Some`).
+    /// Runs in the group-create phase, BEFORE account creation, so membership
+    /// (`useradd -G`) finds the group.
+    fn create_group(&mut self, name: &str, gid: Option<u32>) -> Result<(), ProvisionError>;
+    /// Delete a Census-owned group via `groupdel`. Runs in the group-delete
+    /// phase, AFTER account deletion, so the group has no members.
+    fn delete_group(&mut self, name: &str) -> Result<(), ProvisionError>;
     /// Materialize (or clear) the sudoers fragment for an account: if the
     /// account carries a sudo right ([`crate::sudoers::build_sudoers_content`]
     /// yields `Some`), write & validate `census-<role>`; otherwise ensure the
@@ -315,6 +342,14 @@ impl Provisioner for ShadowUtilsProvisioner<'_> {
 
     fn delete(&mut self, name: &str) -> Result<(), ProvisionError> {
         Self::run_all(&build_delete_argv(name))
+    }
+
+    fn create_group(&mut self, name: &str, gid: Option<u32>) -> Result<(), ProvisionError> {
+        Self::run_all(&build_create_group_argv(name, gid))
+    }
+
+    fn delete_group(&mut self, name: &str) -> Result<(), ProvisionError> {
+        Self::run_all(&build_delete_group_argv(name))
     }
 
     fn apply_sudoers(&mut self, acct: &ResolvedAccount) -> Result<(), ProvisionError> {
@@ -481,6 +516,25 @@ mod tests {
     fn delete_uses_userdel_r() {
         let cmds = build_delete_argv("oper");
         assert_eq!(cmds, vec![vec!["userdel", "-r", "oper"]]);
+    }
+
+    #[test]
+    fn create_group_pins_gid_when_present() {
+        let cmds = build_create_group_argv("atm-operators", Some(8010));
+        assert_eq!(cmds, vec![vec!["groupadd", "-g", "8010", "atm-operators"]]);
+    }
+
+    #[test]
+    fn create_group_omits_g_when_unpinned() {
+        let cmds = build_create_group_argv("tellers", None);
+        assert_eq!(cmds, vec![vec!["groupadd", "tellers"]]);
+        assert!(!cmds[0].contains(&"-g".to_owned()));
+    }
+
+    #[test]
+    fn delete_group_uses_groupdel() {
+        let cmds = build_delete_group_argv("atm-operators");
+        assert_eq!(cmds, vec![vec!["groupdel", "atm-operators"]]);
     }
 
     #[test]
