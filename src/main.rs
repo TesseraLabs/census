@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use census::coverage::SurfaceClass;
 
 #[derive(Parser)]
 #[command(name = "census", version, about = "Declarative Unix access provisioner")]
@@ -116,6 +117,50 @@ enum Command {
         #[arg(long)]
         lang: Option<String>,
     },
+    /// Catalog operations.
+    Catalog {
+        #[command(subcommand)]
+        sub: CatalogSub,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogSub {
+    /// Read-only audit: enumerate the device's live privileged surface and report
+    /// what the installed catalog does NOT cover. Never mutates or runs binaries.
+    Coverage {
+        /// Emit machine-readable JSON instead of the human view.
+        #[arg(long)]
+        json: bool,
+        /// Override the OS target as `family-distro-version` (e.g.
+        /// `linux-debian-12`); autodetected from /etc/os-release if absent.
+        #[arg(long)]
+        os_target: Option<String>,
+        /// Extra catalog root for permission expansion (repeatable; appended to
+        /// the defaults in precedence order — later wins).
+        #[arg(long = "catalog-dir")]
+        catalog_dir: Vec<std::path::PathBuf>,
+        /// Role-store dir whose roles are resolved into concrete instances so
+        /// parametrized permissions contribute named units/paths/groups.
+        #[arg(long)]
+        roles: Option<std::path::PathBuf>,
+        /// A parametrized record with no role instance does NOT count as covering.
+        #[arg(long)]
+        strict: bool,
+        /// Restrict to a comma-separated subset of classes
+        /// (sudo_bin,config,unit,group,capfile,setuid). Default: all.
+        #[arg(long)]
+        class: Option<String>,
+        /// Exit non-zero (CI-gate) when overall coverage is below this percent.
+        #[arg(long)]
+        min_coverage: Option<f64>,
+        /// Include low-priority objects in the human report.
+        #[arg(long)]
+        include_low_priority: bool,
+        /// Accept (no-op) — surface caching is not yet implemented.
+        #[arg(long)]
+        cache: bool,
+    },
 }
 
 /// The default catalog roots plus any `--catalog-dir` overrides, in precedence
@@ -199,5 +244,42 @@ fn main() -> std::process::ExitCode {
             os_target.as_deref(),
             lang.as_deref(),
         ),
+        Command::Catalog { sub } => match sub {
+            CatalogSub::Coverage {
+                json,
+                os_target,
+                catalog_dir,
+                roles,
+                strict,
+                class,
+                min_coverage,
+                include_low_priority,
+                cache,
+            } => {
+                // Parse the optional --class filter up front so an unknown class is
+                // a clean error before any scanning runs.
+                let classes = match class {
+                    Some(spec) => match census::cli::parse_classes(&spec) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("census: {e}");
+                            return std::process::ExitCode::FAILURE;
+                        }
+                    },
+                    None => Vec::<SurfaceClass>::new(),
+                };
+                census::cli::run_coverage(census::cli::CoverageOpts {
+                    json,
+                    os_target,
+                    catalog_roots: catalog_roots_with_overrides(catalog_dir),
+                    roles,
+                    strict,
+                    classes,
+                    min_coverage,
+                    include_low_priority,
+                    cache,
+                })
+            }
+        },
     }
 }

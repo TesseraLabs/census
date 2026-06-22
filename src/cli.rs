@@ -6,6 +6,9 @@ use crate::catalog::{
     self, CatalogError, LiveCatalog, OsTarget, ResolveCtx, ResolvedPermission, Risk,
     SourcedPrimitive,
 };
+use crate::coverage::{
+    self, CoverageCtx, CoverageReport, LiveSurface, ResolvedRole, SurfaceClass, SurfaceScanner,
+};
 use crate::doctor::{self, DoctorReport};
 use crate::inspect::LiveInspector;
 use crate::l10n::{self, LiveL10n, L10nSource};
@@ -1008,6 +1011,382 @@ fn via_suffix(permission: &str, via: &Option<String>) -> String {
 }
 
 // ============================================================================
+// catalog coverage (read-only audit)
+//
+// Enumerates the device's live privileged surface (`LiveSurface`) and reports
+// what the installed catalog does NOT cover. Strictly read-only: it never runs
+// the enumerated binaries, never reads config content, and never mutates. The
+// pure coverage core (`coverage::coverage`) does the matching; this CLI layer
+// only builds inputs, renders the report, and decides the `--min-coverage` exit.
+// ============================================================================
+
+/// Options for `census catalog coverage` (CLI-derived).
+pub struct CoverageOpts {
+    /// Emit machine-readable JSON instead of the human view.
+    pub json: bool,
+    /// `--os-target family-distro-version` override; autodetects when `None`.
+    pub os_target: Option<String>,
+    /// Catalog roots in precedence order (lowest first).
+    pub catalog_roots: Vec<PathBuf>,
+    /// Optional role-store dir whose roles are resolved into concrete instances
+    /// (so parametrized permissions contribute named units/paths).
+    pub roles: Option<PathBuf>,
+    /// `--strict`: a parametrized record without a role instance does NOT cover.
+    pub strict: bool,
+    /// Surface classes to scan; empty means all classes.
+    pub classes: Vec<SurfaceClass>,
+    /// `--min-coverage <pct>`: non-zero exit when overall coverage is below this.
+    pub min_coverage: Option<f64>,
+    /// `--include-low-priority`: include low-priority objects in the human report
+    /// (currently a presentation toggle; the metric is unaffected).
+    pub include_low_priority: bool,
+    /// `--cache`: accepted for forward-compat; caching is not yet implemented, so
+    /// the flag is a no-op (a fresh scan runs every time).
+    pub cache: bool,
+}
+
+/// Parse a `--class a,b,c` value into surface classes. An unknown token is an
+/// error (fail closed rather than silently scanning fewer classes than asked).
+pub fn parse_classes(spec: &str) -> Result<Vec<SurfaceClass>, String> {
+    let mut out: Vec<SurfaceClass> = Vec::new();
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let class = match tok {
+            "sudo_bin" => SurfaceClass::SudoBin,
+            "config" => SurfaceClass::Config,
+            "unit" => SurfaceClass::Unit,
+            "group" => SurfaceClass::Group,
+            "capfile" => SurfaceClass::CapFile,
+            "setuid" => SurfaceClass::Setuid,
+            other => return Err(format!("unknown surface class '{other}'")),
+        };
+        if !out.contains(&class) {
+            out.push(class);
+        }
+    }
+    Ok(out)
+}
+
+/// The full set of surface classes, used when `--class` is not given.
+fn all_classes() -> Vec<SurfaceClass> {
+    vec![
+        SurfaceClass::SudoBin,
+        SurfaceClass::Config,
+        SurfaceClass::Unit,
+        SurfaceClass::Group,
+        SurfaceClass::CapFile,
+        SurfaceClass::Setuid,
+    ]
+}
+
+/// Resolve every role slice under `roles_dir` into a `ResolvedRole` (concrete
+/// expanded sudo + groups). Each role's permissions are expanded with their
+/// declared params via `resolve_with_params`, so a parametrized record
+/// (`service-restart units=[…]`) contributes concrete commands. A role that fails
+/// to resolve is surfaced as a warning and skipped — a coverage audit should still
+/// run over the roles that DO resolve rather than abort on one bad slice.
+///
+/// `catalog_roots` MUST be the same roots the main coverage pass uses (including
+/// any `--catalog-dir` site overrides). A role may reference a permission defined
+/// only in a site catalog; resolving roles against the bare defaults would fail
+/// to expand it and under-contribute coverage.
+fn resolve_roles(
+    roles_dir: &Path,
+    catalog_roots: &[PathBuf],
+    os: &OsTarget,
+    ctx: &ResolveCtx,
+) -> Vec<ResolvedRole> {
+    let catalog = LiveCatalog::new(catalog_roots.to_vec());
+    let mut out: Vec<ResolvedRole> = Vec::new();
+    let entries = match std::fs::read_dir(roles_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("census: warning: cannot read roles dir {}: {e}", roles_dir.display());
+            return out;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        let role = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(r) => r,
+            None => continue,
+        };
+        let comp = match rolestore::read_composition(roles_dir, role) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("census: warning: role {role}: {e}");
+                continue;
+            }
+        };
+        // A raw sudo_role names a sudoers alias, not a concrete binary, so it
+        // contributes no command token and is intentionally not folded in; raw
+        // groups DO gate-keep, so they seed the role's covered groups.
+        let mut sudo: Vec<String> = Vec::new();
+        let mut groups: Vec<String> = comp.groups.clone();
+        for perm in &comp.permissions {
+            match catalog::resolve_with_params(&perm.id, &perm.params, os, &catalog, ctx) {
+                Ok((resolved, _warnings)) => {
+                    for p in &resolved.sudo {
+                        sudo.push(p.value.clone());
+                    }
+                    for p in &resolved.groups {
+                        groups.push(p.value.clone());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("census: warning: role {role} permission {}: {e}", perm.id);
+                }
+            }
+        }
+        out.push(ResolvedRole::new(sudo, groups));
+    }
+    out
+}
+
+/// Map overall coverage and an optional `--min-coverage` threshold to an exit
+/// code. Without a threshold the audit is read-only and always succeeds (0). With
+/// a threshold, coverage below it exits 4 (a distinct CI-gate failure, separate
+/// from a scan/catalog error which exits `FAILURE`==1). Pure so the policy is
+/// unit-testable.
+fn coverage_exit_code(overall_pct: f64, min: Option<f64>) -> ExitCode {
+    match min {
+        Some(threshold) if overall_pct < threshold => ExitCode::from(4),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+/// Render a coverage report as a human-readable audit. Pure (report in, string
+/// out) so the output shape is unit-testable from a hand-built report.
+pub fn render_coverage_human(report: &CoverageReport, include_low_priority: bool) -> String {
+    let _ = include_low_priority; // currently affects no rows; reserved toggle
+    let mut out = String::new();
+    out.push_str(&format!(
+        "coverage for {} (catalog {})\n",
+        if report.os_target.is_empty() { "unknown" } else { &report.os_target },
+        report.catalog_version.as_deref().unwrap_or("unknown"),
+    ));
+
+    // Per-class summary.
+    out.push_str("by class:\n");
+    for c in &report.by_class {
+        out.push_str(&format!(
+            "  {:<9} {}/{} ({:.1}%)\n",
+            c.class.as_str(),
+            c.covered,
+            c.total,
+            c.pct(),
+        ));
+    }
+    out.push_str(&format!("overall: {:.1}%\n", report.overall_pct));
+
+    // Uncovered objects (honest gaps) grouped by class, with a suggestion.
+    let gaps: Vec<_> = report
+        .objects
+        .iter()
+        .filter(|o| !o.covered && o.intentional_exclusion.is_none())
+        .collect();
+    out.push_str("uncovered:\n");
+    if gaps.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for o in &gaps {
+            let suggestion = o
+                .suggested_permission
+                .as_deref()
+                .map(|s| format!(" → suggested: {s}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  [{}] {}{}\n",
+                o.object.class.as_str(),
+                o.object.key,
+                suggestion,
+            ));
+        }
+    }
+
+    // Intentionally-uncovered, each with its reason (does not penalise the metric).
+    let intentional: Vec<_> = report
+        .objects
+        .iter()
+        .filter(|o| o.intentional_exclusion.is_some())
+        .collect();
+    if !intentional.is_empty() {
+        out.push_str("intentionally uncovered:\n");
+        for o in &intentional {
+            out.push_str(&format!(
+                "  [{}] {} — {}\n",
+                o.object.class.as_str(),
+                o.object.key,
+                o.intentional_exclusion.as_deref().unwrap_or(""),
+            ));
+        }
+    }
+
+    // Anomalies (orphan setuid / orphan capfile) — investigate, separate from gaps.
+    if !report.anomalies.is_empty() {
+        out.push_str("anomalies (investigate):\n");
+        for a in &report.anomalies {
+            out.push_str(&format!("  [{}] {} ({})\n", a.class.as_str(), a.key, a.detail));
+        }
+    }
+
+    out
+}
+
+/// Provenance as a stable lowercase token for JSON output.
+fn provenance_json(p: &coverage::Provenance) -> String {
+    match p {
+        coverage::Provenance::Vendor => json_str("vendor"),
+        coverage::Provenance::Addon(pkg) => json_str(&format!("addon:{pkg}")),
+        coverage::Provenance::Orphan => json_str("orphan"),
+    }
+}
+
+/// Render a coverage report as machine-readable JSON: an `objects` array of
+/// per-object verdicts plus a `summary` object. Hand-rolled over the `json_str`
+/// escaper (no serde_json dep), matching the `compile --json` style. Pure.
+pub fn render_coverage_json(report: &CoverageReport) -> String {
+    let mut out = String::new();
+    out.push('{');
+
+    out.push_str("\"objects\":[");
+    let objs: Vec<String> = report
+        .objects
+        .iter()
+        .map(|o| {
+            format!(
+                "{{\"class\":{},\"key\":{},\"covered\":{},\"provenance\":{},\"suggested_permission\":{},\"intentional_exclusion\":{}}}",
+                json_str(o.object.class.as_str()),
+                json_str(&o.object.key),
+                o.covered,
+                provenance_json(&o.object.provenance),
+                o.suggested_permission.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+                o.intentional_exclusion.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+            )
+        })
+        .collect();
+    out.push_str(&objs.join(","));
+    out.push_str("],");
+
+    // Anomalies array (orphan setuid/capfile) for the machine consumer.
+    out.push_str("\"anomalies\":[");
+    let anoms: Vec<String> = report
+        .anomalies
+        .iter()
+        .map(|a| {
+            format!(
+                "{{\"class\":{},\"key\":{},\"provenance\":{}}}",
+                json_str(a.class.as_str()),
+                json_str(&a.key),
+                provenance_json(&a.provenance),
+            )
+        })
+        .collect();
+    out.push_str(&anoms.join(","));
+    out.push_str("],");
+
+    // Summary: per-class counts, overall, catalog version, os target.
+    out.push_str("\"summary\":{\"by_class\":[");
+    let by: Vec<String> = report
+        .by_class
+        .iter()
+        .map(|c| {
+            format!(
+                "{{\"class\":{},\"covered\":{},\"total\":{},\"pct\":{:.1}}}",
+                json_str(c.class.as_str()),
+                c.covered,
+                c.total,
+                c.pct(),
+            )
+        })
+        .collect();
+    out.push_str(&by.join(","));
+    let warnings: Vec<String> = report.catalog_warnings.iter().map(|w| json_str(w)).collect();
+    out.push_str(&format!(
+        "],\"overall_pct\":{:.1},\"catalog_version\":{},\"os_target\":{},\"catalog_warnings\":[{}]}}",
+        report.overall_pct,
+        report.catalog_version.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+        json_str(&report.os_target),
+        warnings.join(","),
+    ));
+
+    out.push('}');
+    out.push('\n');
+    out
+}
+
+/// Run `census catalog coverage`: enumerate the live privileged surface, compute
+/// coverage against the installed catalog (+ optional roles), print the report
+/// (human or JSON), and exit per `--min-coverage`. Read-only — never mutates.
+pub fn run_coverage(opts: CoverageOpts) -> ExitCode {
+    let os = match detect_os_target(opts.os_target.as_deref()) {
+        Ok(os) => os,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let catalog = LiveCatalog::new(opts.catalog_roots.clone());
+
+    // Catalog version is echoed into the report for the audit trail. We do not have
+    // a separate version source here, so it is left unset unless the catalog
+    // carries one through resolve (the report records what resolve saw).
+    let ctx = ResolveCtx { catalog_version: None };
+
+    let roles = match &opts.roles {
+        Some(dir) => resolve_roles(dir, &opts.catalog_roots, &os, &ctx),
+        None => Vec::new(),
+    };
+
+    let classes = if opts.classes.is_empty() {
+        all_classes()
+    } else {
+        opts.classes.clone()
+    };
+
+    let surface = match LiveSurface::system().scan(&classes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let cov_ctx = CoverageCtx {
+        strict: opts.strict,
+        catalog_version: ctx.catalog_version.clone(),
+    };
+    let report = match coverage::coverage(&surface, &catalog, &os, &roles, &cov_ctx) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A catalog id that failed to resolve was skipped rather than aborting the
+    // audit; surface each as a stderr warning so the gap is visible while the
+    // report (on stdout) still covers everything that DID resolve.
+    for w in &report.catalog_warnings {
+        eprintln!("census: warning: {w}");
+    }
+
+    if opts.json {
+        print!("{}", render_coverage_json(&report));
+    } else {
+        print!("{}", render_coverage_human(&report, opts.include_low_priority));
+    }
+
+    coverage_exit_code(report.overall_pct, opts.min_coverage)
+}
+
+// ============================================================================
 // Lint (compile --lint; reusable so doctor can call it later)
 // ============================================================================
 
@@ -1707,6 +2086,211 @@ mod tests {
         let text = render_show_tree(&compiled, "ru", &l10n);
         // Title falls back to the id, marked untranslated; risk class still shown.
         assert!(text.contains("permission net-admin — net-admin (untranslated) [contained]"), "{text}");
+    }
+
+    // ---- catalog coverage (render + exit-code helpers; slice 3) ----
+
+    use crate::coverage::{
+        ClassCoverage, CoverageReport, ObjectCoverage, Provenance, SurfaceClass, SurfaceObject,
+    };
+
+    /// A surface object for hand-built coverage reports.
+    fn cov_obj(class: SurfaceClass, key: &str, prov: Provenance) -> SurfaceObject {
+        SurfaceObject {
+            class,
+            key: key.to_owned(),
+            provenance: prov,
+            detail: String::new(),
+        }
+    }
+
+    /// A hand-built coverage report exercising every render branch: a covered and
+    /// an uncovered sudo_bin (the latter with a suggestion), an intentionally
+    /// uncovered group, and an orphan-setuid anomaly.
+    fn sample_report() -> CoverageReport {
+        CoverageReport {
+            by_class: vec![ClassCoverage {
+                class: SurfaceClass::SudoBin,
+                covered: 1,
+                total: 2,
+            }],
+            objects: vec![
+                ObjectCoverage {
+                    object: cov_obj(SurfaceClass::SudoBin, "/usr/sbin/ip", Provenance::Vendor),
+                    covered: true,
+                    suggested_permission: None,
+                    intentional_exclusion: None,
+                },
+                ObjectCoverage {
+                    object: cov_obj(
+                        SurfaceClass::SudoBin,
+                        "/usr/sbin/cryptsetup",
+                        Provenance::Vendor,
+                    ),
+                    covered: false,
+                    suggested_permission: Some("luks-admin".to_owned()),
+                    intentional_exclusion: None,
+                },
+                ObjectCoverage {
+                    object: cov_obj(SurfaceClass::Group, "astra-admin", Provenance::Vendor),
+                    covered: false,
+                    suggested_permission: None,
+                    intentional_exclusion: Some("admin-by-design".to_owned()),
+                },
+            ],
+            setuid_inventory: vec![],
+            anomalies: vec![cov_obj(
+                SurfaceClass::Setuid,
+                "/opt/x/flasher",
+                Provenance::Orphan,
+            )],
+            overall_pct: 50.0,
+            catalog_version: Some("2026.06".to_owned()),
+            os_target: "linux-debian-12".to_owned(),
+            catalog_warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn resolve_roles_honours_catalog_dir_override() {
+        // A role references a permission defined ONLY in a site catalog passed via
+        // the same roots the coverage pass uses. resolve_roles must resolve it
+        // against those roots (not the bare defaults) so the role contributes its
+        // sudo binary to coverage.
+        let tmp = tempfile::tempdir().unwrap();
+        let site_root = tmp.path().join("site-permissions");
+        let layer_dir = site_root.join("linux");
+        std::fs::create_dir_all(&layer_dir).unwrap();
+        std::fs::write(
+            layer_dir.join("site-net.toml"),
+            "id = \"site-net\"\nsudo = [\"/usr/sbin/site-tool\"]\n",
+        )
+        .unwrap();
+
+        let roles_dir = tmp.path().join("roles");
+        std::fs::create_dir_all(&roles_dir).unwrap();
+        std::fs::write(
+            roles_dir.join("oper.toml"),
+            "role = \"oper\"\nversion = 1\nos = \"linux\"\nname = \"Operator\"\nlevel = 5\n[payload]\npermissions = [\"site-net\"]\n",
+        )
+        .unwrap();
+
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let ctx = ResolveCtx::default();
+
+        // With the site root passed through, the role resolves and contributes.
+        let roles = resolve_roles(&roles_dir, &[site_root.clone()], &os, &ctx);
+        assert_eq!(roles.len(), 1);
+        assert!(
+            roles[0].sudo.iter().any(|c| c == "/usr/sbin/site-tool"),
+            "role must resolve its site-catalog permission: {:?}",
+            roles[0].sudo
+        );
+
+        // Without the site root, the same permission is unknown: the role
+        // resolves to nothing (warns-and-skips), proving the override mattered.
+        let empty_root = tmp.path().join("empty-permissions");
+        std::fs::create_dir_all(&empty_root).unwrap();
+        let roles_no_override = resolve_roles(&roles_dir, &[empty_root], &os, &ctx);
+        assert_eq!(roles_no_override.len(), 1);
+        assert!(
+            roles_no_override[0].sudo.is_empty(),
+            "without the site root the permission cannot resolve"
+        );
+    }
+
+    #[test]
+    fn coverage_exit_code_gates_on_min_coverage() {
+        // No threshold → always success even at 0%.
+        assert_eq!(
+            format!("{:?}", coverage_exit_code(0.0, None)),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        // Below threshold → exit 4 (CI-gate, distinct from FAILURE==1).
+        assert_eq!(
+            format!("{:?}", coverage_exit_code(81.0, Some(85.0))),
+            format!("{:?}", ExitCode::from(4))
+        );
+        // At or above threshold → success.
+        assert_eq!(
+            format!("{:?}", coverage_exit_code(85.0, Some(85.0))),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            format!("{:?}", coverage_exit_code(90.0, Some(85.0))),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+    }
+
+    #[test]
+    fn render_coverage_human_shows_all_sections() {
+        let text = render_coverage_human(&sample_report(), false);
+        assert!(text.contains("linux-debian-12"), "{text}");
+        assert!(text.contains("sudo_bin  1/2"), "{text}");
+        assert!(text.contains("overall: 50.0%"), "{text}");
+        // Uncovered gap with its suggestion.
+        assert!(
+            text.contains("/usr/sbin/cryptsetup") && text.contains("luks-admin"),
+            "{text}"
+        );
+        // Intentionally-uncovered with its reason.
+        assert!(
+            text.contains("astra-admin") && text.contains("admin-by-design"),
+            "{text}"
+        );
+        // Anomaly section present.
+        assert!(text.contains("anomalies") && text.contains("/opt/x/flasher"), "{text}");
+        // The covered binary is NOT listed in the uncovered section (it appears
+        // only in the class summary, never as a gap row with a suggestion arrow).
+        assert!(
+            !text.contains("[sudo_bin] /usr/sbin/ip"),
+            "covered binary must not be rendered as a gap: {text}"
+        );
+    }
+
+    #[test]
+    fn render_coverage_json_has_objects_and_summary() {
+        let json = render_coverage_json(&sample_report());
+        assert!(json.contains("\"objects\":["), "{json}");
+        assert!(json.contains("\"key\":\"/usr/sbin/ip\""), "{json}");
+        assert!(json.contains("\"covered\":true"), "{json}");
+        assert!(json.contains("\"suggested_permission\":\"luks-admin\""), "{json}");
+        assert!(json.contains("\"intentional_exclusion\":\"admin-by-design\""), "{json}");
+        assert!(json.contains("\"provenance\":\"vendor\""), "{json}");
+        assert!(json.contains("\"overall_pct\":50.0"), "{json}");
+        assert!(json.contains("\"catalog_version\":\"2026.06\""), "{json}");
+        assert!(json.contains("\"os_target\":\"linux-debian-12\""), "{json}");
+        assert!(json.contains("\"anomalies\":["), "{json}");
+    }
+
+    #[test]
+    fn render_coverage_json_escapes_special_chars() {
+        // A key with a quote and a newline must not break the JSON document — the
+        // shared json_str escaper handles it.
+        let mut report = sample_report();
+        report.objects[0].object.key = "/usr/sbin/x\"y\nz".to_owned();
+        let json = render_coverage_json(&report);
+        assert!(json.contains(r#""key":"/usr/sbin/x\"y\nz""#), "{json}");
+        // Document remains single-line apart from the trailing newline the renderer
+        // appends (no raw newline leaked into the body).
+        assert_eq!(json.matches('\n').count(), 1, "{json}");
+    }
+
+    #[test]
+    fn parse_classes_parses_and_rejects_unknown() {
+        let got = parse_classes("sudo_bin, group ,setuid").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                SurfaceClass::SudoBin,
+                SurfaceClass::Group,
+                SurfaceClass::Setuid
+            ]
+        );
+        // Duplicates collapse.
+        assert_eq!(parse_classes("unit,unit").unwrap(), vec![SurfaceClass::Unit]);
+        // Unknown token is a hard error (fail closed).
+        assert!(parse_classes("sudo_bin,bogus").is_err());
     }
 
     #[test]

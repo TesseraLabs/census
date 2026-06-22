@@ -433,5 +433,36 @@ echo ":: $(c_apply)"
 assert_not "revoked /usr/sbin/ip absent from sudoers" "test -f $SUDOERS/census-netop && grep -q '/usr/sbin/ip' $SUDOERS/census-netop"
 assert     "netop account retained"             "getent passwd netop >/dev/null"
 
+echo "== scenario 25-27: CATALOG COVERAGE (read-only audit of live privileged surface vs catalog) =="
+# `census catalog coverage` enumerates the live privileged surface (sudo binaries,
+# config files, systemd units, groups, capability files, setuid bits) and reports
+# what the shipped catalog (/work/share/permissions) does NOT cover. Read-only —
+# mutates nothing. Prefer cheap classes (group, sudo_bin) over the full setuid walk
+# of / so the run stays fast and deterministic. Exit codes: 0 normal; 4 when
+# --min-coverage threshold is not met; 1 on scan/catalog error or unknown --class.
+COV() { "$CENSUS" catalog coverage --catalog-dir /work/share/permissions "$@" 2>&1; }
+
+echo "-- 25: coverage runs read-only and reports a summary --"
+out25="$(COV --class group,sudo_bin)"; rc25=$?; echo ":: $out25"
+assert     "coverage exits 0"                   "[ $rc25 -eq 0 ]"
+assert     "coverage prints a summary"          "echo \"\$out25\" | grep -qiE 'coverage|covered|%'"
+assert     "coverage mentions group class"      "echo \"\$out25\" | grep -qiE 'group'"
+assert     "coverage mentions sudo_bin class"   "echo \"\$out25\" | grep -qiE 'sudo_bin'"
+
+echo "-- 26: --min-coverage 100 gate trips (real surface is never fully covered) --"
+out26="$(COV --class sudo_bin --min-coverage 100)"; rc26=$?; echo ":: $out26"
+assert     "below-threshold exits 4 (not error 1)" "[ $rc26 -eq 4 ]"
+
+echo "-- 27: --json emits machine-readable output; unknown class errors --"
+out27="$(COV --class group --json)"; rc27=$?; echo ":: $out27"
+assert     "json coverage exits 0"              "[ $rc27 -eq 0 ]"
+assert     "json starts with { or ["           "echo \"\$out27\" | grep -qE '^[[:space:]]*[\\{\\[]'"
+assert     "json has overall_pct"              "echo \"\$out27\" | grep -q 'overall_pct'"
+assert     "json has by_class"                 "echo \"\$out27\" | grep -q 'by_class'"
+COV --class bogus >/dev/null 2>&1; rc27b=$?
+assert     "unknown class rejected (non-zero)" "[ $rc27b -ne 0 ]"
+out27c="$(COV --class group --min-coverage 0)"; rc27c=$?
+assert     "min-coverage 0 always met (exit 0)" "[ $rc27c -eq 0 ]"
+
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

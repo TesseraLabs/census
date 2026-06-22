@@ -3,6 +3,7 @@ pub mod apply;
 pub mod backup;
 pub mod catalog;
 pub mod cli;
+pub mod coverage;
 pub mod declaration;
 pub mod doctor;
 pub mod inspect;
