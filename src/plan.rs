@@ -5,8 +5,8 @@
 //! as destructive. No mutation happens here.
 
 use crate::inspect::GroupFacts;
-use crate::model::ResolvedAccount;
-use crate::state::{ManagedAccount, ManagedGroup, SystemState};
+use crate::model::{Provenance, ResolvedAccount, ResolvedGroup};
+use crate::state::{ManagedAccount, ManagedFileGrant, ManagedGroup, SystemState};
 use std::collections::BTreeMap;
 
 /// A single planned change.
@@ -35,21 +35,56 @@ impl Action {
     }
 }
 
-/// A single planned group change. Computed from the required set vs the managed
-/// group registry + live facts (design Р3). Census only ever creates or deletes
-/// groups it owns (in the registry); pre-existing/foreign groups are skipped.
+/// A single planned group change. Two diff paths feed this enum:
+/// * the membership-driven path ([`diff_groups`]), which only ever `Create`s or
+///   `Delete`s groups Census owns from the required set vs the registry + live
+///   facts (design Р3); and
+/// * the declaration-driven path ([`diff_resolved_groups`]), which reconciles
+///   declared `[[group]]` objects carrying grants/members and adds `Adopt`,
+///   `Release`, and `Update` for the provenance-aware lifecycle.
+///
+/// Only `Delete` is destructive: it removes the underlying group. `Adopt`,
+/// `Release`, and `Update` never destroy a group — `Release` strips Census's own
+/// grants/members from an adopted group and returns it to baseline without a
+/// `groupdel`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupAction {
-    /// Group is required but not present in the system — create it (with the
-    /// pinned GID if the declaration pinned one, else OS-assigned).
+    /// Group is required/declared (`Created` provenance) but not present in the
+    /// system — create it (with the pinned GID if declared, else OS-assigned).
     Create {
         /// Group name to create.
         name: String,
         /// Pinned GID, if declared.
         gid: Option<u32>,
     },
-    /// Group is in the registry (Census-owned) but no longer required and not
-    /// declared — delete it (destructive). Sequenced after account deletes.
+    /// Group is declared with `Adopted` provenance and not yet in the registry —
+    /// take the pre-existing group under management (snapshot its baseline, then
+    /// layer Census's grants/members on top). Never creates the group. NOT
+    /// destructive.
+    Adopt {
+        /// Group name to adopt.
+        name: String,
+    },
+    /// Group is in the registry with `Adopted` provenance but no longer declared
+    /// — release it: strip Census's own grants and Census-added members and
+    /// return it to the recorded baseline. The underlying group is NEVER deleted.
+    /// NOT destructive.
+    Release {
+        /// Group name to release.
+        name: String,
+    },
+    /// Group is in the registry and still declared, but its grants or members
+    /// differ from what Census recorded — reconcile it. `changes` are
+    /// human-readable field-level descriptions. NOT destructive.
+    Update {
+        /// Group name to reconcile.
+        name: String,
+        /// What differs (field-level descriptions).
+        changes: Vec<String>,
+    },
+    /// Group is in the registry with `Created` provenance but no longer
+    /// required/declared — delete it (destructive). Sequenced after account
+    /// deletes.
     Delete {
         /// Group name to remove.
         name: String,
@@ -57,7 +92,8 @@ pub enum GroupAction {
 }
 
 impl GroupAction {
-    /// Whether this action is destructive (delete).
+    /// Whether this action is destructive. Only `Delete` removes the underlying
+    /// group; `Adopt`/`Release`/`Update` leave the group intact.
     pub fn is_destructive(&self) -> bool {
         matches!(self, GroupAction::Delete { .. })
     }
@@ -130,11 +166,7 @@ fn diff_fields(target: &ResolvedAccount, current: &ManagedAccount) -> Vec<String
     if target.shell != current.shell {
         changes.push(format!("shell {:?} -> {:?}", current.shell, target.shell));
     }
-    let mut tg = target.groups.clone();
-    let mut cg = current.groups.clone();
-    tg.sort();
-    cg.sort();
-    if tg != cg {
+    if !str_set_equal(&current.groups, &target.groups) {
         changes.push(format!("groups {:?} -> {:?}", current.groups, target.groups));
     }
     if target.sudo_role != current.sudo_role {
@@ -144,17 +176,79 @@ fn diff_fields(target: &ResolvedAccount, current: &ManagedAccount) -> Vec<String
     // groups/sudo_role. Granting or revoking a permission that changes the
     // command set must produce an Update so the NOPASSWD fragment is rewritten —
     // otherwise a revoked command would leak as a stale rule.
-    let mut tc = target.sudo_commands.clone();
-    let mut cc = current.sudo_commands.clone();
-    tc.sort();
-    cc.sort();
-    if tc != cc {
+    if !str_set_equal(&current.sudo_commands, &target.sudo_commands) {
         changes.push(format!(
             "sudo-commands {:?} -> {:?}",
             current.sudo_commands, target.sudo_commands
         ));
     }
+    // File grants: compared set-equal (order-insensitive) by
+    // (path, access, recursive), mirroring sudo_commands. Granting or revoking a
+    // permission that changes the file-grant set must produce an Update so the
+    // backend re-materializes / revokes the ACL — otherwise a revoked grant would
+    // leak as a stale ACL entry.
+    if !file_grants_set_equal(&current.file_grants, &target.file_grants) {
+        let cur: Vec<_> = current.file_grants.iter().map(grant_label_managed).collect();
+        let tgt: Vec<_> = target.file_grants.iter().map(grant_label_resolved).collect();
+        changes.push(format!("file-grants {cur:?} -> {tgt:?}"));
+    }
     changes
+}
+
+/// The set-equality key of a file grant: (path, access, recursive). Order- and
+/// provenance-insensitive — provenance and the derived shape are not part of the
+/// account's enforced state, only what is materialized is.
+fn grant_key(path: &str, access: crate::catalog::Access, recursive: bool) -> (String, bool, bool) {
+    // access encoded as a bool (rw=true) so the tuple is cheaply Ord-comparable.
+    (path.to_owned(), matches!(access, crate::catalog::Access::Rw), recursive)
+}
+
+/// Whether a recorded managed file-grant set equals a resolved target set,
+/// compared set-equal (order-insensitive) by (path, access, recursive). Shared
+/// by the plan diff and `apply::build_managed_set`.
+pub fn file_grants_set_equal(
+    managed: &[ManagedFileGrant],
+    target: &[crate::catalog::ResolvedFileGrant],
+) -> bool {
+    if managed.len() != target.len() {
+        return false;
+    }
+    let mut m: Vec<_> = managed
+        .iter()
+        .map(|g| grant_key(&g.path, g.access, g.recursive))
+        .collect();
+    let mut t: Vec<_> = target
+        .iter()
+        .map(|g| grant_key(&g.path, g.access, g.recursive))
+        .collect();
+    m.sort();
+    t.sort();
+    m == t
+}
+
+/// Whether two string lists are set-equal (order-insensitive). Shared by the
+/// account diff (`groups`, `sudo_commands`) and the group diff
+/// (`sudo_commands`, members) so both compare enforced sets the same way: order
+/// is not part of the enforced state, membership is.
+fn str_set_equal(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut sa = a.to_vec();
+    let mut sb = b.to_vec();
+    sa.sort();
+    sb.sort();
+    sa == sb
+}
+
+/// A short human-readable label for a managed file grant (for change lines).
+fn grant_label_managed(g: &ManagedFileGrant) -> String {
+    format!("{}={:?}{}", g.path, g.access, if g.recursive { " -R" } else { "" })
+}
+
+/// A short human-readable label for a resolved file grant (for change lines).
+fn grant_label_resolved(g: &crate::catalog::ResolvedFileGrant) -> String {
+    format!("{}={:?}{}", g.path, g.access, if g.recursive { " -R" } else { "" })
 }
 
 /// Compute the plan. `targets` are the desired accounts (from `model::resolve`),
@@ -277,9 +371,14 @@ pub fn diff_groups(
     }
 
     // Deletes: registry (Census-owned) groups no longer required (BTreeMap order).
+    // Only a `Created` group is groupdel'd here — this path is the authority for
+    // group EXISTENCE. An `Adopted` group pre-existed Census, so its teardown is
+    // a grant-release handled by the declaration-driven resolved path
+    // (`GroupAction::Release`), never a `groupdel`: Census returns it to baseline
+    // but leaves the underlying group (and its foreign members) alone.
     let mut deletes = Vec::new();
-    for name in managed_groups.keys() {
-        if !required.contains_key(name) {
+    for (name, mg) in managed_groups {
+        if !required.contains_key(name) && mg.provenance == Provenance::Created {
             deletes.push(GroupAction::Delete { name: name.clone() });
         }
     }
@@ -318,6 +417,113 @@ pub fn diff_groups_via_inspector(
     diff_groups(required, managed_groups, &live, &gid_owners)
 }
 
+/// Compute the declaration-driven group actions for groups carrying grants and
+/// members (design "Adoption-baseline и release"). This is the second group diff
+/// path, distinct from [`diff_groups`]: that one reconciles the membership-driven
+/// required set (accounts joining groups like `netdev`); this one reconciles the
+/// declared `[[group]]` objects that own grants/members and a provenance.
+///
+/// Rules:
+/// * `target` not in `managed_groups`:
+///   * `provenance == Created` → [`GroupAction::Create`] (with the pinned GID);
+///   * `provenance == Adopted` → [`GroupAction::Adopt`] (take it under management,
+///     never create the underlying group).
+/// * `target` in `managed_groups`: compare what Census materializes — sudo
+///   commands and members set-equal (order-insensitive), file grants by
+///   (path, access, recursive). Any difference → [`GroupAction::Update`] with
+///   human-readable change lines (same shape as the account `diff_fields`). All
+///   equal → no action.
+/// * `managed` group with NO matching `target` (by name): the release-vs-delete
+///   trigger is the SAVED provenance, never the declaration's shape —
+///   `Created` → [`GroupAction::Delete`] (full `groupdel`); `Adopted` →
+///   [`GroupAction::Release`] (strip Census's grants/members, restore baseline,
+///   never delete).
+///
+/// Ordering is deterministic: creates/adopts/updates in `targets` slice order,
+/// then releases/deletes in `managed_groups` (BTreeMap) order — mirroring how
+/// [`diff_groups`] sequences its deletes after its creates.
+///
+/// GID is deliberately NOT reconciled here. A group's GID is the responsibility
+/// of the membership-driven [`diff_groups`] path, which compares the recorded
+/// GID against live facts and fails closed with `GroupPlanError::ManagedGidDrift`
+/// rather than renumbering. This declaration-driven path covers only the grants
+/// Census materializes (sudo commands, file grants) and its added members — never
+/// the GID (an adopted group carries `gid == None` regardless, since its GID is
+/// observed at apply, never assigned).
+pub fn diff_resolved_groups(
+    targets: &[ResolvedGroup],
+    managed_groups: &BTreeMap<String, ManagedGroup>,
+) -> Vec<GroupAction> {
+    let mut head = Vec::new();
+    for target in targets {
+        match managed_groups.get(&target.name) {
+            None => match target.provenance {
+                Provenance::Created => head.push(GroupAction::Create {
+                    name: target.name.clone(),
+                    gid: target.gid,
+                }),
+                Provenance::Adopted => head.push(GroupAction::Adopt {
+                    name: target.name.clone(),
+                }),
+            },
+            Some(current) => {
+                let changes = diff_group_fields(target, current);
+                if !changes.is_empty() {
+                    head.push(GroupAction::Update {
+                        name: target.name.clone(),
+                        changes,
+                    });
+                }
+            }
+        }
+    }
+
+    // Releases/deletes: managed groups no longer declared (BTreeMap => sorted).
+    // The trigger is the STORED provenance, not the declaration shape.
+    let declared: std::collections::BTreeSet<&str> =
+        targets.iter().map(|t| t.name.as_str()).collect();
+    for (name, mg) in managed_groups {
+        if declared.contains(name.as_str()) {
+            continue;
+        }
+        match mg.provenance {
+            Provenance::Created => head.push(GroupAction::Delete { name: name.clone() }),
+            Provenance::Adopted => head.push(GroupAction::Release { name: name.clone() }),
+        }
+    }
+
+    head
+}
+
+/// Compare a resolved target group with its managed record; return the list of
+/// human-readable field differences (empty == in sync). Compares only what
+/// Census materializes/owns: the group's sudo commands, file grants, and
+/// Census-added members (`members_added`) — never the group's foreign/baseline
+/// members. Mirrors the account `diff_fields` change-line shape.
+fn diff_group_fields(target: &ResolvedGroup, current: &ManagedGroup) -> Vec<String> {
+    let mut changes = Vec::new();
+    if !str_set_equal(&current.sudo_commands, &target.sudo_commands) {
+        changes.push(format!(
+            "sudo-commands {:?} -> {:?}",
+            current.sudo_commands, target.sudo_commands
+        ));
+    }
+    if !file_grants_set_equal(&current.file_grants, &target.file_grants) {
+        let cur: Vec<_> = current.file_grants.iter().map(grant_label_managed).collect();
+        let tgt: Vec<_> = target.file_grants.iter().map(grant_label_resolved).collect();
+        changes.push(format!("file-grants {cur:?} -> {tgt:?}"));
+    }
+    // Members compared against members_added — what Census itself added. The
+    // group's pre-existing/foreign members are never part of the diff.
+    if !str_set_equal(&current.members_added, &target.members) {
+        changes.push(format!(
+            "members {:?} -> {:?}",
+            current.members_added, target.members
+        ));
+    }
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +541,9 @@ mod tests {
             sudo_role: None,
             sudo_commands: Vec::new(),
             limits: Limits::default(),
+            file_grants: Vec::new(),
             locked_password: true,
+            provenance: crate::model::Provenance::Created,
         }
     }
 
@@ -347,6 +555,8 @@ mod tests {
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
             sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            provenance: crate::model::Provenance::Created,
             from_version: v,
         }
     }
@@ -530,6 +740,80 @@ mod tests {
         assert!(plan.is_empty(), "same command set in different order is in sync");
     }
 
+    // ---- file-grant diff ----
+
+    use crate::catalog::{Access, ResolvedFileGrant, Shape, SourcedFileGrant};
+
+    fn rgrant(path: &str, access: Access, recursive: bool) -> ResolvedFileGrant {
+        ResolvedFileGrant {
+            path: path.to_owned(),
+            access,
+            recursive,
+            shape: if recursive { Shape::Dir } else { Shape::File },
+            sources: vec![SourcedFileGrant { layer: "linux".to_owned(), via: None }],
+        }
+    }
+
+    fn mgrant(path: &str, access: Access, recursive: bool) -> ManagedFileGrant {
+        ManagedFileGrant { path: path.to_owned(), access, recursive }
+    }
+
+    #[test]
+    fn file_grant_change_yields_update() {
+        // Managed records a ro grant; the target widens it to rw → must Update
+        // with a change line mentioning file-grants.
+        let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
+        t.file_grants = vec![rgrant("/etc/ssh", Access::Rw, true)];
+        let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
+        m.file_grants = vec![mgrant("/etc/ssh", Access::Ro, true)];
+        let plan = diff(&[t], &state_of(vec![m]));
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            Action::Update { changes, .. } => {
+                assert_eq!(changes.len(), 1, "only file-grants should differ");
+                assert!(
+                    changes[0].contains("file-grants"),
+                    "change must mention file-grants: {changes:?}"
+                );
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_grant_removal_yields_update() {
+        // Target drops a grant the registry still records → must Update so the
+        // backend revokes it (no stale ACL leak).
+        let t = target("oper", 9010, "/bin/bash", &["wheel"]); // no grants
+        let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
+        m.file_grants = vec![mgrant("/etc/ssh", Access::Rw, true)];
+        let plan = diff(&[t], &state_of(vec![m]));
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            Action::Update { changes, .. } => {
+                assert!(changes[0].contains("file-grants"), "removal must mention file-grants: {changes:?}");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identical_file_grants_order_insensitive_is_idempotent() {
+        // Same grant set in a different order must NOT produce an action.
+        let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
+        t.file_grants = vec![
+            rgrant("/etc/ssh", Access::Rw, true),
+            rgrant("/etc/pam.d", Access::Ro, true),
+        ];
+        let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
+        m.file_grants = vec![
+            mgrant("/etc/pam.d", Access::Ro, true),
+            mgrant("/etc/ssh", Access::Rw, true),
+        ];
+        let plan = diff(&[t], &state_of(vec![m]));
+        assert!(plan.is_empty(), "same grant set in different order is in sync");
+    }
+
     // ---- group diff (task 3) ----
 
     use crate::inspect::GroupFacts;
@@ -540,7 +824,16 @@ mod tests {
     }
 
     fn mgroup(name: &str, gid: u32) -> ManagedGroup {
-        ManagedGroup { name: name.to_owned(), gid, from_version: 1 }
+        ManagedGroup {
+            name: name.to_owned(),
+            gid,
+            provenance: crate::model::Provenance::Created,
+            members_added: Vec::new(),
+            sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            adopt_baseline: None,
+            from_version: 1,
+        }
     }
 
     fn managed_groups(gs: &[ManagedGroup]) -> BTreeMap<String, ManagedGroup> {
@@ -659,6 +952,21 @@ mod tests {
     }
 
     #[test]
+    fn diff_groups_does_not_delete_adopted_orphan() {
+        // The existence-authority path must NEVER groupdel an Adopted group: its
+        // teardown is a grant-release on the resolved path, not a delete. Only a
+        // Created orphan is deleted here.
+        let required = req(&[]);
+        let mut adopted = mgroup("wheel", 10);
+        adopted.provenance = Provenance::Adopted;
+        let registry = managed_groups(&[adopted, mgroup("z-created", 8099)]);
+        let live = live_groups(&[("wheel", 10), ("z-created", 8099)]);
+        let actions = diff_groups(&required, &registry, &live, &no_owners()).unwrap();
+        // Only the Created orphan is deleted; the Adopted one is left untouched.
+        assert_eq!(actions, vec![GroupAction::Delete { name: "z-created".into() }]);
+    }
+
+    #[test]
     fn group_create_and_delete_ordering() {
         // new group required; old managed group orphaned. Create precedes delete.
         let required = req(&[("new-grp", None)]);
@@ -685,5 +993,172 @@ mod tests {
         assert!(matches!(plan.actions[0], Action::Update { .. }));
         assert!(matches!(plan.actions[1], Action::Create(_)));
         assert!(matches!(plan.actions[2], Action::Delete { .. }));
+    }
+
+    // ---- resolved-group diff (declaration-driven, provenance-aware) ----
+
+    /// A resolved target group: provenance Created with the given pinned GID,
+    /// empty grants/members. Mutated by the tests that need grants.
+    fn rgroup(name: &str, gid: Option<u32>, provenance: crate::model::Provenance) -> ResolvedGroup {
+        ResolvedGroup {
+            name: name.to_owned(),
+            gid,
+            provenance,
+            members: Vec::new(),
+            sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            limits: crate::rolestore::Limits::default(),
+            bound_roles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolved_created_group_absent_yields_create() {
+        let targets = vec![rgroup("atm-operators", Some(8010), Provenance::Created)];
+        let actions = diff_resolved_groups(&targets, &BTreeMap::new());
+        assert_eq!(
+            actions,
+            vec![GroupAction::Create {
+                name: "atm-operators".into(),
+                gid: Some(8010)
+            }]
+        );
+    }
+
+    #[test]
+    fn resolved_adopted_group_absent_yields_adopt() {
+        // An adopted group not yet in the registry → Adopt (not Create), gid is
+        // observed at apply so the pin is irrelevant here.
+        let targets = vec![rgroup("wheel", None, Provenance::Adopted)];
+        let actions = diff_resolved_groups(&targets, &BTreeMap::new());
+        assert_eq!(actions, vec![GroupAction::Adopt { name: "wheel".into() }]);
+        assert!(!actions[0].is_destructive(), "adopt is never destructive");
+    }
+
+    #[test]
+    fn managed_created_group_undeclared_yields_delete() {
+        let registry = managed_groups(&[mgroup("atm-operators", 8010)]); // Created
+        let actions = diff_resolved_groups(&[], &registry);
+        assert_eq!(actions, vec![GroupAction::Delete { name: "atm-operators".into() }]);
+        assert!(actions[0].is_destructive());
+    }
+
+    #[test]
+    fn managed_adopted_group_undeclared_yields_release_not_delete() {
+        // KEY invariant: the trigger is the SAVED provenance, not the declaration
+        // shape. A managed Adopted group that vanished must Release, never Delete.
+        let mut g = mgroup("wheel", 10);
+        g.provenance = Provenance::Adopted;
+        let registry = managed_groups(&[g]);
+        let actions = diff_resolved_groups(&[], &registry);
+        assert_eq!(actions, vec![GroupAction::Release { name: "wheel".into() }]);
+        assert!(!actions[0].is_destructive(), "release must never be destructive");
+    }
+
+    #[test]
+    fn resolved_group_sudo_commands_drift_yields_update() {
+        let mut t = rgroup("ops", Some(8020), Provenance::Created);
+        t.sudo_commands = vec!["/usr/sbin/ip".into(), "/usr/bin/nmcli".into()];
+        let mut m = mgroup("ops", 8020);
+        m.sudo_commands = vec!["/usr/sbin/ip".into()];
+        let registry = managed_groups(&[m]);
+        let actions = diff_resolved_groups(&[t], &registry);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            GroupAction::Update { name, changes } => {
+                assert_eq!(name, "ops");
+                assert_eq!(changes.len(), 1, "only sudo-commands should differ: {changes:?}");
+                assert!(changes[0].contains("sudo-commands"), "{changes:?}");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_group_file_grants_drift_yields_update() {
+        let mut t = rgroup("ops", Some(8020), Provenance::Created);
+        t.file_grants = vec![rgrant("/etc/net", Access::Rw, true)];
+        let mut m = mgroup("ops", 8020);
+        m.file_grants = vec![mgrant("/etc/net", Access::Ro, true)];
+        let registry = managed_groups(&[m]);
+        let actions = diff_resolved_groups(&[t], &registry);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            GroupAction::Update { changes, .. } => {
+                assert_eq!(changes.len(), 1, "only file-grants should differ: {changes:?}");
+                assert!(changes[0].contains("file-grants"), "{changes:?}");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_group_members_drift_against_members_added_yields_update() {
+        // target.members differs from current.members_added (what Census added) →
+        // Update. Foreign/baseline members are not part of this comparison.
+        let mut t = rgroup("ops", Some(8020), Provenance::Created);
+        t.members = vec!["netops".into(), "dbops".into()];
+        let mut m = mgroup("ops", 8020);
+        m.members_added = vec!["netops".into()];
+        let registry = managed_groups(&[m]);
+        let actions = diff_resolved_groups(&[t], &registry);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            GroupAction::Update { changes, .. } => {
+                assert_eq!(changes.len(), 1, "only members should differ: {changes:?}");
+                assert!(changes[0].contains("members"), "{changes:?}");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_group_fully_in_sync_yields_no_action() {
+        // Every materialized field matches (order-insensitive) → no action.
+        let mut t = rgroup("ops", Some(8020), Provenance::Created);
+        t.sudo_commands = vec!["/usr/sbin/ip".into(), "/usr/bin/nmcli".into()];
+        t.file_grants = vec![rgrant("/etc/net", Access::Rw, true)];
+        t.members = vec!["dbops".into(), "netops".into()];
+        let mut m = mgroup("ops", 8020);
+        // Different ORDER on every set — must still be in sync.
+        m.sudo_commands = vec!["/usr/bin/nmcli".into(), "/usr/sbin/ip".into()];
+        m.file_grants = vec![mgrant("/etc/net", Access::Rw, true)];
+        m.members_added = vec!["netops".into(), "dbops".into()];
+        let registry = managed_groups(&[m]);
+        let actions = diff_resolved_groups(&[t], &registry);
+        assert!(actions.is_empty(), "fully-synced group must produce no action: {actions:?}");
+    }
+
+    #[test]
+    fn resolved_groups_ordering_is_deterministic() {
+        // Targets in a fixed slice order: one update, one adopt, one create.
+        // Managed-only groups (a Created and an Adopted) trail after, in BTreeMap
+        // (sorted) order → Delete before Release because "z-created" > "a-...".
+        let mut upd = rgroup("ops", Some(8020), Provenance::Created);
+        upd.sudo_commands = vec!["/usr/sbin/ip".into()];
+        let targets = vec![
+            upd,                                              // -> Update (ops)
+            rgroup("wheel", None, Provenance::Adopted),       // -> Adopt (wheel)
+            rgroup("new-grp", Some(8030), Provenance::Created), // -> Create
+        ];
+        let mut adopted_orphan = mgroup("a-orphan", 11);
+        adopted_orphan.provenance = Provenance::Adopted;
+        let registry = managed_groups(&[
+            mgroup("ops", 8020),       // declared → update target above
+            adopted_orphan,            // undeclared Adopted → Release
+            mgroup("z-orphan", 8099),  // undeclared Created → Delete
+        ]);
+        let actions = diff_resolved_groups(&targets, &registry);
+        // Head: targets order → Update(ops), Adopt(wheel), Create(new-grp).
+        assert!(matches!(&actions[0], GroupAction::Update { name, .. } if name == "ops"));
+        assert!(matches!(&actions[1], GroupAction::Adopt { name } if name == "wheel"));
+        assert!(matches!(&actions[2], GroupAction::Create { name, .. } if name == "new-grp"));
+        // Tail: managed-only in BTreeMap order → "a-orphan" (Release) then
+        // "z-orphan" (Delete).
+        assert_eq!(actions[3], GroupAction::Release { name: "a-orphan".into() });
+        assert_eq!(actions[4], GroupAction::Delete { name: "z-orphan".into() });
+        assert_eq!(actions.len(), 5);
+        // Re-running on the same inputs is byte-identical (determinism).
+        assert_eq!(diff_resolved_groups(&targets, &registry), actions);
     }
 }

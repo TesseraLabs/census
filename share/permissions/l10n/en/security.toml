@@ -22,3 +22,18 @@ risk_note = "setenforce 0 disables mandatory access control host-wide."
 title     = "Secure Boot key management"
 summary   = "Manage Secure Boot MOK enrollment (mokutil)."
 risk_note = "Enrolling a key lets unsigned/attacker code pass Secure Boot verification."
+
+[sandbox-operate]
+title     = "Sandbox operation"
+summary   = "Launch the firejail SUID sandbox to confine processes (firejail group)."
+risk_note = "Contained: confines processes rather than expanding host privilege."
+
+[astra-mac-control]
+title     = "Astra MAC control"
+summary   = "Toggle Astra SE hardening switches: interpreter-macro lock, security monitor, ptrace lock."
+risk_note = "Flips mandatory-protection switches host-wide; loosening any removes a confinement barrier."
+
+[astra-digsig-control]
+title     = "Astra ЗПС (digsig) control"
+summary   = "Manage the ELF integrity-control mode and the digsig trust tree (astra-digsig-control, /etc/digsig)."
+risk_note = "Adding a key to /etc/digsig/keys or flipping the mode decides what may run under ЗПС at all — root-equivalent."

@@ -1,4 +1,4 @@
 id       = "device-video"
 risk     = "contained"
 category = "device"
-groups   = ["video", "render"]
+groups   = ["video", "render", "input"]

@@ -2,3 +2,11 @@ id       = "sudo-config"
 risk     = "escalation-capable"
 category = "identity"
 sudo     = ["/usr/sbin/visudo"]
+
+# sudoers drop-in directory. The bare /etc/sudoers is a single file (not granted
+# — the free ACL backend only enforces directory grants); the .d drop-in dir is
+# the rewrite-proof unit and is itself root-equivalent (a drop-in grants sudo).
+[[file]]
+path      = "/etc/sudoers.d"
+access    = "rw"
+recursive = true

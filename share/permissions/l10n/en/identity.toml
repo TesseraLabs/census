@@ -37,3 +37,8 @@ risk_note = "Redefining identity sources can change who maps to which uid/groups
 title     = "Polkit configuration"
 summary   = "Inspect and reload polkit authorization (pkaction, restart polkit)."
 risk_note = "Polkit rules govern privileged actions — a permissive rule is an escalation path."
+
+[astra-ad-integration]
+title     = "Astra AD integration"
+summary   = "Notify users of imminent AD/Kerberos password expiry (ad-password-expiry-notify.sh)."
+risk_note = "Contained: reads expiry state and emits a notification only."

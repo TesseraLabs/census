@@ -30,7 +30,9 @@
 //! `orphan` (not package-owned) setuid file is an anomaly to investigate, not a
 //! coverage gap that penalises the metric.
 
-use crate::catalog::{self, CatalogSource, OsTarget, ResolveCtx};
+use crate::catalog::{
+    self, Access, CatalogSource, OsTarget, ResolveCtx, ResolvedFileGrant, Risk, Shape,
+};
 
 /// A class of privileged surface object.
 ///
@@ -123,12 +125,34 @@ pub struct ResolvedRole {
     pub sudo: Vec<String>,
     /// Expanded group names contributed by this role instance.
     pub groups: Vec<String>,
+    /// Expanded file grants contributed by this role instance. A parametrized
+    /// `[[file]]` grant (e.g. `app-config-edit path="/etc/{app}"`) only yields a
+    /// concrete path once a role supplies the parameter, so a config object under
+    /// such a grant is covered only when the role instance is folded in.
+    pub file_grants: Vec<ResolvedFileGrant>,
 }
 
 impl ResolvedRole {
-    /// Construct from already-expanded sudo + group strings.
+    /// Construct from already-expanded sudo + group strings (no file grants).
     pub fn new(sudo: Vec<String>, groups: Vec<String>) -> Self {
-        ResolvedRole { sudo, groups }
+        ResolvedRole {
+            sudo,
+            groups,
+            file_grants: Vec::new(),
+        }
+    }
+
+    /// Construct from already-expanded sudo + group strings + file grants.
+    pub fn with_file_grants(
+        sudo: Vec<String>,
+        groups: Vec<String>,
+        file_grants: Vec<ResolvedFileGrant>,
+    ) -> Self {
+        ResolvedRole {
+            sudo,
+            groups,
+            file_grants,
+        }
     }
 }
 
@@ -144,6 +168,14 @@ pub struct CoverageCtx {
     /// The catalog version this coverage was computed against, echoed into the
     /// report for the audit trail.
     pub catalog_version: Option<String>,
+    /// Group names that a role-binding grants (a `[[role_group]]` whose resolved
+    /// group carries non-empty sudo and/or file grants). A `group`-class surface
+    /// object for such a group is covered by the binding even though no
+    /// membership primitive expands its name — the role attached a grant to the
+    /// group directly. Built by the CLI from `model::resolve_groups`; empty when
+    /// no declaration/role-store is supplied (coverage then sees only
+    /// membership-covered groups, exactly as before).
+    pub bound_grant_groups: Vec<String>,
 }
 
 /// Per-object coverage verdict in the report.
@@ -159,6 +191,20 @@ pub struct ObjectCoverage {
     /// When set, the object is intentionally uncovered for this reason and does
     /// NOT penalise the metric (escalation mechanism, MAC/pdpl, app group, …).
     pub intentional_exclusion: Option<String>,
+    /// When set, the object cannot be covered by any installed backend without an
+    /// over-broad grant (a single file directly in a non-grantable parent like
+    /// `/etc`, with only the dir-only `AclBackend` present). The free backend
+    /// structurally can't constrain it — covering it would require granting the
+    /// whole parent, which is an over-grant, not a real gap. So it is reported in
+    /// a distinct bucket and, like `intentional_exclusion`, does NOT penalise the
+    /// metric. Kept separate from `intentional_exclusion` so the report can tell
+    /// "intentionally out of scope" apart from "backend can't enforce it yet".
+    pub backend_limited: Option<String>,
+    /// For a covered object, a short note on HOW it is covered when that is not
+    /// obvious — currently the backend + guarantee that enforces a covering file
+    /// grant (e.g. `rw via AclBackend (dir)`). `None` for objects covered by the
+    /// sudo/group/unit mechanism (where the class itself implies the mechanism).
+    pub coverage_note: Option<String>,
 }
 
 /// Coverage counts for a single grant class.
@@ -277,7 +323,86 @@ struct CoveredSet {
     has_service_admin: bool,
     /// Whether the catalog grants `capability-admin` (covers all capfiles).
     has_capability_admin: bool,
+    /// File grants the catalog (+ role instances) resolve to. A `Config`-class
+    /// path is covered when it equals a grant path or lies under a recursive Dir
+    /// grant (see [`config_grant_match`]). Stored as resolved grants so the match
+    /// can distinguish ro/rw and name the enforcing backend in the report.
+    file_grants: Vec<ResolvedFileGrant>,
 }
+
+/// Built-in set of security-relevant config path prefixes: the directories whose
+/// contents gate authentication, privilege, network/firewall, kernel, audit, and
+/// trust on a hardened Linux host. Used to NARROW the `config` denominator —
+/// without this, the class would count every dpkg conffile (thousands of mostly
+/// inert files like `/etc/hostname`), drowning the metric. A config object counts
+/// toward the class only if it is at/under one of these prefixes OR is named by a
+/// catalog file grant (see [`config_in_scope`]); everything else is low-priority
+/// and excluded unless `--include-low-priority` is set.
+///
+/// The list is curated, not exhaustive: it is the privileged-config surface the
+/// coverage audit cares about (sshd, PAM, sudo, sysctl, audit, TLS trust, polkit,
+/// systemd, kernel modules, the limits/security stack). It is documented here so
+/// the chosen denominator is honest and reviewable.
+const SECURITY_RELEVANT_CONFIG_PREFIXES: &[&str] = &[
+    "/etc/ssh",
+    "/etc/pam.d",
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+    "/etc/sysctl.conf",
+    "/etc/sysctl.d",
+    "/etc/audit",
+    "/etc/ssl",
+    "/etc/pki",
+    "/etc/ca-certificates",
+    "/etc/ca-certificates.conf",
+    "/etc/polkit-1",
+    "/etc/PolicyKit",
+    "/etc/systemd",
+    "/etc/security",
+    "/etc/apparmor.d",
+    "/etc/selinux",
+    "/etc/modprobe.d",
+    "/etc/modules-load.d",
+    "/etc/login.defs",
+    "/etc/securetty",
+    "/etc/sudo.conf",
+    "/etc/nsswitch.conf",
+];
+
+/// Parent directories too broad to ever grant wholesale: top-level system trees
+/// and the shared trust dirs whose contents are a mix of unrelated, often
+/// security-critical files owned by many packages. A single security-relevant
+/// config sitting *directly* in one of these (e.g. `/etc/login.defs` in `/etc`,
+/// `/etc/ssl/openssl.cnf` in `/etc/ssl`) cannot be covered by the free dir-ACL
+/// backend without granting the entire parent — which would hand out write to
+/// the whole tree, an over-grant far worse than the uncovered file. The free
+/// backend (dir-only) structurally cannot constrain such an object to the single
+/// file, so it is NOT a real coverage gap: it is *backend-limited* and reported
+/// separately (see [`ObjectCoverage::backend_limited`]). A per-file-capable
+/// backend (commercial) would cover it directly; the gate is therefore on the
+/// installed backends' capability — with only the dir-only backend, parent ∈
+/// this set ⇒ backend-limited.
+///
+/// The set is curated and documented so the "what we won't grant wholesale"
+/// boundary is reviewable: the FHS top-level dirs an admin would never hand out
+/// in full, plus the shared TLS trust dirs (`/etc/ssl`, `/etc/pki`,
+/// `/etc/ca-certificates`) where a bare config file (e.g. `openssl.cnf`) sits
+/// next to private-key material. A config under a *purpose-specific* subdir
+/// (`/etc/ssh`, `/etc/sudoers.d`, `/etc/sysctl.d`) is NOT here — that subdir is
+/// itself a grantable directory, so such an object stays a normal covered/gap.
+const NON_GRANTABLE_PARENTS: &[&str] = &[
+    "/",
+    "/etc",
+    "/usr",
+    "/usr/local",
+    "/var",
+    "/boot",
+    "/opt",
+    "/run",
+    "/etc/ssl",
+    "/etc/pki",
+    "/etc/ca-certificates",
+];
 
 /// Permission ids that act as class-wide "covers everything" grants. Detected by
 /// id presence in the catalog (matches the spec wording "`service-admin`
@@ -342,6 +467,7 @@ fn build_covered_set(
     let mut units: Vec<String> = Vec::new();
     let mut has_service_admin = false;
     let mut has_capability_admin = false;
+    let mut file_grants: Vec<ResolvedFileGrant> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
     let resolve_ctx = ResolveCtx {
@@ -395,6 +521,20 @@ fn build_covered_set(
                 for p in &resolved.groups {
                     push_unique(&mut groups, p.value.clone());
                 }
+                // File grants the catalog declares statically (no `{param}`):
+                // such a grant resolves to a concrete path even without a role
+                // instance, so it covers a config object directly. A templated
+                // grant path (e.g. `/etc/{app}`) is NOT concrete here — it is
+                // folded in only via a role instance below, exactly like a
+                // templated sudo command. (We do not honour strict/non-strict for
+                // file grants: there is no static "binary prefix" analogue for a
+                // path, and a partial prefix would over-claim coverage on a parent
+                // directory the catalog never actually grants.)
+                for g in &resolved.file_grants {
+                    if !has_placeholder(&g.path) {
+                        push_unique_grant(&mut file_grants, g.clone());
+                    }
+                }
             }
             Err(e) => {
                 // One unresolvable id (cycle, contradiction, unknown include)
@@ -424,6 +564,22 @@ fn build_covered_set(
         for g in &role.groups {
             push_unique(&mut groups, g.clone());
         }
+        // A role instance's file grants are already `{param}`-substituted to
+        // concrete paths, so fold them in unconditionally — this is how a
+        // parametrized config-edit grant (`/etc/{app}` → `/etc/nginx`) lands as a
+        // covering grant.
+        for g in &role.file_grants {
+            push_unique_grant(&mut file_grants, g.clone());
+        }
+    }
+
+    // Fold in groups that a `[[role_group]]` binding grants directly: the role
+    // attached sudo/file grants to the group, so the group object is covered even
+    // though no membership primitive names it. (Membership-covered groups are
+    // already in `groups` from the loops above; this only ADDS binding-covered
+    // ones, so existing coverage is untouched.)
+    for g in &ctx.bound_grant_groups {
+        push_unique(&mut groups, g.clone());
     }
 
     Ok((
@@ -433,6 +589,7 @@ fn build_covered_set(
             units,
             has_service_admin,
             has_capability_admin,
+            file_grants,
         },
         warnings,
     ))
@@ -502,6 +659,37 @@ fn push_unique(acc: &mut Vec<String>, value: String) {
     }
 }
 
+/// Fold a covering file grant into the accumulator, keyed by path. A repeated
+/// path widens access to the max (`Ro` < `Rw`) and ORs `recursive` — the same
+/// union rule the catalog/model use — so two grants on the same path do not let a
+/// narrower one mask a wider, and the recorded access reflects the strongest grant
+/// that would be enforced.
+fn push_unique_grant(acc: &mut Vec<ResolvedFileGrant>, grant: ResolvedFileGrant) {
+    if let Some(existing) = acc.iter_mut().find(|g| g.path == grant.path) {
+        existing.access = wider_access(existing.access, grant.access);
+        existing.recursive = existing.recursive || grant.recursive;
+        // Recompute the shape against the now-effective recursive flag (a path
+        // seen once as a file and once recursive is effectively a directory).
+        existing.shape = if existing.recursive {
+            Shape::Dir
+        } else {
+            existing.shape
+        };
+    } else {
+        acc.push(grant);
+    }
+}
+
+/// The wider of two accesses (`Ro` < `Rw`). `Access::max` is private to the
+/// catalog module, so the coverage core has its own tiny widening helper rather
+/// than widening that struct's API just for this read-only audit.
+fn wider_access(a: Access, b: Access) -> Access {
+    match (a, b) {
+        (Access::Rw, _) | (_, Access::Rw) => Access::Rw,
+        _ => Access::Ro,
+    }
+}
+
 /// Compute coverage of `surface` against the installed catalog (+ roles).
 ///
 /// Builds the covered set (every resolved catalog primitive + role instances),
@@ -515,6 +703,24 @@ pub fn coverage(
     os: &OsTarget,
     roles: &[ResolvedRole],
     ctx: &CoverageCtx,
+) -> Result<CoverageReport, CoverageError> {
+    coverage_scoped(surface, catalog, os, roles, ctx, false)
+}
+
+/// Coverage with explicit `include_low_priority`: when `true`, config objects
+/// that are neither security-relevant nor named by a grant are STILL counted in
+/// the `config` denominator (the `--include-low-priority` view). When `false`
+/// (the default and the meaningful metric), such low-priority conffiles are not
+/// counted at all — they are dropped from both the per-object list and the
+/// denominator so the `config` percentage reflects only the privileged-config
+/// surface (see [`SECURITY_RELEVANT_CONFIG_PREFIXES`]).
+pub fn coverage_scoped(
+    surface: &[SurfaceObject],
+    catalog: &dyn CatalogSource,
+    os: &OsTarget,
+    roles: &[ResolvedRole],
+    ctx: &CoverageCtx,
+    include_low_priority: bool,
 ) -> Result<CoverageReport, CoverageError> {
     let (covered, catalog_warnings) = build_covered_set(catalog, os, roles, ctx)?;
 
@@ -549,19 +755,75 @@ pub fn coverage(
             anomalies.push(object.clone());
         }
 
+        // Narrow the config denominator to the security-relevant surface. A
+        // config object that is neither at/under a curated security-relevant
+        // prefix nor named by a catalog file grant is low-priority noise (most
+        // dpkg conffiles): by default it is dropped entirely — not counted, not
+        // listed — so the `config` percentage measures only the privileged-config
+        // surface. `--include-low-priority` keeps it (as an honest gap) so the
+        // operator can still see the long tail.
+        if object.class == SurfaceClass::Config
+            && !include_low_priority
+            && !config_in_scope(&object.key, &covered.file_grants)
+        {
+            continue;
+        }
+
         // Intentionally-uncovered policy: these do not penalise the metric and
-        // are reported with a reason rather than as a gap.
+        // are reported with a reason rather than as a gap. This is checked BEFORE
+        // the binding-covered set is consulted, so an admin-by-design group
+        // (wheel/sudo/astra-admin…) bound by a role stays "intentionally excluded",
+        // NOT "covered" — deliberate precedence: an excluded object never penalises
+        // the metric, and a role binding does not turn an admin group into a
+        // counted-covered grant object.
         if let Some(reason) = intentional_exclusion(object) {
             objects.push(ObjectCoverage {
                 object: object.clone(),
                 covered: false,
                 suggested_permission: None,
                 intentional_exclusion: Some(reason),
+                backend_limited: None,
+                coverage_note: None,
             });
             continue;
         }
 
-        let is_covered = object_covered(object, &covered);
+        // Config coverage is grant-based and yields a backend/guarantee note;
+        // every other class is covered by the sudo/group/unit mechanism (no note).
+        let (is_covered, coverage_note) = if object.class == SurfaceClass::Config {
+            match config_grant_cover(&object.key, &covered.file_grants) {
+                Some(note) => (true, Some(note)),
+                None => (false, None),
+            }
+        } else {
+            (object_covered(object, &covered), None)
+        };
+
+        // Backend-limited reclassification: an UNCOVERED config object that is a
+        // single file directly in a non-grantable parent (e.g. `/etc/login.defs`)
+        // cannot be covered by the dir-only `AclBackend` without granting the whole
+        // parent — an over-grant, not a real gap. Bucket it separately and exclude
+        // it from the metric (denominator), exactly like an intentional exclusion
+        // but with its own distinct reason so the report tells the two apart. Only
+        // config objects can be backend-limited (only file grants are dir-shaped);
+        // a covered object is already enforceable and stays counted as covered.
+        if !is_covered
+            && object.class == SurfaceClass::Config
+            && backend_limited_config(&object.key)
+        {
+            objects.push(ObjectCoverage {
+                object: object.clone(),
+                covered: false,
+                suggested_permission: None,
+                intentional_exclusion: None,
+                backend_limited: Some(
+                    "single file in non-grantable parent; requires per-file-capable backend"
+                        .to_owned(),
+                ),
+                coverage_note: None,
+            });
+            continue;
+        }
 
         // Tally toward the metric (covered + honest gaps; the intentional path
         // above already `continue`d out).
@@ -577,7 +839,7 @@ pub fn coverage(
         let suggested = if is_covered {
             None
         } else {
-            suggest_permission(object)
+            suggest_permission_with_grants(object)
         };
 
         objects.push(ObjectCoverage {
@@ -585,6 +847,8 @@ pub fn coverage(
             covered: is_covered,
             suggested_permission: suggested,
             intentional_exclusion: None,
+            backend_limited: None,
+            coverage_note,
         });
     }
 
@@ -641,15 +905,128 @@ fn object_covered(object: &SurfaceObject, covered: &CoveredSet) -> bool {
             covered.has_service_admin || unit_covered(&object.key, &covered.units)
         }
         SurfaceClass::CapFile => covered.has_capability_admin,
-        // Config coverage: our catalog models privilege via concrete sudo tools,
-        // not a `config-edit` primitive, so a config path matches only when a sudo
-        // command's binary path equals it. With no config-edit primitive in the
-        // catalog, config-class objects are honestly reported uncovered unless such
-        // a path match exists — config coverage is therefore expected to be low.
-        SurfaceClass::Config => covered.sudo_binaries.iter().any(|b| b == &object.key),
+        // Config coverage is grant-based and handled directly in `coverage_scoped`
+        // (it needs the backend/guarantee note), so it never routes through here.
+        SurfaceClass::Config => false,
         // Not a grant class; never reached for Setuid (filtered earlier).
         SurfaceClass::Setuid => false,
     }
+}
+
+/// Whether a config path is IN SCOPE for the `config` metric: either it is at/
+/// under a curated security-relevant prefix, or it is named by a catalog file
+/// grant (any grant whose path equals it or whose recursive directory contains
+/// it). Out-of-scope config objects are low-priority and, by default, dropped
+/// from the denominator entirely (see [`coverage_scoped`]).
+fn config_in_scope(path: &str, grants: &[ResolvedFileGrant]) -> bool {
+    if is_security_relevant_config(path) {
+        return true;
+    }
+    // A path a grant actually targets is in scope even if it falls outside the
+    // curated set — the catalog has explicitly taken an interest in it.
+    grants
+        .iter()
+        .any(|g| grant_covers_path(g, path).is_some())
+}
+
+/// Whether `path` is at or under one of the curated security-relevant prefixes.
+/// The match is on a path-component boundary, NOT a naive substring: `/etc/ssh`
+/// matches `/etc/ssh` and `/etc/ssh/sshd_config` but NOT `/etc/sshd_other`
+/// (which merely shares a textual prefix). The bare `/etc/sudoers` file and the
+/// `/etc/sudoers.d` directory are distinct entries so both are covered.
+fn is_security_relevant_config(path: &str) -> bool {
+    SECURITY_RELEVANT_CONFIG_PREFIXES
+        .iter()
+        .any(|prefix| path_at_or_under(prefix, path))
+}
+
+/// Whether `path` equals `base` or lies strictly under it on a `/`-component
+/// boundary. `path_at_or_under("/etc/ssh", "/etc/ssh")` and `.../sshd_config` are
+/// true; `path_at_or_under("/etc/ssh", "/etc/sshd_other")` is false. This is the
+/// boundary rule the whole config-coverage match relies on — a plain
+/// `str::starts_with` would wrongly treat `/etc/sshd_other` as under `/etc/ssh`.
+fn path_at_or_under(base: &str, path: &str) -> bool {
+    if path == base {
+        return true;
+    }
+    // Strictly-under requires the next char after `base` to be the separator, so
+    // the match lands on a component boundary (and a trailing slash on `base`,
+    // should one appear, is tolerated by trimming it first).
+    let base = base.strip_suffix('/').unwrap_or(base);
+    path.strip_prefix(base)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a config `path` is covered by a file grant, and if so the verdict's
+/// HOW note (`<ro|rw> via <backend> (<shape>)`). A path is covered when it equals
+/// a grant path, or lies under a `recursive` Dir grant on a component boundary.
+/// Returns the strongest covering grant's note (max access), or `None`.
+fn config_grant_cover(path: &str, grants: &[ResolvedFileGrant]) -> Option<String> {
+    let mut best: Option<&ResolvedFileGrant> = None;
+    for g in grants {
+        if grant_covers_path(g, path).is_some() {
+            best = Some(match best {
+                Some(prev) if prev.access == Access::Rw => prev,
+                _ => g,
+            });
+        }
+    }
+    best.map(grant_coverage_note)
+}
+
+/// Whether one grant covers `path`, returning the matching grant on success.
+///
+/// Match rule (the documented config-coverage semantics):
+///
+/// - an exact path equality always covers (any shape);
+/// - a `recursive` directory grant covers any path strictly under it, matched
+///   on a `/`-component boundary (so `/etc/ssh` recursive covers
+///   `/etc/ssh/sshd_config` but NOT `/etc/sshd_other`).
+///
+/// A non-recursive grant covers only its exact path — it makes no claim on
+/// children. (Pattern grants are matched by exact path here; glob expansion is a
+/// capable-backend concern, not something the open coverage audit simulates.)
+fn grant_covers_path<'a>(grant: &'a ResolvedFileGrant, path: &str) -> Option<&'a ResolvedFileGrant> {
+    if grant.path == path {
+        return Some(grant);
+    }
+    if grant.recursive && path_at_or_under(&grant.path, path) {
+        return Some(grant);
+    }
+    None
+}
+
+/// The coverage note for a covering grant: `<ro|rw> via <backend> (<shape>)`. A
+/// directory grant is enforced rewrite-proof by the open `AclBackend`; a File or
+/// Pattern grant would need a capability-gated backend, which the note states
+/// honestly so the report does not imply the open build can enforce it.
+fn grant_coverage_note(grant: &ResolvedFileGrant) -> String {
+    let access = match grant.access {
+        Access::Ro => "ro",
+        Access::Rw => "rw",
+    };
+    match grant.shape {
+        Shape::Dir => format!("{access} via AclBackend (dir)"),
+        Shape::File => format!("{access} (requires per-file-capable backend)"),
+        Shape::Pattern => format!("{access} (requires pattern-capable backend)"),
+    }
+}
+
+/// Whether an uncovered config object is *backend-limited* rather than a genuine
+/// gap: a single file sitting directly in a [`NON_GRANTABLE_PARENTS`] directory,
+/// which the dir-only `AclBackend` cannot cover without granting the whole parent.
+///
+/// The check is purely on the object's parent directory equalling a non-grantable
+/// parent — i.e. the file is at depth 1 under a too-broad tree (`/etc/login.defs`,
+/// `/etc/ssl/openssl.cnf`). A file under a purpose-specific subdir
+/// (`/etc/ssh/sshd_config` → parent `/etc/ssh`, a grantable directory) is NOT
+/// backend-limited: that subdir can be granted, so the object is a normal covered/
+/// gap. This gate assumes the dir-only backend (the open build); a per-file-capable
+/// backend would cover these directly, so a future caller with such a backend
+/// installed would simply not reclassify here.
+fn backend_limited_config(path: &str) -> bool {
+    let parent = parent_dir(path);
+    NON_GRANTABLE_PARENTS.iter().any(|p| *p == parent)
 }
 
 /// Whether a unit name is covered by the named-unit set, accepting both `<u>` and
@@ -748,9 +1125,215 @@ fn suggest_permission(object: &SurfaceObject) -> Option<String> {
     }
 }
 
+/// Suggestion for an uncovered object, extending [`suggest_permission`] with a
+/// config-specific hint: an in-scope config path with no covering grant suggests
+/// declaring a file grant on its containing directory (the rewrite-proof open
+/// unit). Other classes fall through to the existing domain heuristics.
+fn suggest_permission_with_grants(object: &SurfaceObject) -> Option<String> {
+    if object.class == SurfaceClass::Config {
+        // Suggest a directory grant on the parent — the open `AclBackend` enforces
+        // a directory rewrite-proof, so steering the author to the dir (not the
+        // bare file) is the correct, enforceable remediation.
+        let dir = parent_dir(&object.key);
+        return Some(format!("file grant rw on {dir} (recursive)"));
+    }
+    suggest_permission(object)
+}
+
+/// The parent directory of a path (`/etc/ssh/sshd_config` → `/etc/ssh`). A path
+/// with no `/` after the root, or the root itself, yields the path unchanged.
+fn parent_dir(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        // Keep the leading `/` for a top-level path (`/foo` → `/`).
+        Some(("", _)) => "/",
+        Some((parent, _)) => parent,
+        None => path,
+    }
+}
+
 /// The final path component of a binary path (`/usr/bin/su` → `su`).
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+// --- reverse lookup: which-grants -------------------------------------------
+//
+// The inverse of coverage: given a path or command, which catalog permissions
+// grant access to it, and how. A read-only query (even "no grants" is success) —
+// it never runs the binary or reads file content.
+
+/// Who a grant lands on: a role account or a Unix group. The reverse lookup
+/// echoes this into each match so the operator sees whether access is reached
+/// through a per-account mechanism (`census-<role>` sudoers, `u:account` ACL) or
+/// a group mechanism (`%group` sudoers, `g:group` ACL) — and, for the latter,
+/// which group (every member inherits the grant).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantTarget {
+    /// The grant is carried by a role-account permission set (per-account
+    /// mechanism). The string is informational (the catalog permission id is the
+    /// authoritative key already on `GrantSource`); account sources use this so
+    /// the account path renders exactly as before.
+    Account(String),
+    /// The grant is bound to the named Unix group: every member (including
+    /// effectively-nested LDAP members) inherits it. Rendered via `%group`
+    /// sudoers / `g:group` ACL.
+    Group(String),
+}
+
+impl GrantTarget {
+    /// The group name when this is a group target, else `None`. Lets the renderer
+    /// and JSON pick the group-mechanism wording without matching the full enum.
+    pub fn group(&self) -> Option<&str> {
+        match self {
+            GrantTarget::Group(g) => Some(g),
+            GrantTarget::Account(_) => None,
+        }
+    }
+}
+
+/// A single grant origin's resolved grants, reduced to what the reverse lookup
+/// needs: its id, the target it lands on (account or group), advisory risk, the
+/// concrete sudo command strings it expands to, and its resolved file grants.
+/// Built by the CLI from `catalog::resolve` over `all_definitions` (account
+/// sources) and from `model::resolve_groups` (group sources), so the matching
+/// core stays pure (no catalog/OS I/O) and is unit-tested directly from
+/// hand-built sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSource {
+    /// The permission id (account source) or group name (group source) that
+    /// carries these grants — the audit key shown as the match's `permission`.
+    pub id: String,
+    /// Who the grant lands on. Account sources render via the per-account
+    /// mechanism (unchanged); group sources render via `%group` / `g:group` and
+    /// name the inheriting group.
+    pub target: GrantTarget,
+    /// Advisory risk class of the permission, echoed into each match.
+    pub risk: Option<Risk>,
+    /// Concrete sudo command strings the source expands to (templated
+    /// commands with an unfilled `{placeholder}` are skipped by the CLI builder —
+    /// a reverse lookup is over concrete grants, not templates).
+    pub sudo: Vec<String>,
+    /// Resolved file grants the source carries.
+    pub file_grants: Vec<ResolvedFileGrant>,
+}
+
+/// What kind of grant matched the queried argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantKind {
+    /// The arg is the binary of one of the permission's sudo commands.
+    Sudo,
+    /// The arg is covered by one of the permission's file grants.
+    File,
+}
+
+impl GrantKind {
+    /// Stable lowercase token for JSON output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GrantKind::Sudo => "sudo",
+            GrantKind::File => "file",
+        }
+    }
+}
+
+/// One reverse-lookup match: a permission that grants access to the queried arg,
+/// with the detail of HOW.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantMatch {
+    /// The permission id (account source) or group name (group source) that
+    /// grants access.
+    pub permission: String,
+    /// Who the grant lands on — an account-carried permission or a group every
+    /// member inherits. Drives the rendered mechanism (`via sudo` / `via file`
+    /// for accounts; `via %group sudoers` / `via g:group ACL` for groups).
+    pub target: GrantTarget,
+    /// Whether access is via sudo or via a file grant.
+    pub kind: GrantKind,
+    /// For a sudo match, the matching sudo command string; for a file match, the
+    /// grant path. The concrete thing the operator should look at.
+    pub detail: String,
+    /// For a file match, the access (`ro`/`rw`); `None` for a sudo match.
+    pub access: Option<Access>,
+    /// For a file match, whether the grant is recursive; `None` for a sudo match.
+    pub recursive: Option<bool>,
+    /// The enforcing backend, when a file match names one (Dir → `AclBackend`);
+    /// `None` for a sudo match (the mechanism is sudoers, implied by the kind).
+    pub backend: Option<String>,
+    /// Advisory risk class of the granting permission.
+    pub risk: Option<Risk>,
+}
+
+/// Reverse lookup: which permissions in `sources` grant access to `arg`, and how.
+///
+/// Match rules (mirroring the forward coverage match exactly):
+///
+/// - **sudo/command**: a permission matches when the argv-leading binary token of
+///   one of its sudo commands (the first whitespace-delimited token — args only
+///   narrow what the binary does, they do not change which binary is reachable)
+///   equals `arg`. `arg` is itself reduced to its leading token so passing a full
+///   command (`/usr/sbin/ip link`) matches the same as the bare binary.
+/// - **file**: a permission matches when one of its file grants covers `arg` —
+///   exact path equality (any shape) or `arg` strictly under a `recursive` Dir
+///   grant on a `/`-component boundary (the same [`grant_covers_path`] rule
+///   coverage uses, so a recursive `/etc/ssh` grant matches `/etc/ssh/sshd_config`
+///   but not `/etc/sshd_other`).
+///
+/// One permission can yield several matches (multiple matching sudo commands or
+/// file grants). Results are in source order, sudo matches before file matches per
+/// permission. An `arg` that matches nothing yields an empty vec — the caller
+/// treats that as a successful "no grants" query, not an error.
+pub fn which_grants(arg: &str, sources: &[GrantSource]) -> Vec<GrantMatch> {
+    // Reduce the query to its leading binary token so a full command line and the
+    // bare binary are treated identically (argv-boundary, like coverage).
+    let arg_bin = sudo_binary_token(arg).unwrap_or(arg);
+
+    let mut out: Vec<GrantMatch> = Vec::new();
+    for src in sources {
+        for cmd in &src.sudo {
+            if let Some(bin) = sudo_binary_token(cmd) {
+                if bin == arg_bin {
+                    out.push(GrantMatch {
+                        permission: src.id.clone(),
+                        target: src.target.clone(),
+                        kind: GrantKind::Sudo,
+                        detail: cmd.clone(),
+                        access: None,
+                        recursive: None,
+                        backend: None,
+                        risk: src.risk,
+                    });
+                }
+            }
+        }
+        for g in &src.file_grants {
+            // File grants are matched on the literal path argument (not the
+            // leading-token reduction — a path is not a command line).
+            if grant_covers_path(g, arg).is_some() {
+                out.push(GrantMatch {
+                    permission: src.id.clone(),
+                    target: src.target.clone(),
+                    kind: GrantKind::File,
+                    detail: g.path.clone(),
+                    access: Some(g.access),
+                    recursive: Some(g.recursive),
+                    backend: Some(grant_backend(g)),
+                    risk: src.risk,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The backend that enforces a file grant, by shape. A directory grant is enforced
+/// by the open `AclBackend`; File/Pattern shapes need a capability-gated backend,
+/// stated honestly so the match does not imply the open build can enforce them.
+fn grant_backend(grant: &ResolvedFileGrant) -> String {
+    match grant.shape {
+        Shape::Dir => "AclBackend".to_owned(),
+        Shape::File => "per-file-capable backend".to_owned(),
+        Shape::Pattern => "pattern-capable backend".to_owned(),
+    }
 }
 
 // --- live surface scanner ---------------------------------------------------
@@ -1310,6 +1893,7 @@ mod tests {
             replace: false,
             includes: Vec::new(),
             include_categories: Vec::new(),
+            files: Vec::new(),
         }
     }
 
@@ -1334,6 +1918,34 @@ mod tests {
         }
     }
 
+    /// A catalog record carrying one `[[file]]` grant (path/access/recursive).
+    fn file_def(id: &str, path: &str, access: Access, recursive: bool) -> PermissionDef {
+        PermissionDef {
+            files: vec![crate::catalog::FileGrant {
+                path: path.to_owned(),
+                access,
+                recursive,
+            }],
+            ..def(id)
+        }
+    }
+
+    /// A resolved file grant for a role instance (already concrete/substituted).
+    fn rfg(path: &str, access: Access, recursive: bool) -> ResolvedFileGrant {
+        ResolvedFileGrant {
+            path: path.to_owned(),
+            access,
+            recursive,
+            shape: crate::catalog::FileGrant {
+                path: path.to_owned(),
+                access,
+                recursive,
+            }
+            .shape(),
+            sources: Vec::new(),
+        }
+    }
+
     fn obj(class: SurfaceClass, key: &str, prov: Provenance) -> SurfaceObject {
         SurfaceObject {
             class,
@@ -1347,6 +1959,7 @@ mod tests {
         CoverageCtx {
             strict: false,
             catalog_version: Some("2026.06".to_owned()),
+            bound_grant_groups: Vec::new(),
         }
     }
 
@@ -1445,6 +2058,7 @@ mod tests {
         let strict = CoverageCtx {
             strict: true,
             catalog_version: None,
+            bound_grant_groups: Vec::new(),
         };
         let r = coverage(&surface, &cat, &debian(), &[], &strict).unwrap();
         assert!(
@@ -1470,6 +2084,7 @@ mod tests {
         let strict = CoverageCtx {
             strict: true,
             catalog_version: None,
+            bound_grant_groups: Vec::new(),
         };
         let r = coverage(&surface, &cat, &debian(), &[role], &strict).unwrap();
         assert!(find(&r, "atm-app.service").covered);
@@ -1506,6 +2121,29 @@ mod tests {
         assert!(!find(&r, "video").covered);
         // netdev carries a domain suggestion; the covered one has none.
         assert_eq!(find(&r, "netdev").suggested_permission, None);
+    }
+
+    #[test]
+    fn group_covered_by_role_binding_grant() {
+        // A group with no membership-covering primitive is an honest gap by
+        // default; once a `[[role_group]]` binding attaches a grant to it (folded
+        // in via `bound_grant_groups`), the same group object is covered.
+        let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
+        let surface = vec![obj(SurfaceClass::Group, "atm-operators", Provenance::Vendor)];
+
+        // No binding → uncovered gap.
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert!(!find(&r, "atm-operators").covered);
+
+        // With a binding-covered group folded in → covered.
+        let bound = CoverageCtx {
+            strict: false,
+            catalog_version: None,
+            bound_grant_groups: vec!["atm-operators".to_owned()],
+        };
+        let r2 = coverage(&surface, &cat, &debian(), &[], &bound).unwrap();
+        assert!(find(&r2, "atm-operators").covered);
+        assert_eq!(class_cov(&r2, SurfaceClass::Group).covered, 1);
     }
 
     #[test]
@@ -1721,9 +2359,10 @@ mod tests {
     }
 
     #[test]
-    fn config_uncovered_without_config_edit_primitive() {
-        // The catalog has no config-edit primitive; a config object is honestly
-        // uncovered unless a sudo binary path matches it (documented limitation).
+    fn config_uncovered_without_any_grant() {
+        // No file grant touches /etc/ssh; the config object is in scope
+        // (security-relevant prefix) but honestly uncovered, with a suggestion to
+        // declare a directory file grant.
         let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
         let surface = vec![obj(
             SurfaceClass::Config,
@@ -1731,7 +2370,261 @@ mod tests {
             Provenance::Vendor,
         )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
-        assert!(!find(&r, "/etc/ssh/sshd_config").covered);
+        let c = find(&r, "/etc/ssh/sshd_config");
+        assert!(!c.covered);
+        assert_eq!(
+            c.suggested_permission.as_deref(),
+            Some("file grant rw on /etc/ssh (recursive)")
+        );
+    }
+
+    // --- backend-limited config (single file in non-grantable parent) ------
+
+    #[test]
+    fn single_file_in_non_grantable_parent_is_backend_limited_not_a_gap() {
+        // /etc/login.defs is security-relevant (in scope) and ungranted, but it
+        // sits directly in /etc — a non-grantable parent. The dir-only AclBackend
+        // can't cover it without granting all of /etc, so it is backend-limited,
+        // NOT an uncovered gap, and it does not count toward the metric.
+        let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
+        let surface = vec![obj(SurfaceClass::Config, "/etc/login.defs", Provenance::Vendor)];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        let c = find(&r, "/etc/login.defs");
+        assert!(!c.covered);
+        assert!(
+            c.backend_limited.is_some(),
+            "a single file in /etc must be backend-limited"
+        );
+        assert!(c.intentional_exclusion.is_none());
+        // Excluded from the config denominator (not a gap, not counted).
+        assert_eq!(class_cov(&r, SurfaceClass::Config).total, 0);
+        assert_eq!(class_cov(&r, SurfaceClass::Config).covered, 0);
+    }
+
+    #[test]
+    fn backend_limited_recognises_etc_ssl_bare_file() {
+        // /etc/ssl/openssl.cnf sits directly in /etc/ssl (a shared trust dir, in
+        // NON_GRANTABLE_PARENTS) — backend-limited, same as a bare /etc file.
+        let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
+        let surface = vec![obj(
+            SurfaceClass::Config,
+            "/etc/ssl/openssl.cnf",
+            Provenance::Vendor,
+        )];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        let c = find(&r, "/etc/ssl/openssl.cnf");
+        assert!(c.backend_limited.is_some(), "{c:?}");
+        assert_eq!(class_cov(&r, SurfaceClass::Config).total, 0);
+    }
+
+    #[test]
+    fn file_under_grantable_subdir_stays_a_genuine_gap() {
+        // /etc/ssh/sshd_config sits under /etc/ssh, a grantable directory: with no
+        // grant it is a GENUINE uncovered gap (not backend-limited), and it counts.
+        let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
+        let surface = vec![obj(
+            SurfaceClass::Config,
+            "/etc/ssh/sshd_config",
+            Provenance::Vendor,
+        )];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        let c = find(&r, "/etc/ssh/sshd_config");
+        assert!(!c.covered);
+        assert!(
+            c.backend_limited.is_none(),
+            "a file under a grantable subdir is a real gap, not backend-limited"
+        );
+        assert_eq!(class_cov(&r, SurfaceClass::Config).total, 1);
+    }
+
+    #[test]
+    fn covered_single_file_in_non_grantable_parent_is_not_reclassified() {
+        // A bare /etc file that IS granted (e.g. a per-file grant resolved to it)
+        // stays covered — backend-limited only reclassifies UNcovered objects.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("logindefs", "/etc/login.defs", Access::Rw, false),
+        );
+        let surface = vec![obj(SurfaceClass::Config, "/etc/login.defs", Provenance::Vendor)];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        let c = find(&r, "/etc/login.defs");
+        assert!(c.covered);
+        assert!(c.backend_limited.is_none());
+        assert_eq!(class_cov(&r, SurfaceClass::Config).total, 1);
+        assert_eq!(class_cov(&r, SurfaceClass::Config).covered, 1);
+    }
+
+    #[test]
+    fn backend_limited_excluded_from_denominator_alongside_real_gap() {
+        // A mix: one backend-limited bare /etc file + one genuine gap under a
+        // grantable subdir. Only the genuine gap counts (1/1 denominator → 0%
+        // covered), the backend-limited one is excluded entirely.
+        let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
+        let surface = vec![
+            obj(SurfaceClass::Config, "/etc/login.defs", Provenance::Vendor),
+            obj(SurfaceClass::Config, "/etc/ssh/sshd_config", Provenance::Vendor),
+        ];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert!(find(&r, "/etc/login.defs").backend_limited.is_some());
+        let gap = find(&r, "/etc/ssh/sshd_config");
+        assert!(!gap.covered && gap.backend_limited.is_none());
+        assert_eq!(
+            class_cov(&r, SurfaceClass::Config).total,
+            1,
+            "only the genuine gap counts; backend-limited excluded"
+        );
+    }
+
+    // --- config coverage via file grants (slice 4) -------------------------
+
+    #[test]
+    fn config_under_recursive_dir_grant_is_covered_with_backend_note() {
+        // Catalog gives a recursive rw Dir grant on /etc/ssh; the config object
+        // /etc/ssh/sshd_config under it is covered, with an AclBackend (dir) note.
+        let cat = FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+        let surface = vec![obj(
+            SurfaceClass::Config,
+            "/etc/ssh/sshd_config",
+            Provenance::Vendor,
+        )];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        let c = find(&r, "/etc/ssh/sshd_config");
+        assert!(c.covered);
+        assert_eq!(c.coverage_note.as_deref(), Some("rw via AclBackend (dir)"));
+        assert_eq!(class_cov(&r, SurfaceClass::Config).covered, 1);
+        assert_eq!(class_cov(&r, SurfaceClass::Config).total, 1);
+    }
+
+    #[test]
+    fn config_ro_vs_rw_distinguished_in_note() {
+        // An ro recursive grant yields an `ro` note (not rw).
+        let cat = FakeCatalog::new().with("linux", file_def("ssh-read", "/etc/ssh", Access::Ro, true));
+        let surface = vec![obj(SurfaceClass::Config, "/etc/ssh/sshd_config", Provenance::Vendor)];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert_eq!(
+            find(&r, "/etc/ssh/sshd_config").coverage_note.as_deref(),
+            Some("ro via AclBackend (dir)")
+        );
+    }
+
+    #[test]
+    fn config_path_boundary_not_naive_prefix() {
+        // /etc/security recursive must NOT cover /etc/securetty — they share a
+        // textual prefix but not a path-component boundary. Both are security-
+        // relevant (so both are in scope and counted), which makes the boundary
+        // miss observable as an uncovered object, guarding against starts_with.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("sec-edit", "/etc/security", Access::Rw, true),
+        );
+        let surface = vec![
+            obj(SurfaceClass::Config, "/etc/security/limits.conf", Provenance::Vendor),
+            obj(SurfaceClass::Config, "/etc/securetty", Provenance::Vendor),
+        ];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert!(find(&r, "/etc/security/limits.conf").covered);
+        assert!(
+            !find(&r, "/etc/securetty").covered,
+            "a textual-prefix neighbour must not be over-covered"
+        );
+    }
+
+    #[test]
+    fn non_recursive_grant_covers_only_exact_path() {
+        // A non-recursive File grant on /etc/sudoers covers that exact path, NOT a
+        // child of /etc/sudoers.d (which it makes no claim on).
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("sudoers-edit", "/etc/sudoers", Access::Rw, false),
+        );
+        let surface = vec![
+            obj(SurfaceClass::Config, "/etc/sudoers", Provenance::Vendor),
+            obj(SurfaceClass::Config, "/etc/sudoers.d/census", Provenance::Vendor),
+        ];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        let exact = find(&r, "/etc/sudoers");
+        assert!(exact.covered);
+        // A File-shape grant is covered but the note says it needs a capable backend.
+        assert_eq!(
+            exact.coverage_note.as_deref(),
+            Some("rw (requires per-file-capable backend)")
+        );
+        assert!(!find(&r, "/etc/sudoers.d/census").covered);
+    }
+
+    #[test]
+    fn config_covered_by_role_instance_grant() {
+        // A parametrized config-edit grant is templated in the catalog (no concrete
+        // path) and only a role instance supplies /etc/nginx. With the role folded
+        // in, the config object under it is covered.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("app-config-edit", "/etc/{app}", Access::Rw, true),
+        );
+        let surface = vec![obj(SurfaceClass::Config, "/etc/nginx/nginx.conf", Provenance::Vendor)];
+
+        // Without the role instance: templated grant is not concrete → uncovered.
+        // (/etc/nginx is not in the curated set, so it is only in scope BECAUSE a
+        // grant — once concrete — names it; without the instance it is dropped.)
+        let r0 = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert!(r0.objects.iter().all(|o| o.object.key != "/etc/nginx/nginx.conf"));
+
+        // With the role instance contributing a concrete /etc/nginx recursive grant.
+        let role = ResolvedRole::with_file_grants(vec![], vec![], vec![rfg("/etc/nginx", Access::Rw, true)]);
+        let r = coverage(&surface, &cat, &debian(), &[role], &ctx()).unwrap();
+        let c = find(&r, "/etc/nginx/nginx.conf");
+        assert!(c.covered);
+        assert_eq!(c.coverage_note.as_deref(), Some("rw via AclBackend (dir)"));
+    }
+
+    #[test]
+    fn non_security_relevant_config_excluded_from_denominator() {
+        // A low-priority conffile under a grantable subdir (/etc/app/app.conf) is
+        // neither security-relevant nor grant-named: by default it is dropped from
+        // the config class entirely (not counted, not listed), so the denominator
+        // shrinks to the security-relevant object only. Its parent /etc/app is a
+        // grantable subdir (NOT in NON_GRANTABLE_PARENTS), so under
+        // --include-low-priority it is a genuine gap — distinct from the
+        // backend-limited reclassification a bare /etc file would get.
+        let cat = FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+        let surface = vec![
+            obj(SurfaceClass::Config, "/etc/ssh/sshd_config", Provenance::Vendor),
+            obj(SurfaceClass::Config, "/etc/app/app.conf", Provenance::Vendor),
+        ];
+
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        // Only the security-relevant object is counted (1/1), the low-priority dropped.
+        assert_eq!(class_cov(&r, SurfaceClass::Config).total, 1);
+        assert!(r.objects.iter().all(|o| o.object.key != "/etc/app/app.conf"));
+
+        // With --include-low-priority, the low-priority file is counted (as an
+        // uncovered gap), so the denominator grows and coverage drops.
+        let r2 = coverage_scoped(&surface, &cat, &debian(), &[], &ctx(), true).unwrap();
+        assert_eq!(class_cov(&r2, SurfaceClass::Config).total, 2);
+        let low = find(&r2, "/etc/app/app.conf");
+        assert!(!low.covered);
+        assert!(low.backend_limited.is_none());
+    }
+
+    #[test]
+    fn config_denominator_shrinks_vs_all_conffiles() {
+        // A realistic mix: one security-relevant config + several inert conffiles.
+        // The default config denominator counts only the security-relevant one,
+        // demonstrating the narrowed, meaningful metric.
+        let cat = FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+        let surface = vec![
+            obj(SurfaceClass::Config, "/etc/ssh/sshd_config", Provenance::Vendor),
+            obj(SurfaceClass::Config, "/etc/hostname", Provenance::Vendor),
+            obj(SurfaceClass::Config, "/etc/hosts", Provenance::Vendor),
+            obj(SurfaceClass::Config, "/etc/motd", Provenance::Vendor),
+        ];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert_eq!(
+            class_cov(&r, SurfaceClass::Config).total,
+            1,
+            "denominator narrowed to the security-relevant config only"
+        );
+        assert_eq!(class_cov(&r, SurfaceClass::Config).pct(), 100.0);
     }
 
     #[test]
@@ -1741,6 +2634,149 @@ mod tests {
         let r = coverage(&[], &cat, &debian(), &[], &ctx()).unwrap();
         assert_eq!(r.overall_pct, 100.0);
         assert!(r.objects.is_empty());
+    }
+
+    // --- reverse lookup: which_grants ---------------------------------------
+
+    fn grant_src(id: &str, sudo: &[&str], grants: Vec<ResolvedFileGrant>) -> GrantSource {
+        GrantSource {
+            id: id.to_owned(),
+            target: GrantTarget::Account(id.to_owned()),
+            risk: None,
+            sudo: sudo.iter().map(|s| s.to_string()).collect(),
+            file_grants: grants,
+        }
+    }
+
+    /// A group-target source: the same grants, but reached through a `%group`
+    /// sudoers fragment / `g:group` ACL (every member inherits).
+    fn group_grant_src(group: &str, sudo: &[&str], grants: Vec<ResolvedFileGrant>) -> GrantSource {
+        GrantSource {
+            id: group.to_owned(),
+            target: GrantTarget::Group(group.to_owned()),
+            risk: None,
+            sudo: sudo.iter().map(|s| s.to_string()).collect(),
+            file_grants: grants,
+        }
+    }
+
+    #[test]
+    fn which_grants_finds_sudo_match_by_binary() {
+        // One perm grants /usr/sbin/ip via sudo, one grants /etc/ssh rw via file.
+        // which-grants /usr/sbin/ip finds only the sudo one.
+        let sources = vec![
+            grant_src("network-admin", &["/usr/sbin/ip link set"], vec![]),
+            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::Rw, true)]),
+        ];
+        let matches = which_grants("/usr/sbin/ip", &sources);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].permission, "network-admin");
+        assert_eq!(matches[0].kind, GrantKind::Sudo);
+        assert_eq!(matches[0].detail, "/usr/sbin/ip link set");
+        assert!(matches[0].access.is_none());
+        assert!(matches[0].backend.is_none());
+    }
+
+    #[test]
+    fn which_grants_finds_file_match_under_recursive_dir() {
+        // /etc/ssh/sshd_config is under the recursive /etc/ssh rw grant → file match.
+        let sources = vec![
+            grant_src("network-admin", &["/usr/sbin/ip link set"], vec![]),
+            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::Rw, true)]),
+        ];
+        let matches = which_grants("/etc/ssh/sshd_config", &sources);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].permission, "ssh-edit");
+        assert_eq!(matches[0].kind, GrantKind::File);
+        assert_eq!(matches[0].detail, "/etc/ssh");
+        assert_eq!(matches[0].access, Some(Access::Rw));
+        assert_eq!(matches[0].recursive, Some(true));
+        assert_eq!(matches[0].backend.as_deref(), Some("AclBackend"));
+    }
+
+    #[test]
+    fn which_grants_non_matching_arg_is_empty() {
+        let sources = vec![
+            grant_src("network-admin", &["/usr/sbin/ip link set"], vec![]),
+            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::Rw, true)]),
+        ];
+        assert!(which_grants("/usr/bin/nonexistent", &sources).is_empty());
+        // A path neighbour of the recursive grant (textual prefix, not a
+        // component-boundary child) does NOT match.
+        assert!(which_grants("/etc/sshd_other", &sources).is_empty());
+    }
+
+    #[test]
+    fn which_grants_full_command_arg_matches_bare_binary() {
+        // Passing a full command line reduces to its leading binary token, so it
+        // matches the same sudo grant as the bare binary.
+        let sources = vec![grant_src("power", &["/sbin/shutdown -r now"], vec![])];
+        let matches = which_grants("/sbin/shutdown -h", &sources);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].detail, "/sbin/shutdown -r now");
+    }
+
+    #[test]
+    fn which_grants_non_recursive_file_matches_only_exact_path() {
+        // A non-recursive File grant on /etc/sudoers matches that exact path, not a
+        // child path. Its backend note states a per-file-capable backend.
+        let sources = vec![grant_src(
+            "sudoers-edit",
+            &[],
+            vec![rfg("/etc/sudoers", Access::Rw, false)],
+        )];
+        let exact = which_grants("/etc/sudoers", &sources);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].kind, GrantKind::File);
+        assert_eq!(exact[0].backend.as_deref(), Some("per-file-capable backend"));
+        // A different path under it is not matched by the non-recursive grant.
+        assert!(which_grants("/etc/sudoers.d/census", &sources).is_empty());
+    }
+
+    #[test]
+    fn which_grants_finds_group_sudo_match() {
+        // A group-bound sudo grant: which-grants on the command matches with
+        // target=Group and the group name (every member inherits via %group).
+        let sources = vec![group_grant_src("netops", &["/usr/sbin/ip link set"], vec![])];
+        let matches = which_grants("/usr/sbin/ip", &sources);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].permission, "netops");
+        assert_eq!(matches[0].kind, GrantKind::Sudo);
+        assert_eq!(matches[0].target, GrantTarget::Group("netops".to_owned()));
+        assert_eq!(matches[0].target.group(), Some("netops"));
+    }
+
+    #[test]
+    fn which_grants_finds_group_file_match_under_recursive_dir() {
+        // A path under a group's recursive `g:group` file grant matches with
+        // target=Group.
+        let sources = vec![group_grant_src(
+            "netops",
+            &[],
+            vec![rfg("/etc/net", Access::Rw, true)],
+        )];
+        let matches = which_grants("/etc/net/iface.conf", &sources);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].permission, "netops");
+        assert_eq!(matches[0].kind, GrantKind::File);
+        assert_eq!(matches[0].target, GrantTarget::Group("netops".to_owned()));
+        assert_eq!(matches[0].access, Some(Access::Rw));
+        assert_eq!(matches[0].recursive, Some(true));
+    }
+
+    #[test]
+    fn which_grants_account_and_group_sources_coexist() {
+        // The same binary granted by both an account permission and a group: both
+        // matches surface, each carrying its own target.
+        let sources = vec![
+            grant_src("network-admin", &["/usr/sbin/ip link"], vec![]),
+            group_grant_src("netops", &["/usr/sbin/ip route"], vec![]),
+        ];
+        let matches = which_grants("/usr/sbin/ip", &sources);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].target, GrantTarget::Account("network-admin".to_owned()));
+        assert!(matches[0].target.group().is_none());
+        assert_eq!(matches[1].target, GrantTarget::Group("netops".to_owned()));
     }
 
     // --- live-scanner pure parsers (in-memory; no shell-out) ----------------

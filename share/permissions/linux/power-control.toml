@@ -1,4 +1,4 @@
 id       = "power-control"
 risk     = "escalation-capable"
 category = "os-config"
-sudo     = ["/usr/sbin/shutdown", "/usr/sbin/reboot", "/usr/sbin/poweroff"]
+sudo     = ["/usr/sbin/shutdown", "/usr/sbin/reboot", "/usr/sbin/poweroff", "/usr/sbin/ctrlaltdel"]

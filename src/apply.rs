@@ -16,7 +16,7 @@ use crate::declaration::Declaration;
 use crate::inspect::SystemInspector;
 use crate::mutate::{Provisioner, ProvisionError};
 use crate::plan::{self, Action, GroupAction};
-use crate::state::{ManagedAccount, ManagedGroup, SystemState};
+use crate::state::{ManagedAccount, ManagedFileGrant, ManagedGroup, SystemState};
 use crate::trust::{self, TrustMode, TrustOptions};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -66,6 +66,12 @@ pub enum ApplyError {
     /// A non-destructive plan is never blocked by this (nothing to defer).
     #[error("live-session registry unreadable and plan is destructive: {0}")]
     SessionRegistry(String),
+    /// A file-access grant could not be routed to a capable backend
+    /// (capability-gating, fail-closed) or its materialization/revocation
+    /// failed. The gating variant is surfaced BEFORE any snapshot or mutation —
+    /// Census refuses an unenforceable grant rather than applying weaker access.
+    #[error("file access: {0}")]
+    FileAccess(#[from] crate::fileaccess::FileAccessError),
 }
 
 /// A `userdel` that was deferred because the account has a live Tessera session.
@@ -130,6 +136,15 @@ pub struct ApplyInputs<'a> {
     /// Threaded into [`crate::model::resolve`] so a role's `permissions` expand
     /// into concrete primitives before the plan is built.
     pub compile: crate::model::CompileInputs<'a>,
+    /// File-access enforcement backend (production wires
+    /// [`crate::fileaccess::AclBackend::production`]; tests pass a
+    /// [`crate::fileaccess::FakeBackend`]). This is a SEPARATE seam from
+    /// [`Provisioner`]: the provisioner drives shadow-utils (accounts / groups /
+    /// sudoers) while this backend materializes / revokes / snapshots / restores
+    /// file grants. Held as one backend for this slice, but routed through
+    /// [`crate::fileaccess::route_grants`] so capability-gating is exercised and
+    /// adding more backends later is a one-line change.
+    pub file_access: &'a mut dyn crate::fileaccess::FileAccessBackend,
 }
 
 /// Outcome of a successful apply: the new managed registry contents and the log
@@ -196,6 +211,45 @@ pub fn run(
         log.push(format!("warning: {w}"));
     }
 
+    // Resolve the declared groups too (the declaration-driven grants path):
+    // each `[[group]]` joined with the grants every bound role contributes
+    // (%group sudo commands, g:group file grants, added members) + provenance.
+    // This is the AUTHORITY for a group's GRANTS; group EXISTENCE stays with the
+    // membership-driven `diff_groups` below. Group resolve warnings flow into the
+    // log just like account ones, and a failed expansion fails closed here.
+    let (resolved_groups, group_resolve_warnings) =
+        crate::model::resolve_groups(inputs.declaration, &inputs.compile)
+            .map_err(|e| ApplyError::Resolve(e.to_string()))?;
+    for w in &group_resolve_warnings {
+        log.push(format!("warning: {w}"));
+    }
+
+    // 3b. Capability-gating (fail-closed) — BEFORE any snapshot or mutation, in
+    // the same pre-mutation band as trust and anti-lockout. Every target's file
+    // grants are routed against the installed backend(s); a grant whose shape no
+    // backend can enforce (a per-file or pattern grant with only the dir-capable
+    // ACL backend) returns `Unsupported` here and aborts apply before anything is
+    // touched. The open build refuses an unenforceable grant rather than applying
+    // weaker, rewrite-prone access (design "Capability-gating и честный отказ").
+    // The SAME gate runs over each resolved group's `g:group` file grants: a
+    // group grant Census cannot enforce must fail closed in this band exactly as
+    // an account grant does — never materialized weaker.
+    {
+        let backends: [&dyn crate::fileaccess::FileAccessBackend; 1] = [&*inputs.file_access];
+        for target in &targets {
+            if target.file_grants.is_empty() {
+                continue;
+            }
+            crate::fileaccess::route_grants(&target.file_grants, &backends)?;
+        }
+        for group in &resolved_groups {
+            if group.file_grants.is_empty() {
+                continue;
+            }
+            crate::fileaccess::route_grants(&group.file_grants, &backends)?;
+        }
+    }
+
     // 4-5. Diff vs managed state (accounts).
     let managed_now = inputs.state.managed_accounts();
     let managed_groups_now = inputs.state.managed_groups();
@@ -211,6 +265,18 @@ pub fn run(
         &managed_groups_now,
         inputs.inspector,
     )?;
+
+    // 5c. Group GRANT plan (declaration-driven, provenance-aware). This path is
+    // the AUTHORITY for what Census materializes on a group — its `%group`
+    // sudoers, `g:group` ACL, and added members — plus the Adopt/Release/Update
+    // lifecycle. It deliberately does NOT groupadd/groupdel: existence is owned
+    // by `diff_groups` above (its `Create` runs in Phase 1, its provenance-aware
+    // `Delete` in Phase 4). We consume these actions only for the grant phases:
+    // a resolved-path `Create`/`Adopt`/`Update` layers grants on; a `Release`
+    // strips Census's own grants from an adopted group (no `groupdel`); a
+    // resolved-path `Delete` (Created group dropped) drives the grant-teardown
+    // that must precede the entity `groupdel` in Phase 4.
+    let rgroup_actions = plan::diff_resolved_groups(&resolved_groups, &managed_groups_now);
 
     // 5c. Live-reconcile (§12): consult Tessera's live-session registry and DEFER
     // `userdel` for any account with a live session. This runs BEFORE the
@@ -282,15 +348,20 @@ pub fn run(
     }
     crate::lockout::gate(&plan, inputs.lockout)?;
 
-    // Idempotence: empty plan (no account AND no group actions) → zero mutations,
-    // no snapshot, no registry churn (registry still reflects the in-sync set).
+    // Idempotence: empty plan (no account AND no group actions AND no group-grant
+    // actions) → zero mutations, no snapshot, no registry churn (registry still
+    // reflects the in-sync set).
     // NOTE: this branch is now also reachable when the ONLY planned change was a
     // delete that we just deferred. In that case the registry already holds the
     // deferred account (retained below with its prior from_version), so there are
     // no OS mutations — but the registry MUST still record the retention, hence
     // `registry_written` is forced true whenever a deferral happened (idempotent
     // in content: from_version is preserved, but we must not drop ownership).
-    if plan.is_empty() {
+    // `rgroup_actions` is folded into the emptiness test: a declaration-driven
+    // group change (Adopt/Release/Update, or a grant-only diff) can have NO
+    // membership-driven `plan` action behind it (an adopted foreign group is
+    // SKIPped by `diff_groups`), yet it is real work that must snapshot and run.
+    if plan.is_empty() && rgroup_actions.is_empty() {
         log.push("plan is empty — no changes".to_owned());
         return Ok(ApplyReport {
             managed: build_managed_set(
@@ -301,8 +372,10 @@ pub fn run(
             ),
             managed_group_records: build_managed_groups(
                 &required_groups,
+                &resolved_groups,
                 &managed_groups_now,
                 &[],
+                &BTreeMap::new(),
                 inputs.declaration.version,
                 inputs.inspector,
             ),
@@ -322,6 +395,15 @@ pub fn run(
     for path in touched_sudoers_paths(&plan, &inputs.sudoers_dir) {
         provisioner.track_sudoers_backup(path);
     }
+    // The group `%group` fragments (`census-grp-<g>`) touched by the group-grant
+    // phases go into the SAME backup set, so a later-phase failure rolls a group
+    // fragment back together with the account fragments and the auth-DB. A group
+    // is touched when its resolved-path action writes or removes its fragment
+    // (Create/Adopt/Update/Release/Delete). Backing up an absent fragment is a
+    // benign no-op that correctly restores "absent" on rollback.
+    for path in touched_group_sudoers_paths(&rgroup_actions, &inputs.sudoers_dir) {
+        provisioner.track_sudoers_backup(path);
+    }
 
     // 7b. Snapshot before any mutation.
     provisioner
@@ -331,6 +413,34 @@ pub fn run(
             source: e,
             rollback: RollbackOutcome::Restored, // nothing mutated yet
         })?;
+
+    // 7c. Snapshot the file-access state of every path the file-access phase will
+    // touch (grants materialized for created/updated accounts + grants revoked
+    // for changed/deleted accounts), BEFORE mutating it. This is the file-access
+    // analogue of the full-file auth-DB backup (spec R2 / design "Откат"): a later
+    // phase failure rolls the ACLs back from this snapshot just as it rolls back
+    // /etc/passwd. The provisioner snapshot is already taken above, so the backend
+    // restore composes with the auth-DB restore in `phase_failure`.
+    let mut file_access_paths = file_access_touched_paths(&plan, &targets, &managed_now);
+    // Group `g:group` ACL paths the grant phases will touch go into the SAME
+    // file-access snapshot as the account paths, so a later-phase failure rolls a
+    // group ACL back together with the account ACLs (dual-seam restore). Touched =
+    // every resolved group's grant paths (materialized) + every prior recorded
+    // grant path of a released/deleted group (revoked).
+    for p in group_file_access_touched_paths(&rgroup_actions, &resolved_groups, &managed_groups_now) {
+        if !file_access_paths.contains(&p) {
+            file_access_paths.push(p);
+        }
+    }
+    if !file_access_paths.is_empty() {
+        let path_refs: Vec<&Path> = file_access_paths.iter().map(PathBuf::as_path).collect();
+        if let Err(e) = inputs.file_access.snapshot(&path_refs) {
+            // The provisioner snapshot exists but nothing has been mutated yet;
+            // roll it back so we leave no partial state, and surface the error.
+            let _ = provisioner.restore();
+            return Err(ApplyError::FileAccess(e));
+        }
+    }
 
     // 8. Apply phases in order (design Р4):
     //   (1) create missing groups   — BEFORE accounts (membership needs them)
@@ -354,7 +464,7 @@ pub fn run(
                     log.push(format!("create-group: {name} (gid {pin})"));
                 }
                 Err(source) => {
-                    return Err(phase_failure(provisioner, "create-group", source));
+                    return Err(phase_failure(provisioner, inputs.file_access, "create-group", source));
                 }
             }
         }
@@ -390,14 +500,174 @@ pub fn run(
                 log.push(format!("{phase}: {}", action_label(action)));
             }
             Err(source) => {
-                return Err(phase_failure(provisioner, phase, source));
+                return Err(phase_failure(provisioner, inputs.file_access, phase, source));
             }
         }
     }
 
-    // Phase 4: delete orphan managed groups (after account deletes). The
-    // deleted groups are dropped from the registry by `build_managed_groups`
-    // (they are no longer in the required set), so nothing to record here.
+    // Phase 3b: file-access — materialize grants for created/updated accounts and
+    // revoke grants that disappeared (a grant dropped from an updated account, or
+    // every grant of a deleted account). Runs AFTER the account create/update
+    // (and its sudoers), before limits / group deletes — the account exists, so
+    // its ACL entry is well-defined. Materialize is idempotent (setfacl -m of the
+    // same entry is a no-op by content), so this phase adds no spurious mutation
+    // count: it rides along with the account changes that already made the plan
+    // non-empty, exactly as the sudoers write rides along with create/update. On
+    // error BOTH seams roll back (file-access ACLs + the auth-DB/sudoers backup).
+    for action in &plan.actions {
+        let acct = match action {
+            Action::Create(a) => a,
+            Action::Update { account, .. } => account,
+            Action::Delete { .. } => continue, // handled by revoke-deleted below
+        };
+        // Revoke grants this account no longer carries (set difference vs the
+        // recorded managed grants), so a dropped grant's ACL does not leak.
+        for removed in removed_grants(&acct.name, &acct.file_grants, &managed_now) {
+            if let Err(e) = revoke_one(inputs.file_access, &acct.name, &removed) {
+                return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+            }
+        }
+        if acct.file_grants.is_empty() {
+            continue;
+        }
+        let principal = crate::fileaccess::Principal::User(acct.name.clone());
+        if let Err(e) = inputs.file_access.materialize(&principal, &acct.file_grants) {
+            return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+        }
+        log.push(format!(
+            "file-access: materialized {} grant(s) for {}",
+            acct.file_grants.len(),
+            acct.name
+        ));
+    }
+    // Revoke every grant of a deleted account (the account is gone; its ACL
+    // entries must go too).
+    for action in &plan.actions {
+        if let Action::Delete { name } = action {
+            for removed in removed_grants(name, &[], &managed_now) {
+                if let Err(e) = revoke_one(inputs.file_access, name, &removed) {
+                    return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                }
+            }
+        }
+    }
+
+    // Phase 3c: group GRANTS (declaration-driven). The group EXISTS by now — a
+    // membership-driven `Create` ran in Phase 1, an adopted group pre-existed, an
+    // updated/in-sync group was already there — so its `%group` sudoers, `g:group`
+    // ACL, and membership are all well-defined to mutate. Runs AFTER account
+    // grants, BEFORE the entity group-delete in Phase 4 (so a Created group
+    // dropped from the declaration loses its grants here, then its empty shell is
+    // groupdel'd next). Adopt baselines captured here flow into the registry via
+    // `build_managed_groups`. Both seams roll back on any error.
+    let mut adopt_baselines: BTreeMap<String, crate::state::GroupBaseline> = BTreeMap::new();
+    for ga in &rgroup_actions {
+        match ga {
+            GroupAction::Create { name, .. }
+            | GroupAction::Adopt { name }
+            | GroupAction::Update { name, .. } => {
+                let group = resolved_group_by_name(&resolved_groups, name)
+                    .expect("resolved-path action names a resolved group");
+                // Adopt: the group comes under management for the first time —
+                // snapshot its live baseline (GID + pre-existing members) BEFORE
+                // layering Census's grants, so a later release returns it to
+                // exactly this state without ever deleting the group.
+                if matches!(ga, GroupAction::Adopt { .. })
+                    && !managed_groups_now.contains_key(name)
+                {
+                    let gid = inputs.inspector.group(name).map(|f| f.gid).unwrap_or(0);
+                    let members = inputs.inspector.group_members(name);
+                    adopt_baselines.insert(
+                        name.clone(),
+                        crate::state::GroupBaseline { gid, members },
+                    );
+                    log.push(format!("adopt-group: {name} (baseline gid {gid})"));
+                }
+
+                // (a) %group sudoers fragment (write when sudo commands present,
+                // else ensure absent).
+                if let Err(source) = provisioner.apply_group_sudoers(group) {
+                    return Err(phase_failure(provisioner, inputs.file_access, "group-sudoers", source));
+                }
+                // (b) g:group ACL — materialize the group's file grants.
+                if !group.file_grants.is_empty() {
+                    let principal = crate::fileaccess::Principal::Group(name.clone());
+                    if let Err(e) = inputs.file_access.materialize(&principal, &group.file_grants) {
+                        return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                    }
+                    // A revoked group grant (recorded but no longer targeted) must
+                    // drop its ACL entry too — same set-difference the account path
+                    // does, so a removed group grant cannot leak.
+                    for removed in removed_group_grants(name, &group.file_grants, &managed_groups_now) {
+                        if let Err(e) = revoke_one_group(inputs.file_access, name, &removed) {
+                            return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                        }
+                    }
+                    log.push(format!(
+                        "file-access: materialized {} group grant(s) for {}",
+                        group.file_grants.len(),
+                        name
+                    ));
+                } else {
+                    // No target grants: revoke every grant Census previously recorded.
+                    for removed in removed_group_grants(name, &[], &managed_groups_now) {
+                        if let Err(e) = revoke_one_group(inputs.file_access, name, &removed) {
+                            return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                        }
+                    }
+                }
+                // (c) Members: reconcile toward `group.members`. Add targets not
+                // already in our `members_added`; remove our own added members no
+                // longer targeted. Never touch foreign/baseline members.
+                let current = members_added_of(name, &managed_groups_now);
+                for m in &group.members {
+                    if !current.contains(m) {
+                        if let Err(source) = provisioner.add_group_member(name, m) {
+                            return Err(phase_failure(provisioner, inputs.file_access, "group-member", source));
+                        }
+                        mutations += 1;
+                    }
+                }
+                for m in &current {
+                    if !group.members.contains(m) {
+                        if let Err(source) = provisioner.remove_group_member(name, m) {
+                            return Err(phase_failure(provisioner, inputs.file_access, "group-member", source));
+                        }
+                        mutations += 1;
+                    }
+                }
+                mutations += 1; // the grant application itself (sudoers/ACL)
+                log.push(format!("group-grants: {name}"));
+            }
+            GroupAction::Release { name } | GroupAction::Delete { name } => {
+                // Strip Census's own grants from the group. For Release the group
+                // is Adopted (left alive, returned to baseline); for Delete the
+                // group is Created and its empty shell is groupdel'd in Phase 4
+                // AFTER this teardown. Both do the identical grant cleanup here.
+                if let Err(source) = provisioner.remove_group_sudoers_for(name) {
+                    return Err(phase_failure(provisioner, inputs.file_access, "group-sudoers", source));
+                }
+                for removed in removed_group_grants(name, &[], &managed_groups_now) {
+                    if let Err(e) = revoke_one_group(inputs.file_access, name, &removed) {
+                        return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                    }
+                }
+                for m in &members_added_of(name, &managed_groups_now) {
+                    if let Err(source) = provisioner.remove_group_member(name, m) {
+                        return Err(phase_failure(provisioner, inputs.file_access, "group-member", source));
+                    }
+                    mutations += 1;
+                }
+                let verb = if matches!(ga, GroupAction::Release { .. }) { "release" } else { "teardown" };
+                log.push(format!("group-{verb}: {name}"));
+            }
+        }
+    }
+
+    // Phase 4: delete orphan managed groups (after account deletes and after the
+    // group-grant teardown above stripped any %group/ACL/members). The deleted
+    // groups are dropped from the registry by `build_managed_groups` (no longer
+    // required), so nothing to record here.
     for ga in &plan.group_actions {
         if let GroupAction::Delete { name } = ga {
             match provisioner.delete_group(name) {
@@ -406,7 +676,7 @@ pub fn run(
                     log.push(format!("delete-group: {name}"));
                 }
                 Err(source) => {
-                    return Err(phase_failure(provisioner, "delete-group", source));
+                    return Err(phase_failure(provisioner, inputs.file_access, "delete-group", source));
                 }
             }
         }
@@ -424,8 +694,10 @@ pub fn run(
         ),
         managed_group_records: build_managed_groups(
             &required_groups,
+            &resolved_groups,
             &managed_groups_now,
             &created_groups,
+            &adopt_baselines,
             inputs.declaration.version,
             inputs.inspector,
         ),
@@ -511,18 +783,270 @@ fn group_owned_by(
         .is_some_and(|m| m.groups.iter().any(|g| g == group))
 }
 
-/// Run the provisioner's restore after a phase failure and package the
-/// resulting [`ApplyError::Phase`] (shared by every phase arm).
+/// Run the rollback after a phase failure and package the resulting
+/// [`ApplyError::Phase`] (shared by every phase arm).
+///
+/// BOTH seams are restored: the provisioner rolls back the auth-DB + sudoers
+/// full-file backup, and the file-access backend rolls back the ACLs it
+/// snapshotted. They are independent — a failure in either phase must undo the
+/// other's already-applied mutations — so the outcome reports success only if
+/// both restores succeed; otherwise the snapshots are retained for manual
+/// recovery.
 fn phase_failure(
     provisioner: &mut dyn Provisioner,
+    file_access: &mut dyn crate::fileaccess::FileAccessBackend,
     phase: &'static str,
     source: ProvisionError,
 ) -> ApplyError {
-    let rollback = match provisioner.restore() {
-        Ok(()) => RollbackOutcome::Restored,
-        Err(e) => RollbackOutcome::Failed(e.to_string()),
+    let prov = provisioner.restore();
+    let acl = file_access.restore();
+    let rollback = match (prov, acl) {
+        (Ok(()), Ok(())) => RollbackOutcome::Restored,
+        (Err(e), _) => RollbackOutcome::Failed(e.to_string()),
+        (_, Err(e)) => RollbackOutcome::Failed(format!("file-access restore: {e}")),
     };
     ApplyError::Phase { phase, source, rollback }
+}
+
+/// Roll back BOTH seams after a file-access phase failure (the symmetric case of
+/// [`phase_failure`] when the failing operation is a `materialize`/`revoke`
+/// rather than a shadow-utils command). The provisioner restores the auth-DB +
+/// sudoers backup; the backend restores its own ACL snapshot. The returned error
+/// carries the originating [`crate::fileaccess::FileAccessError`].
+fn phase_failure_file_access(
+    provisioner: &mut dyn Provisioner,
+    file_access: &mut dyn crate::fileaccess::FileAccessBackend,
+    source: crate::fileaccess::FileAccessError,
+) -> ApplyError {
+    // Undo the auth-DB/sudoers mutations of earlier phases and any ACL entries
+    // this phase managed to apply before failing. Best-effort: the snapshots are
+    // retained on a restore failure, and the originating error is what surfaces.
+    let _ = provisioner.restore();
+    let _ = file_access.restore();
+    ApplyError::FileAccess(source)
+}
+
+/// Re-hydrate a recorded [`ManagedFileGrant`] into a [`crate::catalog::ResolvedFileGrant`]
+/// for revocation. Provenance is irrelevant to revoke (the backend keys off the
+/// path), so it is left empty; the shape is recomputed from the path + recursive
+/// flag so the backend routes/handles it consistently with materialize.
+fn resolved_from_managed(g: &ManagedFileGrant) -> crate::catalog::ResolvedFileGrant {
+    crate::catalog::ResolvedFileGrant {
+        path: g.path.clone(),
+        access: g.access,
+        recursive: g.recursive,
+        shape: crate::catalog::FileGrant {
+            path: g.path.clone(),
+            access: g.access,
+            recursive: g.recursive,
+        }
+        .shape(),
+        sources: Vec::new(),
+    }
+}
+
+/// The recorded managed grants for `name` whose path is NOT in `keep` — the set
+/// to revoke. `keep` is the account's target grant set (empty for a deleted
+/// account, so every recorded grant is revoked).
+fn removed_grants(
+    name: &str,
+    keep: &[crate::catalog::ResolvedFileGrant],
+    managed_now: &BTreeMap<String, ManagedAccount>,
+) -> Vec<ManagedFileGrant> {
+    let Some(record) = managed_now.get(name) else {
+        return Vec::new();
+    };
+    record
+        .file_grants
+        .iter()
+        .filter(|m| !keep.iter().any(|k| k.path == m.path))
+        .cloned()
+        .collect()
+}
+
+/// Revoke one recorded grant via the backend (re-hydrating it to the resolved
+/// form the SPI expects).
+fn revoke_one(
+    file_access: &mut dyn crate::fileaccess::FileAccessBackend,
+    account: &str,
+    grant: &ManagedFileGrant,
+) -> Result<(), crate::fileaccess::FileAccessError> {
+    let resolved = resolved_from_managed(grant);
+    // File-access on a role-account is the `u:` principal; group materialization
+    // (the `g:` principal) is wired in a later slice. Behavior for accounts is
+    // unchanged.
+    let principal = crate::fileaccess::Principal::User(account.to_owned());
+    file_access.revoke(&principal, &resolved)
+}
+
+/// Every filesystem path the file-access phase will touch — grant paths
+/// materialized for created/updated accounts plus grant paths revoked for
+/// changed/deleted accounts — so they can be snapshotted before mutation (spec
+/// R2 parity with the full-file auth-DB backup). Deduplicated, order-stable.
+fn file_access_touched_paths(
+    plan: &plan::Plan,
+    targets: &[crate::model::ResolvedAccount],
+    managed_now: &BTreeMap<String, ManagedAccount>,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let push = |p: &str, paths: &mut Vec<PathBuf>| {
+        let pb = PathBuf::from(p);
+        if !paths.contains(&pb) {
+            paths.push(pb);
+        }
+    };
+    // Materialized paths: every target's grants (a target is created or updated).
+    for t in targets {
+        // Only accounts that are actually in the plan (created/updated) mutate;
+        // an in-sync account is not re-materialized. But an in-sync account never
+        // reaches a non-empty-plan mutation either way, so snapshotting its paths
+        // is harmless (a no-op snapshot restores the same state). Keep it simple
+        // and snapshot every target's grant paths plus every removed path.
+        for g in &t.file_grants {
+            push(&g.path, &mut paths);
+        }
+    }
+    // Revoked paths: removed grants of updated accounts + all grants of deletes.
+    for action in &plan.actions {
+        match action {
+            Action::Create(a) | Action::Update { account: a, .. } => {
+                for r in removed_grants(&a.name, &a.file_grants, managed_now) {
+                    push(&r.path, &mut paths);
+                }
+            }
+            Action::Delete { name } => {
+                for r in removed_grants(name, &[], managed_now) {
+                    push(&r.path, &mut paths);
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// The `census-grp-<group>` sudoers fragment paths the group-grant phases will
+/// touch, for the pre-snapshot backup set (spec R2 parity with the account
+/// fragments). A group is touched by every resolved-path action — Create/Adopt/
+/// Update write or clear its `%group` fragment; Release/Delete remove it. Backing
+/// up an absent fragment is a no-op that restores "absent" on rollback.
+/// Deduplicated, order-stable.
+fn touched_group_sudoers_paths(
+    rgroup_actions: &[GroupAction],
+    sudoers_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for ga in rgroup_actions {
+        let name = match ga {
+            GroupAction::Create { name, .. }
+            | GroupAction::Adopt { name }
+            | GroupAction::Update { name, .. }
+            | GroupAction::Release { name }
+            | GroupAction::Delete { name } => name,
+        };
+        let p = crate::sudoers::sudoers_group_path(sudoers_dir, name);
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
+/// Every filesystem path the group-grant file-access phase will touch — the
+/// `g:group` grant paths materialized for a resolved group plus the prior
+/// recorded grant paths revoked for a released/deleted/updated group — so they
+/// can be snapshotted before mutation (spec R2 parity with the account paths).
+/// Deduplicated, order-stable.
+fn group_file_access_touched_paths(
+    rgroup_actions: &[GroupAction],
+    resolved_groups: &[crate::model::ResolvedGroup],
+    managed_groups_now: &BTreeMap<String, ManagedGroup>,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let push = |p: &str, paths: &mut Vec<PathBuf>| {
+        let pb = PathBuf::from(p);
+        if !paths.contains(&pb) {
+            paths.push(pb);
+        }
+    };
+    for ga in rgroup_actions {
+        match ga {
+            GroupAction::Create { name, .. }
+            | GroupAction::Adopt { name }
+            | GroupAction::Update { name, .. } => {
+                if let Some(g) = resolved_group_by_name(resolved_groups, name) {
+                    for grant in &g.file_grants {
+                        push(&grant.path, &mut paths);
+                    }
+                }
+                // Revoked group grants (recorded but no longer targeted).
+                let keep = resolved_group_by_name(resolved_groups, name)
+                    .map(|g| g.file_grants.as_slice())
+                    .unwrap_or(&[]);
+                for r in removed_group_grants(name, keep, managed_groups_now) {
+                    push(&r.path, &mut paths);
+                }
+            }
+            GroupAction::Release { name } | GroupAction::Delete { name } => {
+                for r in removed_group_grants(name, &[], managed_groups_now) {
+                    push(&r.path, &mut paths);
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Find a resolved group by name (the resolved-path actions carry only the name).
+fn resolved_group_by_name<'a>(
+    groups: &'a [crate::model::ResolvedGroup],
+    name: &str,
+) -> Option<&'a crate::model::ResolvedGroup> {
+    groups.iter().find(|g| g.name == name)
+}
+
+/// The recorded managed GROUP grants for `name` whose path is NOT in `keep` — the
+/// set to revoke. `keep` is the group's target grant set (empty for a released/
+/// deleted group, so every recorded grant is revoked). Mirrors `removed_grants`
+/// for the account path.
+fn removed_group_grants(
+    name: &str,
+    keep: &[crate::catalog::ResolvedFileGrant],
+    managed_groups_now: &BTreeMap<String, ManagedGroup>,
+) -> Vec<ManagedFileGrant> {
+    let Some(record) = managed_groups_now.get(name) else {
+        return Vec::new();
+    };
+    record
+        .file_grants
+        .iter()
+        .filter(|m| !keep.iter().any(|k| k.path == m.path))
+        .cloned()
+        .collect()
+}
+
+/// Revoke one recorded GROUP grant via the backend (the `g:` principal). Mirrors
+/// `revoke_one` for the account path, only the principal letter differs.
+fn revoke_one_group(
+    file_access: &mut dyn crate::fileaccess::FileAccessBackend,
+    group: &str,
+    grant: &ManagedFileGrant,
+) -> Result<(), crate::fileaccess::FileAccessError> {
+    let resolved = resolved_from_managed(grant);
+    let principal = crate::fileaccess::Principal::Group(group.to_owned());
+    file_access.revoke(&principal, &resolved)
+}
+
+/// The members Census itself recorded as added to `name` (its prior
+/// `members_added`), or empty when the group has no prior record. The reconcile
+/// baseline for the membership phase: only these are ever removed by Census.
+fn members_added_of(
+    name: &str,
+    managed_groups_now: &BTreeMap<String, ManagedGroup>,
+) -> Vec<String> {
+    managed_groups_now
+        .get(name)
+        .map(|g| g.members_added.clone())
+        .unwrap_or_default()
 }
 
 /// Compute the set of `census-<role>` sudoers fragment paths the plan will
@@ -593,7 +1117,11 @@ fn build_managed_set(
                     // The concrete sudo command set is part of the account's
                     // recorded privilege; an unchanged set (order-insensitive)
                     // preserves from_version, a changed one is a real update.
-                    && groups_equal(&existing.sudo_commands, &t.sudo_commands) =>
+                    && groups_equal(&existing.sudo_commands, &t.sudo_commands)
+                    // The file-grant set is likewise part of the recorded
+                    // privilege: an unchanged set (set-equal) preserves
+                    // from_version, a changed one is a real update.
+                    && file_grants_equal(&existing.file_grants, &t.file_grants) =>
                 {
                     existing.from_version
                 }
@@ -606,6 +1134,12 @@ fn build_managed_set(
                 groups: t.groups.clone(),
                 sudo_role: t.sudo_role.clone(),
                 sudo_commands: t.sudo_commands.clone(),
+                file_grants: t
+                    .file_grants
+                    .iter()
+                    .map(ManagedFileGrant::from_resolved)
+                    .collect(),
+                provenance: crate::model::Provenance::Created,
                 from_version,
             }
         })
@@ -633,25 +1167,28 @@ fn build_managed_set(
 /// `created` is the list of (name, pin) Census created this run.
 fn build_managed_groups(
     required: &BTreeMap<String, Option<u32>>,
+    resolved_groups: &[crate::model::ResolvedGroup],
     prior: &BTreeMap<String, ManagedGroup>,
     created: &[(String, Option<u32>)],
+    adopt_baselines: &BTreeMap<String, crate::state::GroupBaseline>,
     version: u32,
     inspector: &dyn SystemInspector,
 ) -> Vec<ManagedGroup> {
-    let mut out = Vec::new();
+    let mut by_name: BTreeMap<String, ManagedGroup> = BTreeMap::new();
 
-    // Carry forward prior-registry groups that are still required (owned, kept).
+    // Membership-driven records (the plain groups accounts join, like `netdev`):
+    // carry forward prior-registry groups still required, then add newly-created
+    // ones. A declared `[[group]]` is overlaid with its full grant record below,
+    // so this pass only finalizes the grant-less membership groups.
     for (name, mg) in prior {
         if required.contains_key(name) {
-            out.push(mg.clone());
+            by_name.insert(name.clone(), mg.clone());
         }
-        // else: orphan — was deleted this run, drop from the registry.
+        // else: orphan — deleted (Created) or released (Adopted) this run; drop.
     }
-
-    // Add newly-created groups (not already carried forward).
     for (name, pin) in created {
-        if prior.contains_key(name) {
-            continue; // already carried forward above
+        if by_name.contains_key(name) {
+            continue;
         }
         // Prefer the pin; otherwise read the OS-assigned GID back from the live
         // system. If the read-back fails (should not happen right after a
@@ -660,13 +1197,85 @@ fn build_managed_groups(
         let gid = pin
             .or_else(|| inspector.group(name).map(|f| f.gid))
             .unwrap_or(0);
-        out.push(ManagedGroup {
-            name: name.clone(),
-            gid,
-            from_version: version,
-        });
+        by_name.insert(
+            name.clone(),
+            ManagedGroup {
+                name: name.clone(),
+                gid,
+                provenance: crate::model::Provenance::Created,
+                members_added: Vec::new(),
+                sudo_commands: Vec::new(),
+                file_grants: Vec::new(),
+                adopt_baseline: None,
+                from_version: version,
+            },
+        );
     }
 
+    // Declaration-driven overlay: every currently-declared `[[group]]` carries
+    // the grants Census materialized (sudo commands, `g:group` file grants) and
+    // the members it added. This is the authority for those fields, so it
+    // replaces any membership-only record built above for the same name. A group
+    // that was Released/Deleted is absent from `resolved_groups` (no longer
+    // declared) and therefore never recorded — its prior record was already
+    // dropped above.
+    for rg in resolved_groups {
+        let prior_record = prior.get(&rg.name);
+        // GID: a Created pin wins; otherwise carry the prior recorded GID; else
+        // read the live GID back (adopted groups observe, never assign). Fall
+        // back to 0 only if nothing is known (doctor flags divergence).
+        let gid = rg
+            .gid
+            .or_else(|| prior_record.map(|p| p.gid))
+            .or_else(|| inspector.group(&rg.name).map(|f| f.gid))
+            .unwrap_or(0);
+
+        // Adopt baseline: the one captured this run wins (first adoption);
+        // otherwise carry the prior record's baseline forward across applies.
+        let adopt_baseline = match rg.provenance {
+            crate::model::Provenance::Created => None,
+            crate::model::Provenance::Adopted => adopt_baselines
+                .get(&rg.name)
+                .cloned()
+                .or_else(|| prior_record.and_then(|p| p.adopt_baseline.clone())),
+        };
+
+        let file_grants: Vec<ManagedFileGrant> =
+            rg.file_grants.iter().map(ManagedFileGrant::from_resolved).collect();
+
+        // Preserve from_version when the recorded grants/members/provenance are
+        // unchanged (mirrors the account record); a real change bumps to the
+        // declaration version.
+        let from_version = match prior_record {
+            Some(p)
+                if p.provenance == rg.provenance
+                    && groups_equal(&p.sudo_commands, &rg.sudo_commands)
+                    && groups_equal(&p.members_added, &rg.members)
+                    && crate::plan::file_grants_set_equal(&p.file_grants, &rg.file_grants) =>
+            {
+                p.from_version
+            }
+            _ => version,
+        };
+
+        by_name.insert(
+            rg.name.clone(),
+            ManagedGroup {
+                name: rg.name.clone(),
+                gid,
+                provenance: rg.provenance,
+                // After the membership reconcile, Census-added members ARE the
+                // target members (we add the missing, remove our own extras).
+                members_added: rg.members.clone(),
+                sudo_commands: rg.sudo_commands.clone(),
+                file_grants,
+                adopt_baseline,
+                from_version,
+            },
+        );
+    }
+
+    let mut out: Vec<ManagedGroup> = by_name.into_values().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
@@ -677,6 +1286,17 @@ fn groups_equal(a: &[String], b: &[String]) -> bool {
     a.sort();
     b.sort();
     a == b
+}
+
+/// Whether a recorded managed file-grant set equals a resolved target set,
+/// compared set-equal (order-insensitive) by (path, access, recursive) — the
+/// same comparison the plan diff uses. Lets `build_managed_set` preserve
+/// `from_version` when only the order of grants differs.
+fn file_grants_equal(
+    managed: &[ManagedFileGrant],
+    target: &[crate::catalog::ResolvedFileGrant],
+) -> bool {
+    crate::plan::file_grants_set_equal(managed, target)
 }
 
 /// Serialize a managed set (accounts + groups) to TOML and write it atomically
@@ -712,11 +1332,18 @@ struct RegistryDoc {
 mod tests {
     use super::*;
     use crate::catalog::{FakeCatalog, OsTarget, ResolveCtx};
+    use crate::fileaccess::{acl_capabilities, FakeBackend, FileAccessBackend};
     use crate::inspect::{FakeInspector, GroupFacts};
     use crate::lockout::LockoutContext;
     use crate::model::{CompileInputs, ResolvedAccount};
     use crate::state::{FakeState, ManagedGroup};
     use std::sync::OnceLock;
+
+    /// A fresh dir-only (ACL-equivalent) backend for tests whose roles carry no
+    /// per-file/pattern grants — the common case.
+    fn dir_backend() -> FakeBackend {
+        FakeBackend::new("acl", acl_capabilities())
+    }
 
     /// An empty permission catalog + a fixed OS target for tests whose roles do
     /// not use `permissions` (the legacy raw-only path). Backed by statics so
@@ -783,6 +1410,25 @@ mod tests {
         fn remove_sudoers(&mut self, name: &str) -> Result<(), ProvisionError> {
             self.maybe_fail("remove_sudoers", name)
         }
+        fn apply_group_sudoers(
+            &mut self,
+            group: &crate::model::ResolvedGroup,
+        ) -> Result<(), ProvisionError> {
+            self.maybe_fail("apply_group_sudoers", &group.name)
+        }
+        fn remove_group_sudoers_for(&mut self, group: &str) -> Result<(), ProvisionError> {
+            self.maybe_fail("remove_group_sudoers", group)
+        }
+        fn add_group_member(&mut self, group: &str, member: &str) -> Result<(), ProvisionError> {
+            self.maybe_fail("add_member", &format!("{group}:{member}"))
+        }
+        fn remove_group_member(
+            &mut self,
+            group: &str,
+            member: &str,
+        ) -> Result<(), ProvisionError> {
+            self.maybe_fail("del_member", &format!("{group}:{member}"))
+        }
         fn track_sudoers_backup(&mut self, path: std::path::PathBuf) {
             self.calls.push(format!("track_backup:{}", path.display()));
             self.tracked_backups.push(path);
@@ -832,6 +1478,8 @@ mod tests {
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
             sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            provenance: crate::model::Provenance::Created,
             from_version: v,
         }
     }
@@ -861,6 +1509,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -896,6 +1545,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -928,6 +1578,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -961,6 +1612,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -997,6 +1649,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -1040,6 +1693,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -1088,6 +1742,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -1125,6 +1780,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -1158,6 +1814,11 @@ mod tests {
         let groups = vec![ManagedGroup {
             name: "atm-operators".to_owned(),
             gid: 8010,
+            provenance: crate::model::Provenance::Created,
+            members_added: Vec::new(),
+            sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            adopt_baseline: None,
             from_version: 5,
         }];
         write_registry(&path, &set, &groups).unwrap();
@@ -1232,6 +1893,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -1261,6 +1923,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -1292,6 +1955,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -1326,6 +1990,7 @@ mod tests {
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
                 compile: empty_compile(),
+                file_access: Box::leak(Box::new(dir_backend())),
             },
             &mut p,
         )
@@ -1380,11 +2045,25 @@ mod tests {
             session_source: sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             compile: empty_compile(),
+            // The group/reconcile tests do not exercise file grants; a leaked
+            // fresh dir backend keeps these call sites unchanged (a tiny per-test
+            // leak in a test binary is harmless) while satisfying the `&'a mut`
+            // field. Tests that assert on backend calls build their own inline.
+            file_access: Box::leak(Box::new(dir_backend())),
         }
     }
 
     fn managed_group(name: &str, gid: u32, v: u32) -> ManagedGroup {
-        ManagedGroup { name: name.to_owned(), gid, from_version: v }
+        ManagedGroup {
+            name: name.to_owned(),
+            gid,
+            provenance: crate::model::Provenance::Created,
+            members_added: Vec::new(),
+            sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            adopt_baseline: None,
+            from_version: v,
+        }
     }
 
     fn fake_state_with_groups(
@@ -1532,6 +2211,7 @@ mod tests {
             session_source: sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             compile: empty_compile(),
+            file_access: Box::leak(Box::new(dir_backend())),
         }
     }
 
@@ -1696,6 +2376,7 @@ mod tests {
             session_source: &sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
             compile: empty_compile(),
+            file_access: Box::leak(Box::new(dir_backend())),
         };
         let report = run(inputs, &mut p).unwrap();
         assert_eq!(report.deferred_deletes.len(), 1, "delete deferred before the gate");
@@ -1791,5 +2472,592 @@ mod tests {
         assert!(p.calls.iter().any(|c| c == "delete_group:gb"), "gb deleted");
         assert!(report.managed_group_records.iter().any(|g| g.name == "ga"), "ga retained in registry");
         assert!(!report.managed_group_records.iter().any(|g| g.name == "gb"), "gb dropped from registry");
+    }
+
+    // ---- file-access phase ----
+
+    use crate::catalog::{Access, FileGrant, ListOverride, PermissionDef, Shape};
+    use crate::fileaccess::FakeCall;
+
+    /// A catalog (leaked, so the borrowed `CompileInputs` is `'static`) with one
+    /// permission `fs-edit` carrying a single `[[file]]` grant of the given path/
+    /// access/recursive, on the `linux` base layer.
+    fn compile_with_file_perm(path: &str, access: Access, recursive: bool) -> CompileInputs<'static> {
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                id: "fs-edit".to_owned(),
+                risk: None,
+                category: None,
+                groups: ListOverride::default(),
+                sudo: ListOverride::default(),
+                limits: None,
+                replace: false,
+                includes: Vec::new(),
+                include_categories: Vec::new(),
+                files: vec![FileGrant {
+                    path: path.to_owned(),
+                    access,
+                    recursive,
+                }],
+            },
+        );
+        let os = OsTarget::new("linux", "debian", Some("12".to_owned())).unwrap();
+        CompileInputs {
+            catalog: Box::leak(Box::new(cat)),
+            os: Box::leak(Box::new(os)),
+            ctx: Box::leak(Box::new(ResolveCtx::default())),
+        }
+    }
+
+    /// A `--trust-fs` declaration whose role references the `fs-edit` permission
+    /// (so resolve attaches its file grant). Returns (tempdir, declaration).
+    fn decl_with_file_perm(role: &str, uid: u32) -> (tempfile::TempDir, Declaration) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{role}.toml")),
+            format!("role = \"{role}\"\nversion = 1\nos = \"linux\"\nname = \"X\"\nlevel = 0\n[payload]\npermissions = [\"fs-edit\"]\n"),
+        )
+        .unwrap();
+        let store = tmp.path().display().to_string();
+        let text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+        );
+        let d = Declaration::parse(&text).unwrap();
+        (tmp, d)
+    }
+
+    /// Build trust-fs ApplyInputs with a caller-supplied compile + file backend
+    /// (so the test can inspect the backend's recorded calls afterward).
+    fn fa_inputs<'a>(
+        d: &'a Declaration,
+        st: &'a FakeState,
+        insp: &'a FakeInspector,
+        sessions: &'a dyn SessionSource,
+        compile: CompileInputs<'a>,
+        file_access: &'a mut dyn FileAccessBackend,
+    ) -> ApplyInputs<'a> {
+        ApplyInputs {
+            declaration: d,
+            declaration_bytes: b"",
+            state: st,
+            inspector: insp,
+            trust: TrustOptions { trust_fs: true, ..Default::default() },
+            lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            session_source: sessions,
+            sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+            compile,
+            file_access,
+        }
+    }
+
+    #[test]
+    fn dir_grant_materializes_after_snapshot() {
+        // A created account carries a recursive dir grant → the backend snapshots
+        // the grant path BEFORE materializing it, and materialize receives the
+        // grant for the account.
+        let (_t, d) = decl_with_file_perm("oper", 9010);
+        let st = FakeState::default();
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
+        run(fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+
+        // snapshot recorded with the grant path …
+        let snap_idx = fa
+            .calls
+            .iter()
+            .position(|c| matches!(c, FakeCall::Snapshot { paths } if paths == &vec!["/etc/ssh".to_owned()]))
+            .expect("snapshot of the grant path");
+        // … and materialize recorded with the account + path, AFTER the snapshot.
+        let mat_idx = fa
+            .calls
+            .iter()
+            .position(|c| matches!(c, FakeCall::Materialize { principal, paths }
+                if principal == &crate::fileaccess::Principal::User("oper".to_owned())
+                    && paths == &vec!["/etc/ssh".to_owned()]))
+            .expect("materialize of the grant");
+        assert!(snap_idx < mat_idx, "snapshot must precede materialize: {:?}", fa.calls);
+    }
+
+    #[test]
+    fn removed_grant_is_revoked() {
+        // The registry records a grant the target no longer carries (the role's
+        // permission was changed to grant a DIFFERENT path) → the old path is
+        // revoked, the new one materialized.
+        let (_t, d) = decl_with_file_perm("oper", 9010);
+        let mut prior = managed("oper", 9010, &[], 5);
+        prior.file_grants = vec![crate::state::ManagedFileGrant {
+            path: "/etc/old".to_owned(),
+            access: Access::Rw,
+            recursive: true,
+        }];
+        let st = fake_state(vec![prior]);
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
+        run(fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+
+        assert!(
+            fa.calls.iter().any(|c| matches!(c, FakeCall::Revoke { principal, path }
+                if principal == &crate::fileaccess::Principal::User("oper".to_owned())
+                    && path == "/etc/old")),
+            "the dropped grant must be revoked: {:?}",
+            fa.calls
+        );
+        assert!(
+            fa.calls.iter().any(|c| matches!(c, FakeCall::Materialize { paths, .. }
+                if paths == &vec!["/etc/ssh".to_owned()])),
+            "the new grant must be materialized: {:?}",
+            fa.calls
+        );
+    }
+
+    #[test]
+    fn deleted_account_grants_are_revoked() {
+        // The declaration drops `oper`; the registry recorded a grant for it →
+        // the grant is revoked (no live session, so the delete runs).
+        let (_t, d) = empty_decl();
+        let mut prior = managed("oper", 9010, &[], 4);
+        prior.file_grants = vec![crate::state::ManagedFileGrant {
+            path: "/etc/ssh".to_owned(),
+            access: Access::Rw,
+            recursive: true,
+        }];
+        let st = fake_state(vec![prior]);
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        run(
+            fa_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa),
+            &mut p,
+        )
+        .unwrap();
+        assert!(
+            fa.calls.iter().any(|c| matches!(c, FakeCall::Revoke { principal, path }
+                if principal == &crate::fileaccess::Principal::User("oper".to_owned())
+                    && path == "/etc/ssh")),
+            "the deleted account's grant must be revoked: {:?}",
+            fa.calls
+        );
+    }
+
+    #[test]
+    fn file_shape_grant_without_capable_backend_fails_closed_before_mutation() {
+        // A per-file grant (recursive=false, no glob → Shape::File) with only the
+        // dir-capable ACL backend → gating returns FileAccess BEFORE any snapshot
+        // or provisioner mutation.
+        let (_t, d) = decl_with_file_perm("oper", 9010);
+        let st = FakeState::default();
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend(); // dir-only capability
+        let mut p = FakeProvisioner::default();
+        let compile = compile_with_file_perm("/etc/ssh/sshd_config", Access::Rw, false);
+        let err = run(fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::FileAccess(crate::fileaccess::FileAccessError::Unsupported { ref shape, .. }) if *shape == Shape::File),
+            "per-file grant without a capable backend must fail closed: {err:?}"
+        );
+        // No provisioner mutation and no snapshot of either seam.
+        assert!(!p.snapshotted, "gating must precede the provisioner snapshot");
+        assert!(p.calls.is_empty(), "gating must precede any provisioner mutation");
+        assert!(
+            !fa.calls.iter().any(|c| matches!(c, FakeCall::Snapshot { .. } | FakeCall::Materialize { .. })),
+            "gating must precede any backend snapshot/materialize: {:?}",
+            fa.calls
+        );
+    }
+
+    #[test]
+    fn provisioner_phase_failure_restores_file_access_backend() {
+        // The account create (provisioner) fails AFTER the file-access snapshot
+        // was taken → rollback must call the backend's restore (both seams roll
+        // back together).
+        let (_t, d) = decl_with_file_perm("oper", 9010);
+        let st = FakeState::default();
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::failing("create");
+        let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
+        let err = run(fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap_err();
+        assert!(matches!(err, ApplyError::Phase { phase: "create", .. }), "got {err:?}");
+        assert!(p.restored, "provisioner must restore");
+        assert!(
+            fa.calls.iter().any(|c| matches!(c, FakeCall::Restore)),
+            "file-access backend must restore on a provisioner phase failure: {:?}",
+            fa.calls
+        );
+    }
+
+    // ---- group-grants apply orchestration (slice 5c) ----
+
+    /// A leaked catalog defining one permission `grp-perm` on `linux` carrying a
+    /// `%group`-projectable sudo command + an optional dir file grant. Returned as
+    /// `'static` so the borrowed `CompileInputs` drops into an `ApplyInputs`.
+    fn compile_with_group_perm(sudo: &[&str], file: Option<&str>) -> CompileInputs<'static> {
+        let files = file
+            .map(|p| {
+                vec![FileGrant {
+                    path: p.to_owned(),
+                    access: Access::Rw,
+                    recursive: true,
+                }]
+            })
+            .unwrap_or_default();
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                id: "grp-perm".to_owned(),
+                risk: None,
+                category: None,
+                groups: ListOverride::default(),
+                sudo: ListOverride::Replace(sudo.iter().map(|s| s.to_string()).collect()),
+                limits: None,
+                replace: false,
+                includes: Vec::new(),
+                include_categories: Vec::new(),
+                files,
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        CompileInputs {
+            catalog: Box::leak(Box::new(cat)),
+            os: Box::leak(Box::new(os)),
+            ctx: Box::leak(Box::new(ResolveCtx::default())),
+        }
+    }
+
+    /// Build a `--trust-fs` declaration with a role-store holding `role` (carrying
+    /// `grp-perm`), a single `[[group]]` (optionally `adopt`, with `members`), and
+    /// a `[[role_group]]` binding `role` to that group. `accounts` are extra
+    /// `[[role_account]]` lines (so an adopted group's member can be a managed
+    /// account). Returns (tempdir, declaration).
+    fn decl_group_grant(
+        role: &str,
+        group: &str,
+        adopt: bool,
+        members: &[&str],
+        accounts: &[(&str, u32)],
+    ) -> (tempfile::TempDir, Declaration) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{role}.toml")),
+            format!("role = \"{role}\"\nversion = 1\nos = \"linux\"\nname = \"X\"\nlevel = 0\n[payload]\npermissions = [\"grp-perm\"]\n"),
+        )
+        .unwrap();
+        let store = tmp.path().display().to_string();
+        let mut text = format!(
+            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+        );
+        for (r, uid) in accounts {
+            text.push_str(&format!("[[role_account]]\nrole = \"{r}\"\nuid = {uid}\n"));
+        }
+        let members_lit = members
+            .iter()
+            .map(|m| format!("\"{m}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!("[[group]]\nname = \"{group}\"\n"));
+        if adopt {
+            text.push_str("adopt = true\n");
+        } else {
+            text.push_str("gid = 8050\n");
+        }
+        text.push_str(&format!("members = [{members_lit}]\n"));
+        text.push_str(&format!("[[role_group]]\nrole = \"{role}\"\ngroup = \"{group}\"\n"));
+        let d = Declaration::parse(&text).unwrap();
+        (tmp, d)
+    }
+
+    fn ag_inputs<'a>(
+        d: &'a Declaration,
+        st: &'a FakeState,
+        insp: &'a FakeInspector,
+        sessions: &'a dyn SessionSource,
+        compile: CompileInputs<'a>,
+        file_access: &'a mut dyn FileAccessBackend,
+    ) -> ApplyInputs<'a> {
+        ApplyInputs {
+            declaration: d,
+            declaration_bytes: b"",
+            state: st,
+            inspector: insp,
+            trust: TrustOptions { trust_fs: true, ..Default::default() },
+            lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            sudoers_dir: PathBuf::from("/etc/sudoers.d"),
+            session_source: sessions,
+            sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+            compile,
+            file_access,
+        }
+    }
+
+    #[test]
+    fn created_group_grant_writes_sudoers_acl_and_members() {
+        // A non-adopted [[group]] bound to a role with a sudo + file grant and a
+        // member. apply must: groupadd (existence), write %group sudoers, set
+        // g:group ACL, and gpasswd -a the member.
+        let (_t, d) = decl_group_grant("netops", "ops", false, &["netops"], &[("netops", 9010)]);
+        let st = FakeState::default();
+        let insp = FakeInspector::default(); // group absent → diff_groups Create
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        let compile = compile_with_group_perm(&["/usr/sbin/ip"], Some("/etc/net"));
+        let report = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+
+        // Entity create (membership path) then %group sudoers (resolved path).
+        assert!(p.calls.iter().any(|c| c == "create_group:ops"), "groupadd: {:?}", p.calls);
+        assert!(p.calls.iter().any(|c| c == "apply_group_sudoers:ops"), "%group sudoers: {:?}", p.calls);
+        assert!(p.calls.iter().any(|c| c == "add_member:ops:netops"), "gpasswd add: {:?}", p.calls);
+        // g:group ACL materialized.
+        assert!(
+            fa.calls.iter().any(|c| matches!(c, FakeCall::Materialize { principal, paths }
+                if principal == &crate::fileaccess::Principal::Group("ops".to_owned())
+                    && paths == &vec!["/etc/net".to_owned()])),
+            "group ACL must materialize: {:?}", fa.calls
+        );
+        // Registry record carries the grants/members/provenance.
+        let g = report.managed_group_records.iter().find(|g| g.name == "ops").expect("ops recorded");
+        assert_eq!(g.provenance, crate::model::Provenance::Created);
+        assert_eq!(g.sudo_commands, vec!["/usr/sbin/ip"]);
+        assert_eq!(g.members_added, vec!["netops"]);
+        assert_eq!(g.file_grants.len(), 1);
+        assert_eq!(g.gid, 8050);
+        assert!(g.adopt_baseline.is_none());
+    }
+
+    #[test]
+    fn adopt_group_skips_groupadd_and_records_baseline() {
+        // An adopted [[group]] that already exists live. apply must NOT groupadd,
+        // must snapshot the baseline (live gid + members read via inspector), and
+        // must apply Census's grants on top.
+        let (_t, d) = decl_group_grant("netops", "wheel", true, &["netops"], &[("netops", 9010)]);
+        let st = FakeState::default();
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
+        insp.group_members.insert("wheel".into(), vec!["root".into(), "admin".into()]);
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        let compile = compile_with_group_perm(&["/usr/sbin/ip"], None);
+        let report = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+
+        assert!(!p.calls.iter().any(|c| c.starts_with("create_group")), "adopt must not groupadd: {:?}", p.calls);
+        assert!(p.calls.iter().any(|c| c == "apply_group_sudoers:wheel"), "grants applied: {:?}", p.calls);
+        assert!(p.calls.iter().any(|c| c == "add_member:wheel:netops"), "our member added: {:?}", p.calls);
+        let g = report.managed_group_records.iter().find(|g| g.name == "wheel").expect("wheel recorded");
+        assert_eq!(g.provenance, crate::model::Provenance::Adopted);
+        let baseline = g.adopt_baseline.as_ref().expect("adopt baseline recorded");
+        assert_eq!(baseline.gid, 10, "baseline gid read from inspector");
+        assert_eq!(baseline.members, vec!["root", "admin"], "baseline members read from inspector");
+        // Adopted group records the observed GID, not a pin.
+        assert_eq!(g.gid, 10);
+    }
+
+    #[test]
+    fn release_adopted_group_strips_grants_keeps_group_and_baseline_members() {
+        // An adopted group, previously under management, vanishes from the
+        // declaration. Release must: remove %group sudoers, revoke g:group ACL,
+        // gpasswd -d our own members — but NEVER groupdel, and never touch the
+        // baseline (foreign) members.
+        let (_t, d) = empty_decl();
+        let prior_group = ManagedGroup {
+            name: "wheel".to_owned(),
+            gid: 10,
+            provenance: crate::model::Provenance::Adopted,
+            members_added: vec!["netops".to_owned()],
+            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            file_grants: vec![ManagedFileGrant {
+                path: "/etc/net".to_owned(),
+                access: Access::Rw,
+                recursive: true,
+            }],
+            adopt_baseline: Some(crate::state::GroupBaseline {
+                gid: 10,
+                members: vec!["root".to_owned()],
+            }),
+            from_version: 4,
+        };
+        let st = fake_state_with_groups(vec![], vec![prior_group]);
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        let report = run(ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa), &mut p).unwrap();
+
+        assert!(p.calls.iter().any(|c| c == "remove_group_sudoers:wheel"), "%group sudoers stripped: {:?}", p.calls);
+        assert!(p.calls.iter().any(|c| c == "del_member:wheel:netops"), "our member removed: {:?}", p.calls);
+        assert!(!p.calls.iter().any(|c| c.starts_with("delete_group")), "release must NOT groupdel: {:?}", p.calls);
+        assert!(
+            fa.calls.iter().any(|c| matches!(c, FakeCall::Revoke { principal, path }
+                if principal == &crate::fileaccess::Principal::Group("wheel".to_owned()) && path == "/etc/net")),
+            "group ACL revoked: {:?}", fa.calls
+        );
+        // The released group leaves the registry; its live group + baseline
+        // members (root) are untouched (no del_member for root).
+        assert!(!report.managed_group_records.iter().any(|g| g.name == "wheel"), "released group dropped from registry");
+        assert!(!p.calls.iter().any(|c| c == "del_member:wheel:root"), "baseline member must be untouched: {:?}", p.calls);
+    }
+
+    #[test]
+    fn created_group_dropped_tears_down_grants_then_groupdel() {
+        // A Created [[group]] (with grants/members) vanishes. Grant-teardown
+        // (%group sudoers + ACL + our members) must precede the entity groupdel.
+        let (_t, d) = empty_decl();
+        let prior_group = ManagedGroup {
+            name: "ops".to_owned(),
+            gid: 8050,
+            provenance: crate::model::Provenance::Created,
+            members_added: vec!["netops".to_owned()],
+            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            file_grants: vec![ManagedFileGrant {
+                path: "/etc/net".to_owned(),
+                access: Access::Rw,
+                recursive: true,
+            }],
+            adopt_baseline: None,
+            from_version: 4,
+        };
+        let st = fake_state_with_groups(vec![], vec![prior_group]);
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("ops".into(), GroupFacts { gid: 8050 });
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        let report = run(ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa), &mut p).unwrap();
+
+        let rm_sudo = p.calls.iter().position(|c| c == "remove_group_sudoers:ops").expect("grant teardown");
+        let groupdel = p.calls.iter().position(|c| c == "delete_group:ops").expect("entity groupdel");
+        assert!(rm_sudo < groupdel, "grant teardown must precede groupdel: {:?}", p.calls);
+        assert!(p.calls.iter().any(|c| c == "del_member:ops:netops"), "our member removed: {:?}", p.calls);
+        assert!(
+            fa.calls.iter().any(|c| matches!(c, FakeCall::Revoke { principal, path }
+                if principal == &crate::fileaccess::Principal::Group("ops".to_owned()) && path == "/etc/net")),
+            "group ACL revoked before groupdel: {:?}", fa.calls
+        );
+        assert!(!report.managed_group_records.iter().any(|g| g.name == "ops"), "deleted group dropped from registry");
+    }
+
+    #[test]
+    fn adopted_group_dropped_never_groupdels() {
+        // KEY safety test: an Adopted registry group that vanishes from the
+        // declaration must produce a Release (no groupdel), never an entity
+        // delete — even though it is no longer "required".
+        let (_t, d) = empty_decl();
+        let mut prior_group = managed_group("wheel", 10, 4);
+        prior_group.provenance = crate::model::Provenance::Adopted;
+        prior_group.adopt_baseline = Some(crate::state::GroupBaseline { gid: 10, members: vec![] });
+        let st = fake_state_with_groups(vec![], vec![prior_group]);
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        run(ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa), &mut p).unwrap();
+
+        assert!(
+            !p.calls.iter().any(|c| c.starts_with("delete_group")),
+            "adopted group must never be groupdel'd on teardown: {:?}", p.calls
+        );
+    }
+
+    #[test]
+    fn group_member_reconciliation_adds_and_removes_only_own() {
+        // target.members changed: registry recorded {a} added; declaration now
+        // targets {b}. gpasswd -a b (new) and gpasswd -d a (our own, dropped);
+        // a foreign baseline member is never touched.
+        // A Created group allows any member name (no managed-account constraint),
+        // so `a`/`b` need not be declared accounts.
+        let (_t, d) = decl_group_grant("netops", "ops", false, &["b"], &[("netops", 9010)]);
+        let prior_group = ManagedGroup {
+            name: "ops".to_owned(),
+            gid: 8050,
+            provenance: crate::model::Provenance::Created,
+            members_added: vec!["a".to_owned()],
+            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            file_grants: vec![],
+            adopt_baseline: None,
+            from_version: 4,
+        };
+        let st = fake_state_with_groups(vec![], vec![prior_group]);
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("ops".into(), GroupFacts { gid: 8050 });
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        let compile = compile_with_group_perm(&["/usr/sbin/ip"], None);
+        let report = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+
+        assert!(p.calls.iter().any(|c| c == "add_member:ops:b"), "new member added: {:?}", p.calls);
+        assert!(p.calls.iter().any(|c| c == "del_member:ops:a"), "dropped own member removed: {:?}", p.calls);
+        let g = report.managed_group_records.iter().find(|g| g.name == "ops").unwrap();
+        assert_eq!(g.members_added, vec!["b"], "registry records the new membership");
+    }
+
+    #[test]
+    fn group_grant_phase_failure_triggers_restore() {
+        // A failure in the group-sudoers phase rolls back both seams (provisioner
+        // restore + file-access restore).
+        let (_t, d) = decl_group_grant("netops", "ops", false, &["netops"], &[("netops", 9010)]);
+        let st = FakeState::default();
+        let insp = FakeInspector::default();
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::failing("apply_group_sudoers");
+        let compile = compile_with_group_perm(&["/usr/sbin/ip"], Some("/etc/net"));
+        let err = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap_err();
+        assert!(matches!(err, ApplyError::Phase { phase: "group-sudoers", .. }), "got {err:?}");
+        assert!(p.restored, "provisioner must restore on group-grant failure");
+        assert!(fa.calls.iter().any(|c| matches!(c, FakeCall::Restore)), "file-access restores too: {:?}", fa.calls);
+    }
+
+    #[test]
+    fn group_grant_apply_is_idempotent_on_rerun() {
+        // After a first apply records the group, a re-apply with the SAME
+        // declaration and the registry reflecting it must do no group mutations
+        // (no add/del member, no sudoers churn that counts as a change) — the
+        // resolved-group diff is in sync.
+        let (_t, d) = decl_group_grant("netops", "ops", false, &["netops"], &[("netops", 9010)]);
+        // Registry already reflects the applied state (group + account in sync).
+        let applied_group = ManagedGroup {
+            name: "ops".to_owned(),
+            gid: 8050,
+            provenance: crate::model::Provenance::Created,
+            members_added: vec!["netops".to_owned()],
+            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            file_grants: vec![],
+            adopt_baseline: None,
+            from_version: 5,
+        };
+        // The account resolves `grp-perm` → sudo command `/usr/sbin/ip`; group
+        // membership is managed on the GROUP (gpasswd), not the account's
+        // supplementary groups, so the account record carries no `ops` group.
+        let applied_acct = {
+            let mut m = managed("netops", 9010, &[], 5);
+            m.sudo_commands = vec!["/usr/sbin/ip".to_owned()];
+            m
+        };
+        let st = fake_state_with_groups(vec![applied_acct], vec![applied_group]);
+        let mut insp = FakeInspector::default();
+        insp.groups.insert("ops".into(), GroupFacts { gid: 8050 });
+        let sessions = FakeSessionSource::empty();
+        let mut fa = dir_backend();
+        let mut p = FakeProvisioner::default();
+        let compile = compile_with_group_perm(&["/usr/sbin/ip"], None);
+        let report = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+
+        assert_eq!(report.mutations, 0, "in-sync re-apply is a no-op: {:?}", p.calls);
+        assert!(!p.snapshotted, "no snapshot on an empty plan");
+        assert!(p.calls.is_empty(), "no group mutations on a synced re-apply: {:?}", p.calls);
     }
 }

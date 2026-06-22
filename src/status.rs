@@ -77,6 +77,8 @@ mod tests {
             groups: vec![],
             sudo_role: None,
             sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            provenance: crate::model::Provenance::Created,
             from_version,
         }
     }
@@ -91,7 +93,9 @@ mod tests {
             sudo_role: None,
             sudo_commands: Vec::new(),
             limits: Limits::default(),
+            file_grants: Vec::new(),
             locked_password: true,
+            provenance: crate::model::Provenance::Created,
         }
     }
 

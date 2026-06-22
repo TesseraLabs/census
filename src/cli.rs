@@ -10,6 +10,7 @@ use crate::coverage::{
     self, CoverageCtx, CoverageReport, LiveSurface, ResolvedRole, SurfaceClass, SurfaceScanner,
 };
 use crate::doctor::{self, DoctorReport};
+use crate::fileaccess::AclBackend;
 use crate::inspect::LiveInspector;
 use crate::l10n::{self, LiveL10n, L10nSource};
 use crate::lockout::LockoutContext;
@@ -248,6 +249,13 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
     };
     let ctx = ResolveCtx { catalog_version: None };
 
+    // Production file-access backend: the open ACL backend, snapshotting into a
+    // `file-access` subdir of the rollback root so its ACL dumps do not collide
+    // with the auth-DB full-file backup. A SEPARATE seam from the provisioner —
+    // it materializes/revokes/snapshots/restores file grants while the
+    // provisioner drives shadow-utils.
+    let mut file_access = AclBackend::production(opts.rollback_root.join("file-access"));
+
     let inputs = ApplyInputs {
         declaration: &decl,
         declaration_bytes: text.as_bytes(),
@@ -268,6 +276,7 @@ pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
         session_source: &session_source,
         sessions_file: opts.sessions_file.clone(),
         compile: crate::model::CompileInputs { catalog: &catalog, os: &os, ctx: &ctx },
+        file_access: &mut file_access,
     };
 
     // Scope the provisioner so its mutable borrow of `backup` ends before we
@@ -559,6 +568,36 @@ impl CompiledRole {
         out
     }
 
+    /// The flat union of every file grant across all permissions, keyed by path
+    /// (access widens to the max, `recursive` ORs, shape recomputed) — the same
+    /// rule `model::resolve` applies. Each carries the permission that pulled it in
+    /// (first-seen). File grants only ever come from permissions (no raw escape
+    /// hatch), so there is no raw seed here.
+    fn flat_file_grants(&self) -> Vec<FlatFileGrant> {
+        let mut out: Vec<FlatFileGrant> = Vec::new();
+        for perm in &self.permissions {
+            for g in &perm.resolved.file_grants {
+                if let Some(existing) = out.iter_mut().find(|e| e.grant.path == g.path) {
+                    // Widen in place, mirroring the resolver's by-path union so the
+                    // compiled view shows one grant per path at its strongest.
+                    existing.grant = catalog::union_resolved_file_grants(vec![
+                        existing.grant.clone(),
+                        g.clone(),
+                    ])
+                    .into_iter()
+                    .next()
+                    .expect("union of two grants on one path yields one");
+                } else {
+                    out.push(FlatFileGrant {
+                        grant: g.clone(),
+                        permission: perm.resolved.id.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// The effective limits for the role: raw limits win wholesale when present
     /// (mirrors `model::resolve`), else the first expanded limit per field.
     fn effective_limits(&self) -> Limits {
@@ -627,6 +666,39 @@ impl FlatPrimitive {
             },
             _ => " [raw]".to_owned(),
         }
+    }
+}
+
+/// A file grant flattened for the compile/show view: the resolved grant plus the
+/// permission that contributed it. The render derives the access/recursive/shape
+/// display and the enforcing backend from the grant itself.
+#[derive(Debug, Clone)]
+pub struct FlatFileGrant {
+    /// The resolved file grant (path, access, recursive, shape, provenance).
+    pub grant: catalog::ResolvedFileGrant,
+    /// The permission id that pulled this grant in.
+    pub permission: String,
+}
+
+/// The access token (`ro`/`rw`) for display.
+fn access_token(access: catalog::Access) -> &'static str {
+    match access {
+        catalog::Access::Ro => "ro",
+        catalog::Access::Rw => "rw",
+    }
+}
+
+/// Describe which backend + guarantee resolves a grant of this shape in the open
+/// build. A directory grant is enforced rewrite-proof by the open `AclBackend`; a
+/// File or Pattern grant has no open backend and would REQUIRE a capability-gated
+/// one — stated honestly so the view never implies the open build can enforce it.
+/// Mirrors the routing in [`crate::fileaccess`] (Dir→AclBackend) and the
+/// capability-gating contract (File/Pattern → capable backend required).
+fn backend_for_shape(shape: catalog::Shape) -> &'static str {
+    match shape {
+        catalog::Shape::Dir => "AclBackend (dir, rewrite-proof)",
+        catalog::Shape::File => "requires per-file-capable backend",
+        catalog::Shape::Pattern => "requires pattern-capable backend",
     }
 }
 
@@ -729,6 +801,25 @@ pub fn render_compile_human(compiled: &CompiledRole) -> String {
         }
     }
 
+    let files = compiled.flat_file_grants();
+    out.push_str("files:\n");
+    if files.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for f in &files {
+            // `<path> <ro|rw>[ recursive] via <backend> [perm <id>]`
+            let recursive = if f.grant.recursive { " recursive" } else { "" };
+            out.push_str(&format!(
+                "  {} {}{} via {} [perm {}]\n",
+                f.grant.path,
+                access_token(f.grant.access),
+                recursive,
+                backend_for_shape(f.grant.shape),
+                f.permission,
+            ));
+        }
+    }
+
     let limits = compiled.effective_limits();
     out.push_str("limits:\n");
     if limits == Limits::default() {
@@ -760,6 +851,10 @@ pub fn render_compile_json(compiled: &CompiledRole) -> String {
     out.push_str(&flat_primitives_json(&compiled.flat_sudo()));
     out.push_str("],");
 
+    out.push_str("\"file_grants\":[");
+    out.push_str(&flat_file_grants_json(&compiled.flat_file_grants()));
+    out.push_str("],");
+
     let limits = compiled.effective_limits();
     out.push_str("\"limits\":{");
     out.push_str(&format!(
@@ -784,6 +879,32 @@ fn flat_primitives_json(prims: &[FlatPrimitive]) -> String {
                 p.permission.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
                 p.layer.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
                 p.via.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Render a list of flat file grants as JSON objects: path, access (`ro`/`rw`),
+/// recursive, shape, the enforcing backend description, and the contributing
+/// permission. Reuses `json_str` for escaping.
+fn flat_file_grants_json(grants: &[FlatFileGrant]) -> String {
+    grants
+        .iter()
+        .map(|f| {
+            let shape = match f.grant.shape {
+                catalog::Shape::Dir => "dir",
+                catalog::Shape::File => "file",
+                catalog::Shape::Pattern => "pattern",
+            };
+            format!(
+                "{{\"path\":{},\"access\":{},\"recursive\":{},\"shape\":{},\"backend\":{},\"permission\":{}}}",
+                json_str(&f.grant.path),
+                json_str(access_token(f.grant.access)),
+                f.grant.recursive,
+                json_str(shape),
+                json_str(backend_for_shape(f.grant.shape)),
+                json_str(&f.permission),
             )
         })
         .collect::<Vec<_>>()
@@ -871,7 +992,16 @@ pub fn run_compile(
 
     if lint {
         let l10n = LiveL10n::new(catalog_roots);
-        let findings = lint_role(&compiled, &warnings, &decl, &os, &catalog, &l10n);
+        let mut findings = lint_role(&compiled, &warnings, &decl, &os, &catalog, &l10n);
+        // Group-grant escalation lint: bindings that attach an escalation-capable
+        // grant to a group every member inherits. Resolved from the declaration's
+        // `[[role_group]]` blocks. A resolve failure here is advisory-only (the
+        // group lint is a best-effort overlay on the per-role compile, which is
+        // what `--lint` gates on); surface it as a warning and skip.
+        match model::resolve_groups(&decl, &inputs) {
+            Ok((groups, _warnings)) => findings.extend(group_grant_risk_findings(&groups)),
+            Err(e) => eprintln!("census: warning: group lint skipped: {e}"),
+        }
         for f in &findings {
             eprintln!("census: {} [{}] {}", f.severity.tag(), f.code, f.message);
         }
@@ -979,6 +1109,21 @@ pub fn render_show_tree(compiled: &CompiledRole, lang: &str, l10n: &dyn L10nSour
         for s in &r.sudo {
             out.push_str(&format!("    sudo {}{}\n", s.value, via_suffix(&r.id, &s.via)));
         }
+        for g in &r.file_grants {
+            let recursive = if g.recursive { " recursive" } else { "" };
+            let via = g.sources.iter().find_map(|src| src.via.as_deref());
+            out.push_str(&format!(
+                "    file {} {}{} via {}{}\n",
+                g.path,
+                access_token(g.access),
+                recursive,
+                backend_for_shape(g.shape),
+                match via {
+                    Some(m) if m != r.id => format!(" (via {m})"),
+                    _ => String::new(),
+                },
+            ));
+        }
         if let Some(l) = &r.limits {
             if let Some(n) = l.nofile {
                 out.push_str(&format!("    limit nofile = {n}\n"));
@@ -1031,6 +1176,10 @@ pub struct CoverageOpts {
     /// Optional role-store dir whose roles are resolved into concrete instances
     /// (so parametrized permissions contribute named units/paths).
     pub roles: Option<PathBuf>,
+    /// Optional declaration whose `[[role_group]]` bindings are resolved so a
+    /// `group` object with a bound grant is counted covered. `None` means no
+    /// binding-covered groups are folded in (membership coverage only).
+    pub declaration: Option<PathBuf>,
     /// `--strict`: a parametrized record without a role instance does NOT cover.
     pub strict: bool,
     /// Surface classes to scan; empty means all classes.
@@ -1129,6 +1278,7 @@ fn resolve_roles(
         // groups DO gate-keep, so they seed the role's covered groups.
         let mut sudo: Vec<String> = Vec::new();
         let mut groups: Vec<String> = comp.groups.clone();
+        let mut file_grants: Vec<catalog::ResolvedFileGrant> = Vec::new();
         for perm in &comp.permissions {
             match catalog::resolve_with_params(&perm.id, &perm.params, os, &catalog, ctx) {
                 Ok((resolved, _warnings)) => {
@@ -1138,13 +1288,18 @@ fn resolve_roles(
                     for p in &resolved.groups {
                         groups.push(p.value.clone());
                     }
+                    // A parametrized config-edit grant only becomes a concrete path
+                    // once a role supplies its parameter; fold the role-instance's
+                    // resolved grants in so a config object under such a grant is
+                    // counted covered (with the backend note) in the audit.
+                    file_grants.extend(resolved.file_grants);
                 }
                 Err(e) => {
                     eprintln!("census: warning: role {role} permission {}: {e}", perm.id);
                 }
             }
         }
-        out.push(ResolvedRole::new(sudo, groups));
+        out.push(ResolvedRole::with_file_grants(sudo, groups, file_grants));
     }
     out
 }
@@ -1164,12 +1319,15 @@ fn coverage_exit_code(overall_pct: f64, min: Option<f64>) -> ExitCode {
 /// Render a coverage report as a human-readable audit. Pure (report in, string
 /// out) so the output shape is unit-testable from a hand-built report.
 pub fn render_coverage_human(report: &CoverageReport, include_low_priority: bool) -> String {
-    let _ = include_low_priority; // currently affects no rows; reserved toggle
+    // `include_low_priority` is applied upstream in `coverage_scoped` (it changes
+    // which config objects are in the report at all); here it only annotates the
+    // header so the reader knows which denominator they are looking at.
     let mut out = String::new();
     out.push_str(&format!(
-        "coverage for {} (catalog {})\n",
+        "coverage for {} (catalog {}){}\n",
         if report.os_target.is_empty() { "unknown" } else { &report.os_target },
         report.catalog_version.as_deref().unwrap_or("unknown"),
+        if include_low_priority { " [incl. low-priority config]" } else { "" },
     ));
 
     // Per-class summary.
@@ -1185,11 +1343,32 @@ pub fn render_coverage_human(report: &CoverageReport, include_low_priority: bool
     }
     out.push_str(&format!("overall: {:.1}%\n", report.overall_pct));
 
+    // Covered objects that carry a HOW note (config via file grants): surface the
+    // backend/guarantee so the operator can see which grant enforces each config.
+    let noted: Vec<_> = report
+        .objects
+        .iter()
+        .filter(|o| o.covered && o.coverage_note.is_some())
+        .collect();
+    if !noted.is_empty() {
+        out.push_str("covered via file grants:\n");
+        for o in &noted {
+            out.push_str(&format!(
+                "  [{}] {} — {}\n",
+                o.object.class.as_str(),
+                o.object.key,
+                o.coverage_note.as_deref().unwrap_or(""),
+            ));
+        }
+    }
+
     // Uncovered objects (honest gaps) grouped by class, with a suggestion.
     let gaps: Vec<_> = report
         .objects
         .iter()
-        .filter(|o| !o.covered && o.intentional_exclusion.is_none())
+        .filter(|o| {
+            !o.covered && o.intentional_exclusion.is_none() && o.backend_limited.is_none()
+        })
         .collect();
     out.push_str("uncovered:\n");
     if gaps.is_empty() {
@@ -1228,6 +1407,28 @@ pub fn render_coverage_human(report: &CoverageReport, include_low_priority: bool
         }
     }
 
+    // Backend-limited: objects the free dir-only backend cannot enforce without an
+    // over-broad grant (a single file in a non-grantable parent). Reported in their
+    // own section so they are visible but clearly NOT counted as gaps — distinct
+    // from "intentionally uncovered" (out of scope) and from a real gap (fixable
+    // with a grant). A per-file-capable backend would cover these.
+    let backend_limited: Vec<_> = report
+        .objects
+        .iter()
+        .filter(|o| o.backend_limited.is_some())
+        .collect();
+    if !backend_limited.is_empty() {
+        out.push_str("backend-limited (requires per-file backend):\n");
+        for o in &backend_limited {
+            out.push_str(&format!(
+                "  [{}] {} — {}\n",
+                o.object.class.as_str(),
+                o.object.key,
+                o.backend_limited.as_deref().unwrap_or(""),
+            ));
+        }
+    }
+
     // Anomalies (orphan setuid / orphan capfile) — investigate, separate from gaps.
     if !report.anomalies.is_empty() {
         out.push_str("anomalies (investigate):\n");
@@ -1261,13 +1462,15 @@ pub fn render_coverage_json(report: &CoverageReport) -> String {
         .iter()
         .map(|o| {
             format!(
-                "{{\"class\":{},\"key\":{},\"covered\":{},\"provenance\":{},\"suggested_permission\":{},\"intentional_exclusion\":{}}}",
+                "{{\"class\":{},\"key\":{},\"covered\":{},\"provenance\":{},\"suggested_permission\":{},\"intentional_exclusion\":{},\"backend_limited\":{},\"coverage_note\":{}}}",
                 json_str(o.object.class.as_str()),
                 json_str(&o.object.key),
                 o.covered,
                 provenance_json(&o.object.provenance),
                 o.suggested_permission.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
                 o.intentional_exclusion.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+                o.backend_limited.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+                o.coverage_note.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
             )
         })
         .collect();
@@ -1344,6 +1547,36 @@ pub fn run_coverage(opts: CoverageOpts) -> ExitCode {
         None => Vec::new(),
     };
 
+    // With a declaration, resolve its `[[role_group]]` bindings and collect the
+    // names of groups that carry a grant (non-empty sudo and/or file). A `group`
+    // surface object for such a group is covered by the binding even when no
+    // membership primitive names it. Without a declaration this stays empty
+    // (membership coverage only — the original behavior).
+    let bound_grant_groups = match &opts.declaration {
+        Some(decl_path) => {
+            let decl = match read_declaration(decl_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("census: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let inputs = CompileInputs { catalog: &catalog, os: &os, ctx: &ctx };
+            match model::resolve_groups(&decl, &inputs) {
+                Ok((groups, _warnings)) => groups
+                    .into_iter()
+                    .filter(|g| !g.sudo_commands.is_empty() || !g.file_grants.is_empty())
+                    .map(|g| g.name)
+                    .collect(),
+                Err(e) => {
+                    eprintln!("census: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+
     let classes = if opts.classes.is_empty() {
         all_classes()
     } else {
@@ -1361,8 +1594,16 @@ pub fn run_coverage(opts: CoverageOpts) -> ExitCode {
     let cov_ctx = CoverageCtx {
         strict: opts.strict,
         catalog_version: ctx.catalog_version.clone(),
+        bound_grant_groups,
     };
-    let report = match coverage::coverage(&surface, &catalog, &os, &roles, &cov_ctx) {
+    let report = match coverage::coverage_scoped(
+        &surface,
+        &catalog,
+        &os,
+        &roles,
+        &cov_ctx,
+        opts.include_low_priority,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("census: {e}");
@@ -1384,6 +1625,290 @@ pub fn run_coverage(opts: CoverageOpts) -> ExitCode {
     }
 
     coverage_exit_code(report.overall_pct, opts.min_coverage)
+}
+
+// ============================================================================
+// catalog which-grants (reverse lookup; read-only query)
+//
+// Given a path or command, report which catalog permissions grant access to it
+// and how. The inverse of coverage: coverage asks "what surface is uncovered?",
+// which-grants asks "what grants THIS object?". Read-only — it resolves the
+// catalog, never runs the binary or reads file content, and always exits 0 unless
+// the catalog/OS itself cannot be read (even "no grants" is a successful query).
+// ============================================================================
+
+/// Options for `census catalog which-grants <arg>`.
+pub struct WhichGrantsOpts {
+    /// The absolute path or command to look up.
+    pub arg: String,
+    /// Emit machine-readable JSON instead of the human view.
+    pub json: bool,
+    /// `--os-target family-distro-version` override; autodetects when `None`.
+    pub os_target: Option<String>,
+    /// Catalog roots in precedence order (lowest first).
+    pub catalog_roots: Vec<PathBuf>,
+    /// Optional declaration whose `[[role_group]]` bindings are resolved so group
+    /// grants (`via %group sudoers` / `via g:group ACL`) appear in the lookup.
+    /// `None` reports account grants only (the original behavior).
+    pub declaration: Option<PathBuf>,
+}
+
+/// Build the reverse-lookup sources by resolving every catalog permission.
+///
+/// Each distinct id in `all_definitions` is resolved once; the concrete sudo
+/// command strings and file grants become a [`coverage::GrantSource`]. A templated
+/// sudo command (one still carrying a `{placeholder}` because no role instance
+/// filled it) is SKIPPED — a reverse lookup is over concrete grants the catalog
+/// would actually emit, and a literal `{unit}` is not a real command. Likewise a
+/// templated file-grant path is skipped. An id that fails to resolve is skipped
+/// with a stderr warning (mirroring the coverage audit's warn-and-skip), so one
+/// bad record does not sink the whole query.
+fn build_grant_sources(
+    catalog: &dyn catalog::CatalogSource,
+    os: &OsTarget,
+    ctx: &ResolveCtx,
+) -> Result<Vec<coverage::GrantSource>, CatalogError> {
+    let all = catalog.all_definitions(os)?;
+    let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<coverage::GrantSource> = Vec::new();
+    for (_layer, def) in &all {
+        if seen.iter().any(|s| s == &def.id) {
+            continue;
+        }
+        seen.push(def.id.clone());
+
+        match catalog::resolve(&def.id, os, catalog, ctx) {
+            Ok((resolved, _warnings)) => {
+                // Keep only concrete (non-templated) sudo commands and file grants:
+                // an unfilled `{placeholder}` is not a real grant to look up.
+                let sudo: Vec<String> = resolved
+                    .sudo
+                    .iter()
+                    .map(|p| p.value.clone())
+                    .filter(|c| !has_unfilled_placeholder(c))
+                    .collect();
+                let file_grants: Vec<catalog::ResolvedFileGrant> = resolved
+                    .file_grants
+                    .iter()
+                    .filter(|g| !has_unfilled_placeholder(&g.path))
+                    .cloned()
+                    .collect();
+                if sudo.is_empty() && file_grants.is_empty() {
+                    continue;
+                }
+                out.push(coverage::GrantSource {
+                    id: resolved.id.clone(),
+                    target: coverage::GrantTarget::Account(resolved.id),
+                    risk: resolved.risk,
+                    sudo,
+                    file_grants,
+                });
+            }
+            Err(e) => {
+                eprintln!("census: warning: catalog permission {} unresolved: {e}", def.id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read and parse a declaration TOML, returning a human-readable error string on
+/// an I/O or parse failure. Shared by the optional-declaration paths of coverage
+/// and which-grants so both report a malformed declaration the same way.
+fn read_declaration(path: &Path) -> Result<Declaration, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read declaration {}: {e}", path.display()))?;
+    Declaration::parse(&text).map_err(|e| e.to_string())
+}
+
+/// Build reverse-lookup sources from a declaration's `[[role_group]]` bindings.
+///
+/// Each resolved group with non-empty sudo and/or file grants becomes a
+/// [`coverage::GrantSource`] tagged `target = Group(name)`, so a sudo command or
+/// path reached through the group's `%group` sudoers / `g:group` ACL is reported
+/// as a group match. The matching core (sudo prefix / file under-dir) is reused
+/// unchanged — only the source set is widened. Group sources carry no per-source
+/// risk class (`ResolvedGroup` is an aggregate of several roles' grants, not one
+/// catalog permission); file matches still surface their own backend, and the
+/// group-escalation surface is flagged by the lint, not the reverse lookup.
+///
+/// Returns an empty vec when the declaration has no group bindings. A resolve
+/// failure is propagated (the caller already warns-and-continues on a soft error
+/// elsewhere; here a malformed declaration is a hard read error, consistent with
+/// the other declaration-driven commands).
+fn build_group_grant_sources(
+    decl: &Declaration,
+    inputs: &CompileInputs<'_>,
+) -> Result<Vec<coverage::GrantSource>, model::ResolveError> {
+    let (groups, _warnings) = model::resolve_groups(decl, inputs)?;
+    let mut out: Vec<coverage::GrantSource> = Vec::new();
+    for g in groups {
+        if g.sudo_commands.is_empty() && g.file_grants.is_empty() {
+            continue;
+        }
+        out.push(coverage::GrantSource {
+            id: g.name.clone(),
+            target: coverage::GrantTarget::Group(g.name),
+            risk: None,
+            sudo: g.sudo_commands,
+            file_grants: g.file_grants,
+        });
+    }
+    Ok(out)
+}
+
+/// Whether a string still carries a `{placeholder}` (a templated value that no
+/// role instance filled). Such a value is not a concrete grant, so the reverse
+/// lookup skips it.
+fn has_unfilled_placeholder(s: &str) -> bool {
+    if let Some(open) = s.find('{') {
+        s[open + 1..].contains('}')
+    } else {
+        false
+    }
+}
+
+/// Render reverse-lookup matches as a human-readable report. Pure (matches in,
+/// string out) so the output shape is unit-testable.
+pub fn render_which_grants_human(arg: &str, matches: &[coverage::GrantMatch]) -> String {
+    if matches.is_empty() {
+        return format!("no permission grants access to {arg}\n");
+    }
+    let mut out = format!("{arg} granted by:\n");
+    for m in matches {
+        match m.kind {
+            coverage::GrantKind::Sudo => {
+                // Group target → `%group` sudoers (every member inherits); account
+                // target → the per-account `sudo` mechanism (unchanged).
+                let mechanism = match m.target.group() {
+                    Some(g) => format!("via %group sudoers ({g})"),
+                    None => "via sudo".to_owned(),
+                };
+                out.push_str(&format!(
+                    "  {} — {}: {} [{}]\n",
+                    m.permission,
+                    mechanism,
+                    m.detail,
+                    risk_label(m.risk),
+                ));
+            }
+            coverage::GrantKind::File => {
+                let access = m.access.map(access_token).unwrap_or("");
+                let recursive = if m.recursive == Some(true) { ", recursive" } else { "" };
+                let backend = m.backend.as_deref().unwrap_or("");
+                // Group target → `g:group` ACL; account target → the per-account
+                // file mechanism (unchanged).
+                let mechanism = match m.target.group() {
+                    Some(g) => format!("via g:group ACL ({g})"),
+                    None => "via file".to_owned(),
+                };
+                out.push_str(&format!(
+                    "  {} — {} ({}): {}{} ({}) [{}]\n",
+                    m.permission,
+                    mechanism,
+                    access,
+                    m.detail,
+                    recursive,
+                    backend,
+                    risk_label(m.risk),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Render reverse-lookup matches as machine-readable JSON: an array of match
+/// objects. Hand-rolled over `json_str`, matching the coverage `--json` style.
+/// Pure.
+pub fn render_which_grants_json(matches: &[coverage::GrantMatch]) -> String {
+    let mut out = String::new();
+    out.push('[');
+    let items: Vec<String> = matches
+        .iter()
+        .map(|m| {
+            // `target` is `account` or `group`; `group` carries the inheriting
+            // group name for a group match (null for an account match).
+            let (target_kind, group) = match &m.target {
+                coverage::GrantTarget::Account(_) => ("account", "null".to_owned()),
+                coverage::GrantTarget::Group(g) => ("group", json_str(g)),
+            };
+            format!(
+                "{{\"permission\":{},\"target\":{},\"group\":{},\"kind\":{},\"detail\":{},\"access\":{},\"recursive\":{},\"backend\":{},\"risk\":{}}}",
+                json_str(&m.permission),
+                json_str(target_kind),
+                group,
+                json_str(m.kind.as_str()),
+                json_str(&m.detail),
+                m.access.map(|a| json_str(access_token(a))).unwrap_or_else(|| "null".to_owned()),
+                m.recursive.map(|r| r.to_string()).unwrap_or_else(|| "null".to_owned()),
+                m.backend.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+                json_str(risk_label(m.risk)),
+            )
+        })
+        .collect();
+    out.push_str(&items.join(","));
+    out.push(']');
+    out.push('\n');
+    out
+}
+
+/// Run `census catalog which-grants <arg>`: resolve the catalog, find every
+/// permission that grants access to `arg`, print the matches (human or JSON), and
+/// exit 0. Read-only — never mutates, never runs the arg. Only a catalog/OS read
+/// error exits non-zero; "no grants" is a successful query (exit 0).
+pub fn run_which_grants(opts: WhichGrantsOpts) -> ExitCode {
+    let os = match detect_os_target(opts.os_target.as_deref()) {
+        Ok(os) => os,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let catalog = LiveCatalog::new(opts.catalog_roots.clone());
+    let ctx = ResolveCtx { catalog_version: None };
+
+    let mut sources = match build_grant_sources(&catalog, &os, &ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // With a declaration, also fold in group grants from its `[[role_group]]`
+    // bindings so a command/path reached through a `%group` sudoers fragment or a
+    // `g:group` ACL is reported (with the inheriting group). Without one, only
+    // account grants are looked up (the original behavior).
+    if let Some(decl_path) = &opts.declaration {
+        match read_declaration(decl_path) {
+            Ok(decl) => {
+                let inputs = CompileInputs { catalog: &catalog, os: &os, ctx: &ctx };
+                match build_group_grant_sources(&decl, &inputs) {
+                    Ok(group_sources) => sources.extend(group_sources),
+                    Err(e) => {
+                        eprintln!("census: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("census: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let matches = coverage::which_grants(&opts.arg, &sources);
+
+    if opts.json {
+        print!("{}", render_which_grants_json(&matches));
+    } else {
+        print!("{}", render_which_grants_human(&opts.arg, &matches));
+    }
+
+    // A query always succeeds — even "no grants" is a valid answer (exit 0).
+    ExitCode::SUCCESS
 }
 
 // ============================================================================
@@ -1421,6 +1946,246 @@ pub struct LintFinding {
     pub message: String,
 }
 
+/// Root-equivalent file paths: write access to any of these is effectively a path
+/// to root (a writable sudoers fragment grants arbitrary sudo; a writable PAM/ssh
+/// config subverts authentication; a writable PATH bin is run as whoever invokes
+/// it). An `rw` grant on one of these (or under a recursive one) is flagged
+/// escalation-capable. Curated and documented so the rule is reviewable, not a
+/// magic list buried in code.
+const ROOT_EQUIVALENT_RW_PREFIXES: &[&str] = &[
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+    "/etc/sudo.conf",
+    "/etc/ssh",
+    "/etc/pam.d",
+    "/etc/polkit-1",
+    "/etc/security",
+    "/etc/sysctl.d",
+    "/etc/sysctl.conf",
+    "/etc/modprobe.d",
+    "/etc/apparmor.d",
+    "/etc/selinux",
+    "/etc/systemd",
+    // PATH binary directories: a writable executable here runs with the caller's
+    // privilege the next time it is invoked (often root via cron/sudo).
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+];
+
+/// Secret file/dir paths: even READ access leaks credentials/keys (password
+/// hashes, TLS private keys). An `ro` (or `rw`) grant on one of these — or under
+/// a recursive grant that contains it — is flagged. Every entry here is either an
+/// exact file (`/etc/shadow`, `/etc/krb5.keytab`) or a real directory
+/// (`/etc/ssl/private`), so the component-boundary matcher [`path_boundary_overlaps`]
+/// classifies it correctly. SSH host keys live as a FILENAME family
+/// (`/etc/ssh/ssh_host_*`), not a directory, so they are matched separately by
+/// [`path_is_secret`] (a basename prefix), NOT listed here — a component-boundary
+/// test would miss a grant directly on `/etc/ssh/ssh_host_rsa_key`.
+const SECRET_PATH_PREFIXES: &[&str] = &[
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/ssl/private",
+    "/etc/pki/tls/private",
+    "/etc/krb5.keytab",
+];
+
+/// The directory holding the SSH host private/public keys, and the filename
+/// prefix that marks one. The host keys are a filename family (`ssh_host_rsa_key`,
+/// `ssh_host_ed25519_key`, …) under a shared, non-secret directory (`/etc/ssh`
+/// also holds the public `sshd_config`), so they cannot be a component-boundary
+/// prefix in [`SECRET_PATH_PREFIXES`]; [`path_is_secret`] matches them by basename.
+const SSH_HOST_KEY_DIR: &str = "/etc/ssh";
+const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
+
+/// Whether `candidate` is at or under `base` on a `/`-component boundary, OR
+/// `base` is at or under `candidate` on a boundary. The second direction matters
+/// for a recursive grant: a recursive grant on `/etc` (or `/`) CONTAINS a
+/// sensitive `/etc/shadow`, so the grant must be flagged even though its declared
+/// path is the broader one. A plain prefix test would miss the parent-grant case
+/// or wrongly match a textual neighbour.
+fn path_boundary_overlaps(base: &str, candidate: &str) -> bool {
+    fn at_or_under(parent: &str, child: &str) -> bool {
+        if parent == child {
+            return true;
+        }
+        let parent = parent.strip_suffix('/').unwrap_or(parent);
+        child
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+    at_or_under(base, candidate) || at_or_under(candidate, base)
+}
+
+/// Whether a grant on `path` touches a secret. The single classifier for both the
+/// account ([`file_grant_risk_findings`]) and group ([`group_grant_risk_findings`])
+/// lints, so the rule cannot drift between the two. A path is secret when:
+///
+/// - it overlaps a curated secret file/dir on a `/`-component boundary
+///   (`/etc/shadow`, `/etc/ssl/private`, …) — including a recursive grant on a
+///   parent that CONTAINS one; or
+/// - it is, or lies under, an SSH host private key — a basename family
+///   (`ssh_host_*`) directly in `/etc/ssh`. The component-boundary matcher cannot
+///   express this (the key shares its directory with the non-secret
+///   `sshd_config`), so it is checked explicitly: a recursive grant on `/etc/ssh`
+///   already matches via the boundary rule, and a grant directly on
+///   `/etc/ssh/ssh_host_rsa_key` matches here by basename prefix.
+fn path_is_secret(path: &str) -> bool {
+    if SECRET_PATH_PREFIXES
+        .iter()
+        .any(|p| path_boundary_overlaps(p, path))
+    {
+        return true;
+    }
+    // SSH host key: a file named `ssh_host_*` whose parent directory is `/etc/ssh`
+    // (or a path at/under such a key). `parent_dir`/`basename` over the candidate
+    // catch the exact-file case; the recursive-parent case (`/etc/ssh`) is already
+    // covered by the boundary rule against a host-key path below.
+    if let Some((parent, name)) = path.rsplit_once('/') {
+        if parent == SSH_HOST_KEY_DIR && name.starts_with(SSH_HOST_KEY_PREFIX) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Risk-lint a role's resolved file grants for escalation-capable / secret-leaking
+/// access. Returns WARNING findings (advisory — they inform but do not gate
+/// `compile --lint`, mirroring how the catalog's own `risk` labelling is advisory,
+/// not enforcement). A grant is flagged when:
+///
+/// - it is `rw` and overlaps a root-equivalent path (writable sudoers/ssh/PATH);
+/// - it touches (ro or rw) a secret path (shadow, private keys).
+///
+/// Overlap uses a path-component boundary in BOTH directions so a recursive grant
+/// on a parent of a secret (e.g. recursive `/etc` containing `/etc/shadow`) is
+/// caught, not just an exact match.
+fn file_grant_risk_findings(compiled: &CompiledRole) -> Vec<LintFinding> {
+    let mut out: Vec<LintFinding> = Vec::new();
+    for f in compiled.flat_file_grants() {
+        let path = &f.grant.path;
+
+        if f.grant.access == catalog::Access::Rw
+            && ROOT_EQUIVALENT_RW_PREFIXES
+                .iter()
+                .any(|p| path_boundary_overlaps(p, path))
+        {
+            out.push(LintFinding {
+                code: "rw-root-equivalent",
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "rw file grant on root-equivalent path {path} (perm {}) is escalation-capable",
+                    f.permission
+                ),
+            });
+        }
+
+        if path_is_secret(path) {
+            out.push(LintFinding {
+                code: "secret-path-access",
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "{} file grant on secret path {path} (perm {}) leaks credentials/keys",
+                    access_token(f.grant.access),
+                    f.permission
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// Whether a `%group` sudo command references a root-equivalent path: any argument
+/// token (everything after the leading binary) overlaps a root-equivalent prefix.
+/// This is the generic, reviewable escalation signal for a sudo grant — letting a
+/// member run e.g. `vi /etc/sudoers` or `tee /etc/ssh/sshd_config` as root is a
+/// path to root. We deliberately do NOT flag on the binary's own directory
+/// (almost every sudo command runs a `/usr/bin` or `/usr/sbin` binary — that is
+/// normal, not escalation); the root-equivalent PATH-dir prefixes describe WRITE
+/// access to files there, the `g:group` file-grant lint's concern, not which
+/// binary sudo runs. The match does not distinguish read/write/execute of the
+/// argument (a `cat /etc/sudoers` is flagged too) — for an advisory WARNING this
+/// conservatism is intended, so the wording says "references", not "edits".
+fn sudo_command_edits_root_equivalent(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .skip(1) // skip the leading binary token
+        .filter(|tok| tok.starts_with('/'))
+        .any(|tok| {
+            ROOT_EQUIVALENT_RW_PREFIXES
+                .iter()
+                .any(|p| path_boundary_overlaps(p, tok))
+        })
+}
+
+/// Risk-lint the resolved group bindings for escalation-capable grants that
+/// EVERY group member inherits (including effectively-nested LDAP members). A
+/// group grant widens the blast radius beyond a single account, so the same
+/// root-equivalent / secret-path risk classification used for `u:account` file
+/// grants ([`ROOT_EQUIVALENT_RW_PREFIXES`] / [`SECRET_PATH_PREFIXES`], matched by
+/// [`path_boundary_overlaps`]) is applied to `g:group` grants, and a root-
+/// equivalent `%group` sudo command is flagged too. Findings are advisory
+/// WARNINGs (like the account-side file-grant lint), each naming the group and
+/// the inheritance so the reviewer sees the expanded surface.
+///
+/// Pure (groups in, findings out) so it is unit-tested from hand-built
+/// `ResolvedGroup`s.
+fn group_grant_risk_findings(groups: &[model::ResolvedGroup]) -> Vec<LintFinding> {
+    let mut out: Vec<LintFinding> = Vec::new();
+    for g in groups {
+        let group = &g.name;
+
+        // `%group` sudo that edits a root-equivalent path: every member can use
+        // it to reach root, so it is an escalation surface for the whole group.
+        for cmd in &g.sudo_commands {
+            if sudo_command_edits_root_equivalent(cmd) {
+                out.push(LintFinding {
+                    code: "group-sudo-escalation",
+                    severity: LintSeverity::Warning,
+                    message: format!(
+                        "%{group} sudo grant `{cmd}` references a root-equivalent path (escalation-capable); \
+                         ALL members of group {group} (incl. effectively-nested LDAP) inherit it"
+                    ),
+                });
+            }
+        }
+
+        // `g:group` file grants, classified exactly like a `u:account` grant.
+        for grant in &g.file_grants {
+            let path = &grant.path;
+            if grant.access == catalog::Access::Rw
+                && ROOT_EQUIVALENT_RW_PREFIXES
+                    .iter()
+                    .any(|p| path_boundary_overlaps(p, path))
+            {
+                out.push(LintFinding {
+                    code: "group-rw-root-equivalent",
+                    severity: LintSeverity::Warning,
+                    message: format!(
+                        "g:{group} rw file grant on root-equivalent path {path} is escalation-capable; \
+                         ALL members of group {group} (incl. effectively-nested LDAP) inherit it"
+                    ),
+                });
+            }
+            if path_is_secret(path) {
+                out.push(LintFinding {
+                    code: "group-secret-path-access",
+                    severity: LintSeverity::Warning,
+                    message: format!(
+                        "g:{group} {} file grant on secret path {path} leaks credentials/keys; \
+                         ALL members of group {group} (incl. effectively-nested LDAP) inherit it",
+                        access_token(grant.access)
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Lint a successfully-compiled role plus its resolve warnings.
 ///
 /// Resolve-time ERRORs (unknown permission, cycle, namespace collision, lowered
@@ -1453,6 +2218,9 @@ pub fn lint_role(
             model::ResolveWarning::RawPrimitiveAlongsidePermissions { .. } => {
                 ("raw-primitive", w.to_string())
             }
+            model::ResolveWarning::GroupsPrimitiveOnGroupTarget { .. } => {
+                ("groups-on-group-target", w.to_string())
+            }
             model::ResolveWarning::Catalog(catalog::Warning::UnknownOsVersion { .. }) => {
                 ("unknown-os-version", w.to_string())
             }
@@ -1466,6 +2234,11 @@ pub fn lint_role(
             message,
         });
     }
+
+    // File-grant risk lint: rw on root-equivalent paths / access to secret paths.
+    // Advisory warnings (like the catalog's own risk labelling), placed after the
+    // resolve warnings and before l10n so the output order is stable.
+    out.extend(file_grant_risk_findings(compiled));
 
     // l10n completeness over the role's permission ids. Missing translation and
     // orphan translation are warnings (a missing/broken text must never break
@@ -1810,6 +2583,44 @@ mod tests {
                 risk,
                 groups,
                 sudo,
+                file_grants: Vec::new(),
+                limits: None,
+                limits_layer: None,
+                category_members: Vec::new(),
+                resolved_catalog_version: None,
+            },
+        }
+    }
+
+    /// A compiled permission carrying one resolved file grant.
+    fn compiled_perm_with_file(
+        id: &str,
+        path: &str,
+        access: crate::catalog::Access,
+        recursive: bool,
+        via: Option<&str>,
+    ) -> CompiledPermission {
+        let grant = crate::catalog::FileGrant {
+            path: path.to_owned(),
+            access,
+            recursive,
+        };
+        CompiledPermission {
+            resolved: ResolvedPermission {
+                id: id.to_owned(),
+                risk: None,
+                groups: vec![],
+                sudo: vec![],
+                file_grants: vec![crate::catalog::ResolvedFileGrant {
+                    path: path.to_owned(),
+                    access,
+                    recursive,
+                    shape: grant.shape(),
+                    sources: vec![crate::catalog::SourcedFileGrant {
+                        layer: "linux".to_owned(),
+                        via: via.map(str::to_owned),
+                    }],
+                }],
                 limits: None,
                 limits_layer: None,
                 category_members: Vec::new(),
@@ -1884,6 +2695,291 @@ mod tests {
         assert!(json.contains("\"via\":null"), "{json}");
         assert!(json.contains("\"nofile\":1024"), "{json}");
         assert!(json.contains("\"nproc\":null"), "{json}");
+    }
+
+    // ---- file-grant rendering (slice 5) ----
+
+    #[test]
+    fn render_compile_human_shows_file_grants_dir_and_file() {
+        use crate::catalog::Access;
+        let compiled = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![
+                // A rewrite-proof dir grant (open AclBackend) ...
+                compiled_perm_with_file("ssh-edit", "/etc/ssh", Access::Rw, true, None),
+                // ... and a per-file grant that needs a capable backend.
+                compiled_perm_with_file("hosts-edit", "/etc/hosts", Access::Ro, false, None),
+            ],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        let text = render_compile_human(&compiled);
+        assert!(
+            text.contains("/etc/ssh rw recursive via AclBackend (dir, rewrite-proof) [perm ssh-edit]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/etc/hosts ro via requires per-file-capable backend [perm hosts-edit]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_compile_json_emits_file_grants_array_escaped() {
+        use crate::catalog::Access;
+        let compiled = CompiledRole {
+            role: "oper".to_owned(),
+            // A path with a quote exercises the json_str escaper in the new array.
+            permissions: vec![compiled_perm_with_file(
+                "ssh-edit",
+                "/etc/s\"sh",
+                Access::Rw,
+                true,
+                None,
+            )],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        let json = render_compile_json(&compiled);
+        assert!(json.contains("\"file_grants\":["), "{json}");
+        assert!(json.contains(r#""path":"/etc/s\"sh""#), "{json}");
+        assert!(json.contains("\"access\":\"rw\""), "{json}");
+        assert!(json.contains("\"recursive\":true"), "{json}");
+        assert!(json.contains("\"shape\":\"dir\""), "{json}");
+        assert!(json.contains("\"backend\":\"AclBackend (dir, rewrite-proof)\""), "{json}");
+        assert!(json.contains("\"permission\":\"ssh-edit\""), "{json}");
+    }
+
+    #[test]
+    fn render_show_tree_shows_file_grant_with_backend() {
+        use crate::catalog::Access;
+        let compiled = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![compiled_perm_with_file("ssh-edit", "/etc/ssh", Access::Rw, true, None)],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        let l10n = FakeL10n::new();
+        let text = render_show_tree(&compiled, "en", &l10n);
+        assert!(
+            text.contains("file /etc/ssh rw recursive via AclBackend (dir, rewrite-proof)"),
+            "{text}"
+        );
+    }
+
+    // ---- risk lint (slice 5) ----
+
+    #[test]
+    fn risk_lint_flags_rw_on_root_equivalent() {
+        use crate::catalog::Access;
+        // rw on /etc/ssh is escalation-capable.
+        let compiled = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![compiled_perm_with_file("ssh-edit", "/etc/ssh", Access::Rw, true, None)],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        let findings = file_grant_risk_findings(&compiled);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "rw-root-equivalent")
+            .expect("rw-root-equivalent finding");
+        assert_eq!(f.severity, LintSeverity::Warning);
+        assert!(f.message.contains("/etc/ssh"));
+    }
+
+    #[test]
+    fn risk_lint_flags_secret_path_read() {
+        use crate::catalog::Access;
+        // A recursive grant on /etc that CONTAINS /etc/shadow is flagged even
+        // though its declared path is the broader directory (boundary both ways).
+        let compiled = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![compiled_perm_with_file("etc-read", "/etc", Access::Ro, true, None)],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        let findings = file_grant_risk_findings(&compiled);
+        assert!(
+            findings.iter().any(|f| f.code == "secret-path-access"),
+            "recursive /etc grant must flag the contained secret: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn risk_lint_flags_ssh_host_key_read() {
+        use crate::catalog::Access;
+        // A direct (non-recursive) ro grant on an SSH host PRIVATE key must flag:
+        // the key is a `ssh_host_*` file in /etc/ssh, which the component-boundary
+        // matcher alone misses (it shares its dir with the public sshd_config), so
+        // the basename rule in `path_is_secret` must catch it.
+        let compiled = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![compiled_perm_with_file(
+                "host-key-read",
+                "/etc/ssh/ssh_host_rsa_key",
+                Access::Ro,
+                false,
+                None,
+            )],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        let findings = file_grant_risk_findings(&compiled);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "secret-path-access")
+            .expect("ro grant on an ssh host key must flag secret-path-access");
+        assert_eq!(f.severity, LintSeverity::Warning);
+        assert!(f.message.contains("/etc/ssh/ssh_host_rsa_key"));
+        // A NON-secret file in the same directory (the public config) must NOT flag.
+        let public = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![compiled_perm_with_file(
+                "sshd-config-read",
+                "/etc/ssh/sshd_config",
+                Access::Ro,
+                false,
+                None,
+            )],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        assert!(
+            !file_grant_risk_findings(&public)
+                .iter()
+                .any(|f| f.code == "secret-path-access"),
+            "the public sshd_config in /etc/ssh must not be flagged secret"
+        );
+    }
+
+    #[test]
+    fn risk_lint_clean_grant_no_finding() {
+        use crate::catalog::Access;
+        // rw on an app config dir that is neither root-equivalent nor a secret.
+        let compiled = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![compiled_perm_with_file("app-edit", "/etc/myapp", Access::Rw, true, None)],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        assert!(file_grant_risk_findings(&compiled).is_empty());
+    }
+
+    // ---- group-grant escalation lint (slice 6) ----
+
+    /// A resolved group carrying the given sudo commands and file grants (the
+    /// fields the group lint inspects). Other fields are defaults.
+    fn resolved_group(
+        name: &str,
+        sudo: &[&str],
+        file_grants: Vec<catalog::ResolvedFileGrant>,
+    ) -> model::ResolvedGroup {
+        model::ResolvedGroup {
+            name: name.to_owned(),
+            gid: None,
+            provenance: model::Provenance::Created,
+            members: Vec::new(),
+            sudo_commands: sudo.iter().map(|s| s.to_string()).collect(),
+            file_grants,
+            limits: Limits::default(),
+            bound_roles: Vec::new(),
+        }
+    }
+
+    fn rfg(path: &str, access: catalog::Access, recursive: bool) -> catalog::ResolvedFileGrant {
+        catalog::ResolvedFileGrant {
+            path: path.to_owned(),
+            access,
+            recursive,
+            shape: if recursive { catalog::Shape::Dir } else { catalog::Shape::File },
+            sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn group_lint_flags_rw_root_equivalent_file_grant() {
+        use crate::catalog::Access;
+        let groups = vec![resolved_group("netops", &[], vec![rfg("/etc/ssh", Access::Rw, true)])];
+        let findings = group_grant_risk_findings(&groups);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "group-rw-root-equivalent")
+            .expect("group root-equivalent file finding");
+        assert_eq!(f.severity, LintSeverity::Warning);
+        // The note names the group and the inheritance (all members).
+        assert!(f.message.contains("netops"));
+        assert!(f.message.to_lowercase().contains("members"));
+    }
+
+    #[test]
+    fn group_lint_flags_root_equivalent_sudo() {
+        // A `%group` sudo command that edits a root-equivalent path (here a
+        // sudoers fragment) is escalation surface inherited by every member.
+        let groups = vec![resolved_group("netops", &["/usr/bin/tee /etc/sudoers.d/x"], vec![])];
+        let findings = group_grant_risk_findings(&groups);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "group-sudo-escalation")
+            .expect("group sudo escalation finding");
+        assert_eq!(f.severity, LintSeverity::Warning);
+        assert!(f.message.contains("netops"));
+    }
+
+    #[test]
+    fn group_lint_flags_secret_path_grant() {
+        use crate::catalog::Access;
+        // A recursive grant on /etc that contains /etc/shadow is flagged (boundary
+        // both ways), exactly as for an account grant.
+        let groups = vec![resolved_group("auditors", &[], vec![rfg("/etc", Access::Ro, true)])];
+        let findings = group_grant_risk_findings(&groups);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "group-secret-path-access")
+            .expect("group secret-path finding");
+        assert_eq!(f.severity, LintSeverity::Warning);
+        assert!(f.message.contains("auditors"));
+    }
+
+    #[test]
+    fn group_lint_flags_ssh_host_key_grant() {
+        use crate::catalog::Access;
+        // A direct ro grant on an SSH host private key bound to a group must flag
+        // (same basename rule as the account lint — every member would read the key).
+        let groups = vec![resolved_group(
+            "keyops",
+            &[],
+            vec![rfg("/etc/ssh/ssh_host_ed25519_key", Access::Ro, false)],
+        )];
+        let findings = group_grant_risk_findings(&groups);
+        let f = findings
+            .iter()
+            .find(|f| f.code == "group-secret-path-access")
+            .expect("group grant on an ssh host key must flag secret-path-access");
+        assert_eq!(f.severity, LintSeverity::Warning);
+        assert!(f.message.contains("keyops"));
+        assert!(f.message.contains("/etc/ssh/ssh_host_ed25519_key"));
+    }
+
+    #[test]
+    fn group_lint_clean_group_has_no_finding() {
+        use crate::catalog::Access;
+        // A group with a benign app-dir grant and a non-root-equivalent sudo
+        // command produces no escalation finding.
+        let groups = vec![resolved_group(
+            "appops",
+            &["/usr/bin/systemctl restart atm-app"],
+            vec![rfg("/etc/myapp", Access::Rw, true)],
+        )];
+        assert!(group_grant_risk_findings(&groups).is_empty());
     }
 
     /// Write a role-store slice + declaration referencing it, plus a catalog
@@ -2120,6 +3216,8 @@ mod tests {
                     covered: true,
                     suggested_permission: None,
                     intentional_exclusion: None,
+                    backend_limited: None,
+                    coverage_note: None,
                 },
                 ObjectCoverage {
                     object: cov_obj(
@@ -2130,12 +3228,46 @@ mod tests {
                     covered: false,
                     suggested_permission: Some("luks-admin".to_owned()),
                     intentional_exclusion: None,
+                    backend_limited: None,
+                    coverage_note: None,
                 },
                 ObjectCoverage {
                     object: cov_obj(SurfaceClass::Group, "astra-admin", Provenance::Vendor),
                     covered: false,
                     suggested_permission: None,
                     intentional_exclusion: Some("admin-by-design".to_owned()),
+                    backend_limited: None,
+                    coverage_note: None,
+                },
+                // A config object covered by a file grant carries the backend note.
+                ObjectCoverage {
+                    object: cov_obj(
+                        SurfaceClass::Config,
+                        "/etc/ssh/sshd_config",
+                        Provenance::Vendor,
+                    ),
+                    covered: true,
+                    suggested_permission: None,
+                    intentional_exclusion: None,
+                    backend_limited: None,
+                    coverage_note: Some("rw via AclBackend (dir)".to_owned()),
+                },
+                // A backend-limited config: a single file in /etc the dir-only
+                // backend can't cover without an over-broad grant.
+                ObjectCoverage {
+                    object: cov_obj(
+                        SurfaceClass::Config,
+                        "/etc/login.defs",
+                        Provenance::Vendor,
+                    ),
+                    covered: false,
+                    suggested_permission: None,
+                    intentional_exclusion: None,
+                    backend_limited: Some(
+                        "single file in non-grantable parent; requires per-file-capable backend"
+                            .to_owned(),
+                    ),
+                    coverage_note: None,
                 },
             ],
             setuid_inventory: vec![],
@@ -2238,6 +3370,25 @@ mod tests {
             text.contains("astra-admin") && text.contains("admin-by-design"),
             "{text}"
         );
+        // A config object covered by a file grant lists its backend note.
+        assert!(
+            text.contains("covered via file grants")
+                && text.contains("/etc/ssh/sshd_config")
+                && text.contains("rw via AclBackend (dir)"),
+            "{text}"
+        );
+        // Backend-limited section present, with the bare /etc file and its reason.
+        assert!(
+            text.contains("backend-limited (requires per-file backend)")
+                && text.contains("/etc/login.defs")
+                && text.contains("requires per-file-capable backend"),
+            "{text}"
+        );
+        // A backend-limited object must NOT appear in the uncovered gap section.
+        assert!(
+            !text.contains("[config] /etc/login.defs →"),
+            "backend-limited must not be a gap with a suggestion arrow: {text}"
+        );
         // Anomaly section present.
         assert!(text.contains("anomalies") && text.contains("/opt/x/flasher"), "{text}");
         // The covered binary is NOT listed in the uncovered section (it appears
@@ -2261,6 +3412,15 @@ mod tests {
         assert!(json.contains("\"catalog_version\":\"2026.06\""), "{json}");
         assert!(json.contains("\"os_target\":\"linux-debian-12\""), "{json}");
         assert!(json.contains("\"anomalies\":["), "{json}");
+        // The config object's coverage note is emitted; non-config objects carry null.
+        assert!(json.contains("\"coverage_note\":\"rw via AclBackend (dir)\""), "{json}");
+        assert!(json.contains("\"coverage_note\":null"), "{json}");
+        // The backend-limited config carries its reason; others carry null.
+        assert!(
+            json.contains("\"backend_limited\":\"single file in non-grantable parent; requires per-file-capable backend\""),
+            "{json}"
+        );
+        assert!(json.contains("\"backend_limited\":null"), "{json}");
     }
 
     #[test]
@@ -2291,6 +3451,274 @@ mod tests {
         assert_eq!(parse_classes("unit,unit").unwrap(), vec![SurfaceClass::Unit]);
         // Unknown token is a hard error (fail closed).
         assert!(parse_classes("sudo_bin,bogus").is_err());
+    }
+
+    // ---- catalog which-grants (reverse lookup) ----
+
+    fn sudo_match(perm: &str, detail: &str) -> coverage::GrantMatch {
+        coverage::GrantMatch {
+            permission: perm.to_owned(),
+            target: coverage::GrantTarget::Account(perm.to_owned()),
+            kind: coverage::GrantKind::Sudo,
+            detail: detail.to_owned(),
+            access: None,
+            recursive: None,
+            backend: None,
+            risk: Some(Risk::EscalationCapable),
+        }
+    }
+
+    fn file_match(perm: &str, path: &str) -> coverage::GrantMatch {
+        coverage::GrantMatch {
+            permission: perm.to_owned(),
+            target: coverage::GrantTarget::Account(perm.to_owned()),
+            kind: coverage::GrantKind::File,
+            detail: path.to_owned(),
+            access: Some(crate::catalog::Access::Rw),
+            recursive: Some(true),
+            backend: Some("AclBackend".to_owned()),
+            risk: Some(Risk::Contained),
+        }
+    }
+
+    /// A group-target sudo match — reached through `%group` sudoers; `group` is
+    /// the inheriting group.
+    fn group_sudo_match(group: &str, detail: &str) -> coverage::GrantMatch {
+        coverage::GrantMatch {
+            permission: group.to_owned(),
+            target: coverage::GrantTarget::Group(group.to_owned()),
+            kind: coverage::GrantKind::Sudo,
+            detail: detail.to_owned(),
+            access: None,
+            recursive: None,
+            backend: None,
+            risk: None,
+        }
+    }
+
+    /// A group-target file match — reached through a `g:group` ACL.
+    fn group_file_match(group: &str, path: &str) -> coverage::GrantMatch {
+        coverage::GrantMatch {
+            permission: group.to_owned(),
+            target: coverage::GrantTarget::Group(group.to_owned()),
+            kind: coverage::GrantKind::File,
+            detail: path.to_owned(),
+            access: Some(crate::catalog::Access::Rw),
+            recursive: Some(true),
+            backend: Some("AclBackend".to_owned()),
+            risk: None,
+        }
+    }
+
+    #[test]
+    fn render_which_grants_human_groups_matches() {
+        let matches = vec![
+            sudo_match("network-admin", "/usr/sbin/ip link set"),
+            file_match("ssh-edit", "/etc/ssh"),
+        ];
+        let text = render_which_grants_human("/usr/sbin/ip", &matches);
+        assert!(text.contains("/usr/sbin/ip granted by:"), "{text}");
+        assert!(
+            text.contains("network-admin — via sudo: /usr/sbin/ip link set [escalation-capable]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ssh-edit — via file (rw): /etc/ssh, recursive (AclBackend) [contained]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_which_grants_human_group_matches() {
+        // Group matches render the group mechanism (%group sudoers / g:group ACL)
+        // and name the inheriting group; account output is unchanged (covered by
+        // render_which_grants_human_groups_matches above).
+        let matches = vec![
+            group_sudo_match("netops", "/usr/sbin/ip link set"),
+            group_file_match("netops", "/etc/net"),
+        ];
+        let text = render_which_grants_human("/usr/sbin/ip", &matches);
+        assert!(
+            text.contains("netops — via %group sudoers (netops): /usr/sbin/ip link set"),
+            "{text}"
+        );
+        assert!(
+            text.contains("netops — via g:group ACL (netops) (rw): /etc/net, recursive (AclBackend)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_which_grants_json_distinguishes_group_target() {
+        let matches = vec![
+            sudo_match("network-admin", "/usr/sbin/ip link set"),
+            group_sudo_match("netops", "/usr/sbin/ip route"),
+        ];
+        let json = render_which_grants_json(&matches);
+        // Account match carries target=account, group=null.
+        assert!(json.contains("\"target\":\"account\""), "{json}");
+        // Group match carries target=group and the group name.
+        assert!(json.contains("\"target\":\"group\""), "{json}");
+        assert!(json.contains("\"group\":\"netops\""), "{json}");
+        assert!(json.contains("\"group\":null"), "{json}");
+    }
+
+    #[test]
+    fn render_which_grants_human_no_match_message() {
+        let text = render_which_grants_human("/usr/bin/nope", &[]);
+        assert_eq!(text, "no permission grants access to /usr/bin/nope\n");
+    }
+
+    #[test]
+    fn render_which_grants_json_shape() {
+        let matches = vec![
+            sudo_match("network-admin", "/usr/sbin/ip link set"),
+            file_match("ssh-edit", "/etc/ssh"),
+        ];
+        let json = render_which_grants_json(&matches);
+        assert!(json.starts_with('['), "{json}");
+        assert!(json.contains("\"permission\":\"network-admin\""), "{json}");
+        assert!(json.contains("\"kind\":\"sudo\""), "{json}");
+        assert!(json.contains("\"detail\":\"/usr/sbin/ip link set\""), "{json}");
+        // A sudo match carries null access/recursive/backend.
+        assert!(json.contains("\"access\":null"), "{json}");
+        assert!(json.contains("\"recursive\":null"), "{json}");
+        // A file match carries concrete access/recursive/backend.
+        assert!(json.contains("\"kind\":\"file\""), "{json}");
+        assert!(json.contains("\"access\":\"rw\""), "{json}");
+        assert!(json.contains("\"recursive\":true"), "{json}");
+        assert!(json.contains("\"backend\":\"AclBackend\""), "{json}");
+        assert!(json.contains("\"risk\":\"contained\""), "{json}");
+    }
+
+    #[test]
+    fn render_which_grants_json_empty_is_empty_array() {
+        assert_eq!(render_which_grants_json(&[]), "[]\n");
+    }
+
+    #[test]
+    fn build_grant_sources_skips_templated_and_unresolvable() {
+        // One concrete sudo perm, one templated (skipped because its {unit} is
+        // unfilled with no role instance). build_grant_sources keeps only concrete.
+        let tmp = tempfile::tempdir().unwrap();
+        let (_decl, catalog_root) = compile_fixture(
+            tmp.path(),
+            "[payload]\npermissions = []\n",
+            &[
+                ("linux", "network-admin", "id = \"network-admin\"\nsudo = [\"/usr/sbin/ip\"]\n"),
+                (
+                    "linux",
+                    "service-restart",
+                    "id = \"service-restart\"\nsudo = [\"/usr/bin/systemctl restart {unit}\"]\n",
+                ),
+            ],
+        );
+        let catalog = LiveCatalog::new(vec![catalog_root]);
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let ctx = ResolveCtx::default();
+        let sources = build_grant_sources(&catalog, &os, &ctx).unwrap();
+        // network-admin contributes a concrete command; service-restart's only
+        // command is templated and dropped, so it contributes nothing and is omitted.
+        assert!(sources.iter().any(|s| s.id == "network-admin"
+            && s.sudo.iter().any(|c| c == "/usr/sbin/ip")));
+        assert!(
+            !sources.iter().any(|s| s.id == "service-restart"),
+            "a perm whose only grant is templated must be omitted: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn build_group_grant_sources_emits_group_targets() {
+        // A declaration binding a role to a group yields a Group-target source
+        // carrying the group's sudo + file grants; a group with no grants is
+        // omitted.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("roles");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("netops.toml"),
+            "role = \"netops\"\nversion = 1\nos = \"linux\"\nname = \"netops\"\nlevel = 5\n[payload]\npermissions = [\"net-admin\"]\n",
+        )
+        .unwrap();
+        let catalog_root = tmp.path().join("permissions");
+        std::fs::create_dir_all(catalog_root.join("linux")).unwrap();
+        std::fs::write(
+            catalog_root.join("linux").join("net-admin.toml"),
+            "id = \"net-admin\"\nsudo = [\"/usr/sbin/ip\"]\n\n[[file]]\npath = \"/etc/net\"\naccess = \"rw\"\nrecursive = true\n",
+        )
+        .unwrap();
+        let decl_text = format!(
+            "version = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n\
+             [[group]]\nname = \"netops\"\ngid = 8020\n\
+             [[group]]\nname = \"empty-grp\"\ngid = 8021\n\
+             [[role_group]]\nrole = \"netops\"\ngroup = \"netops\"\n",
+            store.display()
+        );
+        let decl = Declaration::parse(&decl_text).unwrap();
+        let catalog = LiveCatalog::new(vec![catalog_root]);
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let ctx = ResolveCtx::default();
+        let inputs = CompileInputs { catalog: &catalog, os: &os, ctx: &ctx };
+
+        let sources = build_group_grant_sources(&decl, &inputs).unwrap();
+        // The bound group is a Group-target source with the role's grants.
+        let g = sources
+            .iter()
+            .find(|s| s.id == "netops")
+            .expect("group source for bound group");
+        assert_eq!(g.target, coverage::GrantTarget::Group("netops".to_owned()));
+        assert!(g.sudo.iter().any(|c| c == "/usr/sbin/ip"));
+        assert!(g.file_grants.iter().any(|fg| fg.path == "/etc/net"));
+        // The grantless group is omitted.
+        assert!(
+            !sources.iter().any(|s| s.id == "empty-grp"),
+            "a group with no grants must be omitted: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn run_which_grants_finds_match_and_exits_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_decl, catalog_root) = compile_fixture(
+            tmp.path(),
+            "[payload]\npermissions = []\n",
+            &[(
+                "linux",
+                "network-admin",
+                "id = \"network-admin\"\nsudo = [\"/usr/sbin/ip link\"]\n",
+            )],
+        );
+        let code = run_which_grants(WhichGrantsOpts {
+            arg: "/usr/sbin/ip".to_owned(),
+            json: false,
+            os_target: Some("linux-debian".to_owned()),
+            catalog_roots: vec![catalog_root],
+            declaration: None,
+        });
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn run_which_grants_no_match_still_exits_zero() {
+        // Even when nothing grants the arg, the query succeeds (exit 0).
+        let tmp = tempfile::tempdir().unwrap();
+        let (_decl, catalog_root) = compile_fixture(
+            tmp.path(),
+            "[payload]\npermissions = []\n",
+            &[(
+                "linux",
+                "network-admin",
+                "id = \"network-admin\"\nsudo = [\"/usr/sbin/ip\"]\n",
+            )],
+        );
+        let code = run_which_grants(WhichGrantsOpts {
+            arg: "/usr/bin/nonexistent".to_owned(),
+            json: true,
+            os_target: Some("linux-debian".to_owned()),
+            catalog_roots: vec![catalog_root],
+            declaration: None,
+        });
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }
 
     #[test]

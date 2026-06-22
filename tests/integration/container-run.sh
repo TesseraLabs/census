@@ -16,7 +16,7 @@ exec docker run --rm \
   "$IMAGE" \
   bash -c '
     set -e
-    apt-get update -qq && apt-get install -y -qq sudo openssl >/dev/null
+    apt-get update -qq && apt-get install -y -qq sudo openssl acl >/dev/null
     # /work is read-only (host crate); copy out so cargo can write nothing into it
     # (build target is redirected via CARGO_TARGET_DIR in the script).
     bash /work/tests/integration/container-apply.sh

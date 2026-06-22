@@ -91,6 +91,47 @@ fn compile_json_emits_machine_shape() {
 }
 
 #[test]
+fn compile_renders_file_grants_human_and_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (decl, catalog_root) = fixtures(
+        tmp.path(),
+        "[payload]\npermissions = [\"ssh-edit\"]\n",
+        "id = \"ssh-edit\"\nrisk = \"escalation-capable\"\n[[file]]\npath = \"/etc/ssh\"\naccess = \"rw\"\nrecursive = true\n",
+    );
+
+    // Human view shows a files: section with the backend/guarantee.
+    let out = Command::new(env!("CARGO_BIN_EXE_census"))
+        .args(["compile", "oper", "--declaration"])
+        .arg(&decl)
+        .arg("--catalog-dir")
+        .arg(&catalog_root)
+        .args(["--os-target", "linux-debian-12"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("/etc/ssh rw recursive via AclBackend (dir, rewrite-proof)"),
+        "expected files section: {stdout}"
+    );
+
+    // JSON view emits a file_grants array.
+    let out_json = Command::new(env!("CARGO_BIN_EXE_census"))
+        .args(["compile", "oper", "--json", "--declaration"])
+        .arg(&decl)
+        .arg("--catalog-dir")
+        .arg(&catalog_root)
+        .args(["--os-target", "linux-debian-12"])
+        .output()
+        .unwrap();
+    assert!(out_json.status.success());
+    let json = String::from_utf8(out_json.stdout).unwrap();
+    assert!(json.contains("\"file_grants\":["), "{json}");
+    assert!(json.contains("\"path\":\"/etc/ssh\""), "{json}");
+    assert!(json.contains("\"shape\":\"dir\""), "{json}");
+}
+
+#[test]
 fn compile_lint_unknown_permission_exits_nonzero() {
     let tmp = tempfile::tempdir().unwrap();
     let (decl, catalog_root) = fixtures(

@@ -2,4 +2,15 @@ id       = "network-admin"
 risk     = "escalation-capable"
 category = "network"
 groups   = ["netdev"]
-sudo     = ["/usr/sbin/ip", "/usr/bin/nmcli"]
+sudo     = [
+    "/usr/sbin/ip",
+    "/usr/sbin/tc",
+    "/usr/sbin/bridge",
+    "/usr/sbin/ethtool",
+    "/usr/bin/nmcli",
+    "/usr/sbin/dhclient",
+    "/usr/sbin/pppd",
+    "/usr/sbin/mii-tool",
+    "/usr/sbin/plipconfig",
+    "/usr/sbin/usb_modeswitch",
+]

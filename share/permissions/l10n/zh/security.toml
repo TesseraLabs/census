@@ -22,3 +22,18 @@ risk_note = "setenforce 0 会在全主机禁用强制访问控制。"
 title     = "Secure Boot 密钥管理"
 summary   = "管理 Secure Boot MOK 登记（mokutil）。"
 risk_note = "登记密钥可使未签名/攻击者的代码通过 Secure Boot 校验。"
+
+[sandbox-operate]
+title     = "沙箱操作"
+summary   = "启动 firejail SUID 沙箱以限制进程（firejail 组）。"
+risk_note = "受限：限制进程而非扩大主机权限。"
+
+[astra-mac-control]
+title     = "Astra 强制访问控制"
+summary   = "切换 Astra SE 加固开关：解释器宏锁、安全监视器、ptrace 锁。"
+risk_note = "在全主机切换强制保护开关；放松任一项都会移除限制屏障。"
+
+[astra-digsig-control]
+title     = "Astra 封闭软件环境（digsig）控制"
+summary   = "管理 ELF 完整性控制模式与 digsig 信任树（astra-digsig-control、/etc/digsig）。"
+risk_note = "向 /etc/digsig/keys 添加密钥或切换模式即决定封闭环境下可执行的内容——等同 root 权限。"

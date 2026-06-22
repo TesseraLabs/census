@@ -2,3 +2,10 @@ id       = "udev-config"
 risk     = "escalation-capable"
 category = "security"
 sudo     = ["/usr/bin/udevadm"]
+
+# udev rules drop-in directory. A rule runs as root on device events
+# (escalation-capable).
+[[file]]
+path      = "/etc/udev/rules.d"
+access    = "rw"
+recursive = true

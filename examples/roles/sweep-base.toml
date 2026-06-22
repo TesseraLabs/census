@@ -1,0 +1,31 @@
+role    = "sweep-base"
+version = 1
+os      = "linux"
+name    = "Coverage sweep (cross-distro lint exerciser)"
+level   = 9
+
+[payload]
+# Not a realistic role — it references the cross-distro permissions touched by
+# the Astra-1.8.4 coverage expansion so `compile --lint` exercises the new sudo
+# paths and group expansions on every target. Astra-only permissions live in
+# coverage-sweep-astra (they do not resolve on debian/ubuntu).
+permissions = [
+    "user-admin",
+    "network-admin",
+    "firewall-admin",
+    "disk-admin",
+    "driver-config",
+    "service-admin",
+    "logind-config",
+    "print-admin",
+    "power-control",
+    "vm-operate",
+    "audio-access",
+    "device-video",
+    "device-usb",
+    "vpn-admin",
+    "polkit-config",
+    "console-access",
+    "audit-config",
+    "sandbox-operate",
+]

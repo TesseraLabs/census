@@ -1,5 +1,5 @@
 id       = "device-usb"
 risk     = "contained"
 category = "device"
-groups   = ["plugdev"]
+groups   = ["plugdev", "scanner"]
 sudo     = ["/usr/bin/udisksctl"]

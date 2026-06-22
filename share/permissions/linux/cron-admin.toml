@@ -2,3 +2,10 @@ id       = "cron-admin"
 risk     = "escalation-capable"
 category = "os-config"
 sudo     = ["/usr/bin/crontab"]
+
+# System cron drop-in directory. Jobs run as root (escalation-capable). The bare
+# /etc/crontab file is intentionally not granted (free backend = dirs only).
+[[file]]
+path      = "/etc/cron.d"
+access    = "rw"
+recursive = true
