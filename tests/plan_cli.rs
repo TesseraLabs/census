@@ -32,6 +32,10 @@ fn plan_reports_create_for_new_role() {
         .arg(&decl)
         .arg("--managed")
         .arg(&managed)
+        // Pin the OS target so the test does not depend on the host's
+        // /etc/os-release (the role uses raw groups, so the catalog is unused;
+        // we only need a valid target for the resolve path).
+        .args(["--os-target", "linux-debian-12"])
         .output()
         .unwrap();
 
@@ -60,6 +64,7 @@ fn plan_fails_on_missing_role_slice() {
         .arg(&decl)
         .arg("--managed")
         .arg(&managed)
+        .args(["--os-target", "linux-debian-12"])
         .output()
         .unwrap();
 

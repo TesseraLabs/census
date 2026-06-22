@@ -1,0 +1,4 @@
+id       = "perf-trace"
+risk     = "escalation-capable"
+category = "observability"
+sudo     = ["/usr/bin/strace", "/usr/bin/perf", "/usr/sbin/bpftrace", "/usr/bin/ltrace"]

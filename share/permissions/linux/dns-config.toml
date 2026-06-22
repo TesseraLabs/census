@@ -1,0 +1,4 @@
+id       = "dns-config"
+risk     = "escalation-capable"
+category = "network"
+sudo     = ["/usr/bin/resolvectl"]

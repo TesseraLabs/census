@@ -1,0 +1,4 @@
+id       = "repo-config"
+risk     = "escalation-capable"
+category = "packages"
+sudo     = ["/usr/bin/apt-get", "/usr/bin/apt"]

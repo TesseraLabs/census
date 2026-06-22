@@ -1,0 +1,5 @@
+id       = "backup-operator"
+risk     = "escalation-capable"
+category = "storage"
+groups   = ["backup"]
+sudo     = ["/usr/bin/restic", "/usr/bin/borg", "/usr/bin/rsync", "/usr/bin/tar"]

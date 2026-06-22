@@ -1,0 +1,5 @@
+id       = "docker.admin"
+risk     = "escalation-capable"
+category = "container"
+includes = ["docker.ps", "docker.compose"]
+sudo     = ["/usr/bin/systemctl restart docker"]

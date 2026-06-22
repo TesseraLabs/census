@@ -1,0 +1,4 @@
+id       = "quota-admin"
+risk     = "contained"
+category = "storage"
+sudo     = ["/usr/sbin/setquota", "/usr/sbin/repquota", "/usr/sbin/quotacheck"]

@@ -1,0 +1,24 @@
+[apparmor-admin]
+title     = "Администрирование AppArmor"
+summary   = "Загрузка и переключение профилей AppArmor (aa-enforce, aa-complain, apparmor_parser)."
+risk_note = "Перевод профиля в complain/disabled снимает барьер изоляции вокруг службы."
+
+[ca-trust-admin]
+title     = "Администрирование доверия CA"
+summary   = "Обновление системного хранилища доверенных CA (update-ca-certificates)."
+risk_note = "Добавление CA делает поддельные TLS-сертификаты доверенными на всём хосте — включатель MITM."
+
+[udev-config]
+title     = "Настройка udev"
+summary   = "Управление правилами устройств и перезагрузка udev (udevadm)."
+risk_note = "Правило udev может запускать команду от root по событиям устройства — вектор персистентности/эскалации."
+
+[selinux-admin]
+title     = "Администрирование SELinux"
+summary   = "Управление режимом и политикой SELinux (setenforce, semanage, setsebool)."
+risk_note = "setenforce 0 отключает мандатный контроль доступа на всём хосте."
+
+[firmware-secureboot]
+title     = "Управление ключами Secure Boot"
+summary   = "Управление привязкой MOK для Secure Boot (mokutil)."
+risk_note = "Привязка ключа позволяет неподписанному/вредоносному коду пройти проверку Secure Boot."

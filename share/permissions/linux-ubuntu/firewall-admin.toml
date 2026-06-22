@@ -1,0 +1,4 @@
+id        = "firewall-admin"
+# Ubuntu ships ufw as the default firewall front-end; append it to the family
+# base (nft/iptables), which Ubuntu still carries underneath.
+sudo.append = ["/usr/sbin/ufw"]

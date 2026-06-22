@@ -1,0 +1,4 @@
+id       = "ca-trust-admin"
+risk     = "escalation-capable"
+category = "security"
+sudo     = ["/usr/sbin/update-ca-certificates"]

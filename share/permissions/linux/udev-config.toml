@@ -1,0 +1,4 @@
+id       = "udev-config"
+risk     = "escalation-capable"
+category = "security"
+sudo     = ["/usr/bin/udevadm"]

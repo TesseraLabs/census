@@ -1,0 +1,4 @@
+id       = "host-hardening"
+risk     = "escalation-capable"
+category = "security"
+includes = ["apparmor-admin", "audit-config", "kernel-tune", "pam-config", "ca-trust-admin", "udev-config"]

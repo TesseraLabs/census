@@ -1,0 +1,4 @@
+id       = "journald-config"
+risk     = "contained"
+category = "observability"
+sudo     = ["/usr/bin/systemctl restart systemd-journald"]

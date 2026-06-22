@@ -1,0 +1,34 @@
+[network-config]
+title     = "Конфигурация сети (бандл)"
+summary   = "Диагностика + администрирование интерфейсов, межсетевого экрана, DNS и маршрутизации."
+risk_note = "Escalation-capable: наследует root-путь network-admin через `ip netns exec`."
+
+[storage-admin]
+title     = "Администрирование хранилища (бандл)"
+summary   = "Администрирование монтирования, разметки, swap, fstab, квот и LUKS."
+risk_note = "Escalation-capable и деструктивно: полный контроль над блочными устройствами и монтированиями."
+
+[observability]
+title     = "Наблюдаемость (бандл)"
+summary   = "Чтение/администрирование логов, journald, осмотр процессов, метрики и трассировка."
+risk_note = "Escalation-capable: наследует perf-trace (ptrace) и log-admin (стирание журнала)."
+
+[host-hardening]
+title     = "Усиление хоста (бандл)"
+summary   = "Администрирование AppArmor, аудита, sysctl, PAM, доверия CA и udev."
+risk_note = "Escalation-capable: каждый член может ослабить механизм безопасности хоста."
+
+[boot-admin]
+title     = "Администрирование загрузки (бандл)"
+summary   = "Администрирование загрузчика, cmdline ядра, initramfs, TPM и LUKS."
+risk_note = "Escalation-capable: управляет тем, что исполняется до и во время загрузки."
+
+[device-operator]
+title     = "Оператор устройств (бандл)"
+summary   = "Доступ к последовательным, USB, шинным и видеоустройствам плюс настройка udev."
+risk_note = "Escalation-capable через включённый udev-config (команда от root по событиям устройства)."
+
+[peripheral-operator]
+title     = "Оператор периферии (бандл)"
+summary   = "Доступ к печати, звуку, дисплею, ИБП и периферии банкомата."
+risk_note = "Contained: все члены — доступ к устройствам/периферии, без роста привилегий хоста."

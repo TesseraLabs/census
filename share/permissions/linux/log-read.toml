@@ -1,0 +1,4 @@
+id       = "log-read"
+risk     = "contained"
+category = "observability"
+groups   = ["adm", "systemd-journal"]

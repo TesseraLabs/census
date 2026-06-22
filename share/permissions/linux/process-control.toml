@@ -1,0 +1,4 @@
+id       = "process-control"
+risk     = "escalation-capable"
+category = "observability"
+sudo     = ["/usr/bin/kill", "/usr/bin/renice", "/usr/bin/pkill"]

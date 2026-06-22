@@ -1,0 +1,16 @@
+role    = "deviceop"
+version = 1
+os      = "linux"
+name    = "Device & peripheral operator"
+level   = 3
+
+[payload]
+# Mostly contained device/peripheral capabilities; exercises group-only
+# permissions and the astra serial/uucp + admin/console deltas when resolved on
+# the astra target.
+permissions = [
+    "device-operator",
+    "peripheral-operator",
+    "console-access",
+    "hardware-inventory",
+]

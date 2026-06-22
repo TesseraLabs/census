@@ -1,0 +1,9 @@
+[container-operate]
+title     = "Работа с контейнерами"
+summary   = "Запуск rootless-контейнеров и старт/стоп существующих (podman)."
+risk_note = "Contained: rootless podman без root-сокета — без root на хосте."
+
+[vm-operate]
+title     = "Работа с ВМ"
+summary   = "Старт и остановка существующих ВМ (группа libvirt, virsh)."
+risk_note = "Contained: управление жизненным циклом ВМ без правки определений."

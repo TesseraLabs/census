@@ -46,6 +46,11 @@ pub enum ApplyError {
     /// Writing the managed registry (last, atomic) failed after success.
     #[error("registry write failed: {0}")]
     Registry(String),
+    /// Resolving the declaration (role-store read + permission expansion against
+    /// the catalog) failed. Surfaced BEFORE any snapshot/mutation — an
+    /// unresolvable permission (unknown id, cycle) must fail closed.
+    #[error("resolve failed: {0}")]
+    Resolve(String),
     /// Group planning failed (GID-pin conflict or managed-group GID drift). This
     /// is surfaced BEFORE any snapshot/mutation — Census never renumbers.
     #[error("group plan rejected: {0}")]
@@ -121,6 +126,10 @@ pub struct ApplyInputs<'a> {
     /// The registry path `session_source` consults — for a log line only (so the
     /// operator sees which file was read).
     pub sessions_file: PathBuf,
+    /// Permission-expansion inputs (catalog source + OS target + resolve ctx).
+    /// Threaded into [`crate::model::resolve`] so a role's `permissions` expand
+    /// into concrete primitives before the plan is built.
+    pub compile: crate::model::CompileInputs<'a>,
 }
 
 /// Outcome of a successful apply: the new managed registry contents and the log
@@ -175,9 +184,17 @@ pub fn run(
         None => return Err(ApplyError::NotTrusted(decision.reason().to_owned())),
     };
 
-    // 2-3. Resolve targets (slice-1).
-    let targets = crate::model::resolve(inputs.declaration)
-        .map_err(|e| ApplyError::Registry(e.to_string()))?;
+    // 2-3. Resolve targets, expanding each role's permissions against the
+    // catalog into concrete primitives BEFORE the diff (design "Конвейер
+    // компиляции"). Resolve warnings (catalog lint + raw-primitive lint) flow
+    // into the apply log. A failed expansion (unknown id, cycle) fails closed
+    // here — before any snapshot or mutation.
+    let (targets, resolve_warnings) =
+        crate::model::resolve(inputs.declaration, &inputs.compile)
+            .map_err(|e| ApplyError::Resolve(e.to_string()))?;
+    for w in &resolve_warnings {
+        log.push(format!("warning: {w}"));
+    }
 
     // 4-5. Diff vs managed state (accounts).
     let managed_now = inputs.state.managed_accounts();
@@ -572,7 +589,11 @@ fn build_managed_set(
                 Some(existing) if existing.uid == t.uid
                     && existing.shell == t.shell
                     && groups_equal(&existing.groups, &t.groups)
-                    && existing.sudo_role == t.sudo_role =>
+                    && existing.sudo_role == t.sudo_role
+                    // The concrete sudo command set is part of the account's
+                    // recorded privilege; an unchanged set (order-insensitive)
+                    // preserves from_version, a changed one is a real update.
+                    && groups_equal(&existing.sudo_commands, &t.sudo_commands) =>
                 {
                     existing.from_version
                 }
@@ -584,6 +605,7 @@ fn build_managed_set(
                 shell: t.shell.clone(),
                 groups: t.groups.clone(),
                 sudo_role: t.sudo_role.clone(),
+                sudo_commands: t.sudo_commands.clone(),
                 from_version,
             }
         })
@@ -689,10 +711,29 @@ struct RegistryDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{FakeCatalog, OsTarget, ResolveCtx};
     use crate::inspect::{FakeInspector, GroupFacts};
     use crate::lockout::LockoutContext;
-    use crate::model::ResolvedAccount;
+    use crate::model::{CompileInputs, ResolvedAccount};
     use crate::state::{FakeState, ManagedGroup};
+    use std::sync::OnceLock;
+
+    /// An empty permission catalog + a fixed OS target for tests whose roles do
+    /// not use `permissions` (the legacy raw-only path). Backed by statics so
+    /// the borrowed `CompileInputs` can be `'static` and dropped into each
+    /// `ApplyInputs` literal without a per-test local. Roles with no
+    /// `permissions` never touch the catalog, so an empty one is exercised
+    /// exactly as before permission expansion existed.
+    fn empty_compile() -> CompileInputs<'static> {
+        static CAT: OnceLock<FakeCatalog> = OnceLock::new();
+        static OS: OnceLock<OsTarget> = OnceLock::new();
+        static CTX: OnceLock<ResolveCtx> = OnceLock::new();
+        CompileInputs {
+            catalog: CAT.get_or_init(FakeCatalog::new),
+            os: OS.get_or_init(|| OsTarget::new("linux", "debian", Some("12".to_owned())).unwrap()),
+            ctx: CTX.get_or_init(ResolveCtx::default),
+        }
+    }
 
     /// Records every call and can be told to fail at a given phase.
     #[derive(Default)]
@@ -790,6 +831,7 @@ mod tests {
             shell: "/bin/bash".to_owned(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
+            sudo_commands: Vec::new(),
             from_version: v,
         }
     }
@@ -818,6 +860,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -852,6 +895,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -883,6 +927,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -915,6 +960,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -950,6 +996,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -992,6 +1039,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -1039,6 +1087,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -1075,6 +1124,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -1181,6 +1231,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -1209,6 +1260,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -1239,6 +1291,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -1272,6 +1325,7 @@ mod tests {
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+                compile: empty_compile(),
             },
             &mut p,
         )
@@ -1325,6 +1379,7 @@ mod tests {
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             session_source: sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+            compile: empty_compile(),
         }
     }
 
@@ -1476,6 +1531,7 @@ mod tests {
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             session_source: sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+            compile: empty_compile(),
         }
     }
 
@@ -1639,6 +1695,7 @@ mod tests {
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             session_source: &sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
+            compile: empty_compile(),
         };
         let report = run(inputs, &mut p).unwrap();
         assert_eq!(report.deferred_deletes.len(), 1, "delete deferred before the gate");

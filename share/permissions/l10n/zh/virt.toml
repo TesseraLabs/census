@@ -1,0 +1,9 @@
+[container-operate]
+title     = "容器操作"
+summary   = "运行 rootless 容器并启停现有容器（podman）。"
+risk_note = "受限：rootless podman 不带 root 套接字——不获得主机 root。"
+
+[vm-operate]
+title     = "虚拟机操作"
+summary   = "启动和停止现有虚拟机（libvirt 组、virsh）。"
+risk_note = "受限：管理虚拟机生命周期，不编辑定义。"

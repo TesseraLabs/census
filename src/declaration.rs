@@ -417,6 +417,7 @@ uid = 9020
             home: PathBuf::from(format!("/var/lib/census/home/{name}")),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
+            sudo_commands: Vec::new(),
             limits: crate::rolestore::Limits::default(),
             locked_password: true,
         }

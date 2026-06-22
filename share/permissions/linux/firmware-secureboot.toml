@@ -1,0 +1,4 @@
+id       = "firmware-secureboot"
+risk     = "escalation-capable"
+category = "security"
+sudo     = ["/usr/bin/mokutil"]

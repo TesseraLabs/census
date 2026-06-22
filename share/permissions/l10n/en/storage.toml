@@ -1,0 +1,34 @@
+[mount-removable]
+title     = "Mount removable media"
+summary   = "Mount and unmount removable volumes (udisksctl, mount, umount)."
+risk_note = "Arbitrary mount can shadow trusted paths (e.g. over /etc) — an escalation primitive."
+
+[disk-admin]
+title     = "Disk administration"
+summary   = "Partition disks and create filesystems/LVM (parted, fdisk, mkfs.*, lvm)."
+risk_note = "Destructive and root-level: can repartition or wipe any block device."
+
+[luks-admin]
+title     = "LUKS encryption administration"
+summary   = "Manage LUKS-encrypted volumes (cryptsetup)."
+risk_note = "Controls disk encryption keys and headers — can lock out or expose data."
+
+[swap-admin]
+title     = "Swap administration"
+summary   = "Manage swap and zram devices (swapon, swapoff, mkswap, zramctl)."
+risk_note = "Contained: swap on/off; misuse mainly affects memory pressure, not privilege."
+
+[fstab-config]
+title     = "Filesystem mount configuration"
+summary   = "Manage persistent mounts and check mounts (mount, findmnt, systemctl)."
+risk_note = "A crafted /etc/fstab mount over a system path can yield root on next mount/boot."
+
+[backup-operator]
+title     = "Backup operator"
+summary   = "Run backups across the filesystem (restic, borg, rsync, tar) via the backup group."
+risk_note = "Reads the entire filesystem for backup — full disclosure of all on-disk secrets."
+
+[quota-admin]
+title     = "Disk quota administration"
+summary   = "Manage and report filesystem quotas (setquota, repquota, quotacheck)."
+risk_note = "Contained: limits disk usage; no path to host privilege."

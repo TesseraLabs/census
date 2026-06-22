@@ -1,0 +1,6 @@
+id       = "console-access"
+risk     = "contained"
+category = "identity"
+# Generic local-console capability. Distro layers expand it with their
+# OS-specific console group (e.g. astra adds astra-console).
+groups   = []

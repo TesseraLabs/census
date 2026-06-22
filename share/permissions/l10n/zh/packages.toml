@@ -1,0 +1,19 @@
+[package-query]
+title     = "软件包查询"
+summary   = "列出并查看已安装的软件包（apt、dpkg）。"
+risk_note = "只读：报告已安装内容，不安装任何东西。"
+
+[package-install]
+title     = "软件包安装"
+summary   = "安装和卸载软件包（apt-get、apt、dpkg）。"
+risk_note = "软件包维护脚本以 root 运行——设计上即可执行任意代码。"
+
+[repo-config]
+title     = "软件源配置"
+summary   = "管理 APT 软件源并据其运行 apt（apt-get、apt）。"
+risk_note = "添加软件源是供应链入口：一个 root 级软件包的可信来源。"
+
+[apt-policy]
+title     = "APT 策略配置"
+summary   = "配置 APT 行为和无人值守升级（apt-config、unattended-upgrade）。"
+risk_note = "受限：调整更新策略；依赖于已受信任的软件源。"

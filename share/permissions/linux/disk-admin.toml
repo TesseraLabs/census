@@ -1,0 +1,5 @@
+id       = "disk-admin"
+risk     = "escalation-capable"
+category = "storage"
+groups   = ["disk"]
+sudo     = ["/usr/sbin/parted", "/usr/sbin/fdisk", "/usr/sbin/mkfs.ext4", "/usr/sbin/mkfs.xfs", "/usr/sbin/lvm", "/usr/sbin/blkid"]

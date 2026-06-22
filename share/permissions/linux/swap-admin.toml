@@ -1,0 +1,4 @@
+id       = "swap-admin"
+risk     = "contained"
+category = "storage"
+sudo     = ["/usr/sbin/swapon", "/usr/sbin/swapoff", "/usr/sbin/mkswap", "/usr/bin/zramctl"]

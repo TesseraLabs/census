@@ -1,0 +1,4 @@
+id       = "syslog-admin"
+risk     = "contained"
+category = "observability"
+sudo     = ["/usr/bin/systemctl restart rsyslog"]

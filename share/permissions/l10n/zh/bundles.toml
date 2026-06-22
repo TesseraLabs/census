@@ -1,0 +1,34 @@
+[network-config]
+title     = "网络配置（捆绑）"
+summary   = "诊断 + 网卡、防火墙、DNS 和路由管理。"
+risk_note = "具备提权能力：继承 network-admin 的 `ip netns exec` root 途径。"
+
+[storage-admin]
+title     = "存储管理（捆绑）"
+summary   = "挂载、分区、swap、fstab、配额和 LUKS 管理。"
+risk_note = "具备提权能力且具破坏性：完全控制块设备和挂载。"
+
+[observability]
+title     = "可观测性（捆绑）"
+summary   = "日志读取/管理、journald、进程查看、指标和追踪。"
+risk_note = "具备提权能力：继承 perf-trace（ptrace）和 log-admin（抹除痕迹）。"
+
+[host-hardening]
+title     = "主机加固（捆绑）"
+summary   = "AppArmor、审计、sysctl、PAM、CA 信任和 udev 管理。"
+risk_note = "具备提权能力：每个成员都可削弱一项主机安全控制。"
+
+[boot-admin]
+title     = "引导管理（捆绑）"
+summary   = "引导加载器、内核命令行、initramfs、TPM 和 LUKS 管理。"
+risk_note = "具备提权能力：控制引导前及引导期间运行的内容。"
+
+[device-operator]
+title     = "设备操作员（捆绑）"
+summary   = "串口、USB、总线和视频设备访问，以及 udev 配置。"
+risk_note = "经由所含的 udev-config 具备提权能力（设备事件时以 root 运行命令）。"
+
+[peripheral-operator]
+title     = "外设操作员（捆绑）"
+summary   = "打印、音频、显示、UPS 和 ATM 外设访问。"
+risk_note = "受限：所有成员均为设备/外设访问，不提升主机权限。"

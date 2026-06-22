@@ -1,0 +1,4 @@
+id       = "session-terminate"
+risk     = "escalation-capable"
+category = "os-config"
+sudo     = ["/usr/bin/loginctl terminate-user {user}", "/usr/bin/loginctl terminate-session {session}"]

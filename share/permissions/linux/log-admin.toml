@@ -1,0 +1,4 @@
+id       = "log-admin"
+risk     = "escalation-capable"
+category = "observability"
+sudo     = ["/usr/sbin/logrotate", "/usr/bin/journalctl"]

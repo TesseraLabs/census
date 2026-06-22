@@ -1,0 +1,34 @@
+[network-diag]
+title     = "网络诊断"
+summary   = "只读查看套接字、链路和连通性（ss、ip、mtr、ping）。"
+risk_note = "只读：显示状态和计数器，不做任何更改。"
+
+[network-admin]
+title     = "网络管理"
+summary   = "配置网卡、地址、链路和连接（ip、nmcli）。"
+risk_note = "实际等同 root：`ip netns exec` 可在命名空间中执行任意命令。"
+
+[firewall-admin]
+title     = "防火墙管理"
+summary   = "管理包过滤规则（nft、iptables/ip6tables、restore）。"
+risk_note = "改写规则可禁用或绕过主机的网络策略。"
+
+[packet-capture]
+title     = "抓包"
+summary   = "在接口上捕获并解析流量（tcpdump、tshark）。"
+risk_note = "tcpdump 的 `-z postrotate` 会执行命令——以 root 运行任意代码的途径。"
+
+[dns-config]
+title     = "DNS 解析器配置"
+summary   = "设置解析器状态和按链路的 DNS（resolvectl）。"
+risk_note = "重定向解析是主机上每次名称查询的中间人攻击向量。"
+
+[vpn-admin]
+title     = "VPN 管理"
+summary   = "建立并配置 WireGuard 隧道（wg、wg-quick、resolvectl）。"
+risk_note = "隧道配置可重路由流量并覆盖整台主机的 DNS。"
+
+[route-admin]
+title     = "路由管理"
+summary   = "管理内核路由表（ip route）。"
+risk_note = "添加路由可悄然将流量引向攻击者控制的节点。"

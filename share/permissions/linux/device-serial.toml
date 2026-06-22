@@ -1,0 +1,4 @@
+id       = "device-serial"
+risk     = "contained"
+category = "device"
+groups   = ["dialout"]

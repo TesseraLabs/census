@@ -1,0 +1,4 @@
+id       = "time-set"
+risk     = "escalation-capable"
+category = "os-config"
+sudo     = ["/usr/bin/timedatectl", "/usr/sbin/hwclock"]

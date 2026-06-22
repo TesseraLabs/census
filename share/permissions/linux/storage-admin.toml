@@ -1,0 +1,4 @@
+id       = "storage-admin"
+risk     = "escalation-capable"
+category = "storage"
+includes = ["mount-removable", "disk-admin", "swap-admin", "fstab-config", "quota-admin", "luks-admin"]

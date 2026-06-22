@@ -1,0 +1,5 @@
+id       = "network-admin"
+risk     = "escalation-capable"
+category = "network"
+groups   = ["netdev"]
+sudo     = ["/usr/sbin/ip", "/usr/bin/nmcli"]

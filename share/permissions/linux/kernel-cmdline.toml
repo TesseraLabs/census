@@ -1,0 +1,4 @@
+id       = "kernel-cmdline"
+risk     = "escalation-capable"
+category = "boot"
+sudo     = ["/usr/sbin/update-grub"]

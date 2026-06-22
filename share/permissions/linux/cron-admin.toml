@@ -1,0 +1,4 @@
+id       = "cron-admin"
+risk     = "escalation-capable"
+category = "os-config"
+sudo     = ["/usr/bin/crontab"]

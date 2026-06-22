@@ -1,0 +1,5 @@
+id       = "ups-admin"
+risk     = "contained"
+category = "peripheral"
+groups   = ["nut"]
+sudo     = ["/usr/sbin/upsdrvctl", "/usr/bin/upsc"]

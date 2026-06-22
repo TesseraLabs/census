@@ -1,0 +1,4 @@
+id       = "firmware-update"
+risk     = "escalation-capable"
+category = "kernel-hw"
+sudo     = ["/usr/bin/fwupdmgr"]

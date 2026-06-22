@@ -1,0 +1,19 @@
+[package-query]
+title     = "Package query"
+summary   = "List and inspect installed packages (apt, dpkg)."
+risk_note = "Read-only: reports what is installed, installs nothing."
+
+[package-install]
+title     = "Package installation"
+summary   = "Install and remove packages (apt-get, apt, dpkg)."
+risk_note = "Package maintainer scripts run as root — arbitrary code execution by design."
+
+[repo-config]
+title     = "Repository configuration"
+summary   = "Manage APT sources and run apt against them (apt-get, apt)."
+risk_note = "Adding a repository is a supply-chain entry point: a trusted source for root-level packages."
+
+[apt-policy]
+title     = "APT policy configuration"
+summary   = "Configure APT behavior and unattended upgrades (apt-config, unattended-upgrade)."
+risk_note = "Contained: tunes update policy; depends on already-trusted sources."

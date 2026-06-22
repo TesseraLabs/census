@@ -1,0 +1,4 @@
+id       = "fstab-config"
+risk     = "escalation-capable"
+category = "storage"
+sudo     = ["/usr/bin/mount", "/usr/bin/findmnt", "/usr/bin/systemctl"]

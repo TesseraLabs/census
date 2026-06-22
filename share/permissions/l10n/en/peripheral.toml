@@ -1,0 +1,24 @@
+[print-admin]
+title     = "Print administration"
+summary   = "Manage CUPS printers (lpadmin group, cupsctl, lpadmin)."
+risk_note = "Contained: printer setup; no host privilege gain."
+
+[audio-access]
+title     = "Audio access"
+summary   = "Access audio devices (audio, pulse-access groups)."
+risk_note = "Contained: sound device access only."
+
+[display-config]
+title     = "Display configuration"
+summary   = "Configure screen resolution and layout (xrandr)."
+risk_note = "Contained: display settings only."
+
+[ups-admin]
+title     = "UPS administration"
+summary   = "Manage the UPS/NUT stack (nut group, upsdrvctl, upsc)."
+risk_note = "Contained, though a UPS driver can trigger shutdown on power events."
+
+[atm-peripheral]
+title     = "ATM peripheral access"
+summary   = "Access dispenser/card-reader peripherals (dialout, plugdev groups)."
+risk_note = "Contained: vendor peripherals; exact tool set is defined by the site layer."

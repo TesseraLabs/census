@@ -1,0 +1,4 @@
+id       = "driver-config"
+risk     = "escalation-capable"
+category = "kernel-hw"
+sudo     = ["/usr/sbin/modprobe", "/usr/sbin/rmmod", "/usr/bin/modinfo"]

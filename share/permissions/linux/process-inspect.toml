@@ -1,0 +1,4 @@
+id       = "process-inspect"
+risk     = "contained"
+category = "observability"
+sudo     = ["/usr/bin/ps", "/usr/bin/top", "/usr/bin/lsof"]

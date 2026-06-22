@@ -1,0 +1,4 @@
+id       = "coredump-config"
+risk     = "contained"
+category = "observability"
+sudo     = ["/usr/bin/coredumpctl"]
