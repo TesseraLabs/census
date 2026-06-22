@@ -34,3 +34,19 @@ uid  = 9003
 [[role_account]]
 role = "dockerop"
 uid  = 9004
+
+[[role_account]]
+role = "sweep-base"
+uid  = 9005
+
+[[role_account]]
+role = "sweep-astra"
+uid  = 9006
+
+[[role_account]]
+role = "sweep-fa"
+uid  = 9007
+
+[[role_account]]
+role = "sweep-fa-astra"
+uid  = 9008

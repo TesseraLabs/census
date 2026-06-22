@@ -1,0 +1,15 @@
+role    = "sweep-fa-astra"
+version = 1
+os      = "linux"
+name    = "Coverage sweep — Astra file-access grants (lint exerciser)"
+level   = 9
+
+[payload]
+# Astra-only complement to sweep-fa: the Astra-layer permission that carries a
+# `[[file]]` directory grant (astra-mac-control → /etc/parsec) plus a base
+# permission whose grant resolves on every target. Resolve only on
+# --os-target linux-astra-1.8.
+permissions = [
+    "astra-mac-control",
+    "audit-config",
+]

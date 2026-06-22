@@ -13,6 +13,26 @@ use crate::declaration::Declaration;
 use crate::rolestore::{self, Limits, RoleStoreError};
 use std::path::PathBuf;
 
+/// How an object (account or group) came under Census management. Drives the
+/// teardown contract: a `Created` object Census made itself, so removing it from
+/// the declaration means a full delete (`userdel`/`groupdel`); an `Adopted`
+/// object pre-existed and Census only took its grants under management, so
+/// removal means *release* to baseline (strip Census's own grants/members) and
+/// never delete the underlying user or group. Reused by the persisted state in a
+/// later slice, so the resolve layer and the state layer agree on the contract.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    /// Census created the object; on removal it is fully deleted.
+    #[default]
+    Created,
+    /// The object pre-existed and was taken under management; on removal Census
+    /// releases it back to baseline and never deletes it.
+    Adopted,
+}
+
 /// A fully-resolved target account: declaration account-layer merged with the
 /// role-store composition (raw escape-hatch primitives unioned with the
 /// permission expansion), plus Census invariants.
@@ -41,8 +61,57 @@ pub struct ResolvedAccount {
     /// Resource limits. Raw `payload.limits` if set; otherwise merged from the
     /// permission expansion. An explicit raw limit wins over an expanded one.
     pub limits: Limits,
+    /// File-access grants, unioned across every permission the role carries
+    /// (by path: access widens to the max, `recursive` is the OR, provenance
+    /// accumulates) — the same rule the catalog applies within one permission.
+    /// Materialized by a [`crate::fileaccess::FileAccessBackend`] in the apply
+    /// file-access phase; there is no raw escape-hatch for file grants (they
+    /// only ever come from permissions).
+    pub file_grants: Vec<catalog::ResolvedFileGrant>,
     /// Census invariant: role accounts always have a locked password (§8).
     pub locked_password: bool,
+    /// How this account came under management. Resolve only ever produces
+    /// `Created` accounts today — adopted accounts (bound to an existing user)
+    /// are skipped here and apply in a later slice — but the field is carried so
+    /// the value flows through to the state/plan layers without a second pass.
+    pub provenance: Provenance,
+}
+
+/// A fully-resolved target group: the declared group object joined with the
+/// grants every role bound to it contributes. Membership-style primitives are
+/// projected to group-forms (`%group` sudoers, `g:group` ACL, `@group` limits)
+/// by the apply layer; the in-group-membership sub-primitive (`groups`) has no
+/// local meaning on a group target and is dropped with a warning at resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGroup {
+    /// POSIX group name (the key used to reference / create the group).
+    pub name: String,
+    /// Pinned GID for a `Created` group, or `None`. An `Adopted` group always
+    /// carries `None` here — its real GID is observed from the OS at apply time,
+    /// never assigned by Census (adoption never renumbers).
+    pub gid: Option<u32>,
+    /// How this group came under management (from `[[group]].adopt`).
+    pub provenance: Provenance,
+    /// Members Census manages on this group, taken verbatim from
+    /// `GroupSpec.members` (validation already restricted an adopted group's
+    /// members to Census-managed users).
+    pub members: Vec<String>,
+    /// Sudo commands the bound roles grant the group, unioned across every
+    /// bound role's permissions (deduped, stable order). Materialized as a
+    /// `%group` NOPASSWD sudoers fragment.
+    pub sudo_commands: Vec<String>,
+    /// File-access grants the bound roles grant the group, unioned by path
+    /// (access widens to the max, `recursive` is the OR, provenance accumulates)
+    /// — the same rule resolve applies to an account. Materialized as `g:group`
+    /// ACL entries.
+    pub file_grants: Vec<catalog::ResolvedFileGrant>,
+    /// Resource limits the bound roles grant the group, merged field-by-field
+    /// (first role to set a field wins). Materialized as an `@group` block.
+    pub limits: Limits,
+    /// Role ids that contributed grants to this group, in insertion order with
+    /// duplicates removed. Audit/reporting shows which roles a group's grants
+    /// come from.
+    pub bound_roles: Vec<String>,
 }
 
 /// A resolve-time warning surfaced as data (routed to stderr by the CLI, into
@@ -58,6 +127,16 @@ pub enum ResolveWarning {
         /// Which raw primitive (`groups`/`sudo_role`/`limits`).
         primitive: &'static str,
     },
+    /// A bound role expanded an in-group-membership sub-primitive (`groups`)
+    /// onto a group target. There is no local group nesting to apply it to, so
+    /// it is dropped. (LDAP-side nesting still works transparently through the
+    /// group itself; this only concerns the local `usermod -aG` semantics.)
+    GroupsPrimitiveOnGroupTarget {
+        /// The bound role whose permission carried the `groups` primitive.
+        role: String,
+        /// The group target the binding pointed at.
+        group: String,
+    },
     /// A warning bubbled up from the catalog resolve (e.g. an unknown OS
     /// version resolved against the nearest lower layer, or a supplied
     /// permission parameter that matched no template placeholder).
@@ -70,6 +149,11 @@ impl std::fmt::Display for ResolveWarning {
             ResolveWarning::RawPrimitiveAlongsidePermissions { role, primitive } => write!(
                 f,
                 "role {role}: raw {primitive} used alongside permissions; prefer permissions"
+            ),
+            ResolveWarning::GroupsPrimitiveOnGroupTarget { role, group } => write!(
+                f,
+                "role {role}: permission `groups` (вступление в группу) не применимо к group-цели \
+                 {group}; пропущено (локальной вложенности групп нет)"
             ),
             ResolveWarning::Catalog(catalog::Warning::UnknownOsVersion {
                 missing_layer,
@@ -130,12 +214,23 @@ pub fn resolve(
     let mut warnings = Vec::new();
 
     for acct in &decl.role_accounts {
+        // Adopted accounts (no uid; bound to an existing user) do not project to
+        // a created Unix account. Account-layer adoption — binding grants to the
+        // existing user without `useradd` — lands in a later group-grants slice;
+        // here they resolve to nothing so created accounts behave exactly as
+        // before and no adopted user reaches the apply create path.
+        let Some(uid) = acct.uid else {
+            continue;
+        };
         let comp = rolestore::read_composition(&decl.role_store, &acct.role)?;
 
         // Start from the raw escape-hatch primitives. The permission expansion
         // is unioned on top (raw wins for limits — see below).
         let mut groups: Vec<String> = comp.groups.clone();
         let mut sudo_commands: Vec<String> = Vec::new();
+        // File grants come ONLY from permissions (no raw escape-hatch). Collect
+        // every permission's resolved grants, then union by path below.
+        let mut file_grants: Vec<catalog::ResolvedFileGrant> = Vec::new();
         // Raw limits win: capture whether the role set any so an expanded limit
         // never overwrites an explicit operator choice.
         let raw_limits_present = comp.limits != Limits::default();
@@ -197,6 +292,9 @@ pub fn resolve(
                     sudo_commands.push(s.value);
                 }
             }
+            // Accumulate this permission's resolved file grants; the by-path
+            // union happens once after all permissions are collected.
+            file_grants.extend(resolved.file_grants);
             // Limits: explicit raw limits win; otherwise the first expansion that
             // sets a field fills it in. We merge field-by-field so two
             // permissions can each contribute a different limit. Within a single
@@ -206,29 +304,154 @@ pub fn resolve(
             // permission — this loop only sequences across distinct permissions.
             if !raw_limits_present {
                 if let Some(expanded) = resolved.limits {
-                    if limits.nofile.is_none() {
-                        limits.nofile = expanded.nofile;
-                    }
-                    if limits.nproc.is_none() {
-                        limits.nproc = expanded.nproc;
-                    }
+                    merge_limits_first_wins(&mut limits, &expanded);
                 }
             }
         }
 
         out.push(ResolvedAccount {
             name: acct.role.clone(),
-            uid: acct.uid,
+            uid,
             shell: decl.shell_for(acct).to_owned(),
             home: decl.home_for(acct),
             groups,
             sudo_role: comp.sudo_role,
             sudo_commands,
             limits,
+            file_grants: catalog::union_resolved_file_grants(file_grants),
             locked_password: true,
+            // Only created accounts reach this point — adopted accounts (no uid)
+            // are skipped above, so resolve never emits an Adopted account today.
+            provenance: Provenance::Created,
         });
     }
     Ok((out, warnings))
+}
+
+/// Merge one permission's resolved limits into an accumulator, first-wins per
+/// field: a field already set is left untouched, an unset field takes the
+/// expansion's value. Shared by account and group resolution so both sequence
+/// limits across permissions identically.
+fn merge_limits_first_wins(acc: &mut Limits, expanded: &Limits) {
+    if acc.nofile.is_none() {
+        acc.nofile = expanded.nofile;
+    }
+    if acc.nproc.is_none() {
+        acc.nproc = expanded.nproc;
+    }
+}
+
+/// Resolve every `[[role_group]]` binding into the group grants Census wants to
+/// materialize. Each declared `[[group]]` seeds a [`ResolvedGroup`] (name, GID
+/// pin, provenance, members); each binding then reads the bound role's
+/// composition, expands its permissions against the catalog, and unions the
+/// resulting sudo commands, file grants, and limits onto the group. The
+/// in-group-membership sub-primitive (`groups`) has no group-target meaning and
+/// is dropped with a [`ResolveWarning::GroupsPrimitiveOnGroupTarget`].
+///
+/// Fails closed if a bound role's slice is missing/malformed (this is where a
+/// `[[role_group]].role` is finally checked against the role-store — declaration
+/// validation deliberately defers role existence to here) or if any permission
+/// cannot be expanded.
+pub fn resolve_groups(
+    decl: &Declaration,
+    inputs: &CompileInputs<'_>,
+) -> Result<(Vec<ResolvedGroup>, Vec<ResolveWarning>), ResolveError> {
+    let mut warnings = Vec::new();
+
+    // Seed one ResolvedGroup per declared [[group]]. Provenance comes from the
+    // group's `adopt` flag, NOT from any later `groups` pin — an adopted group is
+    // observed, never assigned a GID. Bindings below accumulate grants onto these.
+    let mut groups: Vec<ResolvedGroup> = decl
+        .groups
+        .iter()
+        .map(|g| ResolvedGroup {
+            name: g.name.clone(),
+            gid: if g.adopt { None } else { g.gid },
+            provenance: if g.adopt {
+                Provenance::Adopted
+            } else {
+                Provenance::Created
+            },
+            members: g.members.clone(),
+            sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            limits: Limits::default(),
+            bound_roles: Vec::new(),
+        })
+        .collect();
+
+    for rg in &decl.role_groups {
+        // Validation (slice 1) guarantees `rg.group` names a declared [[group]],
+        // so the lookup always hits.
+        let idx = groups
+            .iter()
+            .position(|g| g.name == rg.group)
+            .expect("role_group target is a declared group (validated in slice 1)");
+
+        // First point a role bound to a group is checked against the role-store.
+        let comp = rolestore::read_composition(&decl.role_store, &rg.role)?;
+
+        // Accumulate this binding's file grants separately, then union by path
+        // once after every permission so the by-path widening is applied whole.
+        let mut binding_file_grants: Vec<catalog::ResolvedFileGrant> = Vec::new();
+        let mut emitted_groups_warning = false;
+
+        for perm in &comp.permissions {
+            let (resolved, catalog_warnings) = catalog::resolve_with_params(
+                &perm.id,
+                &perm.params,
+                inputs.os,
+                inputs.catalog,
+                inputs.ctx,
+            )
+            .map_err(|source| ResolveError::Catalog {
+                role: rg.role.clone(),
+                source,
+            })?;
+            for w in catalog_warnings {
+                warnings.push(ResolveWarning::Catalog(w));
+            }
+            // Union expanded sudo commands onto the group (dedup, stable order).
+            for s in resolved.sudo {
+                if !groups[idx].sudo_commands.contains(&s.value) {
+                    groups[idx].sudo_commands.push(s.value);
+                }
+            }
+            binding_file_grants.extend(resolved.file_grants);
+            // Limits: first role/permission to set a field wins. Group targets
+            // have no raw escape-hatch limits, so the accumulator starts empty
+            // and fills field-by-field across permissions and bound roles.
+            if let Some(expanded) = resolved.limits {
+                let mut merged = groups[idx].limits.clone();
+                merge_limits_first_wins(&mut merged, &expanded);
+                groups[idx].limits = merged;
+            }
+            // The in-group-membership primitive has no group-target meaning;
+            // drop it and warn once per binding if any permission carried one.
+            if !resolved.groups.is_empty() && !emitted_groups_warning {
+                warnings.push(ResolveWarning::GroupsPrimitiveOnGroupTarget {
+                    role: rg.role.clone(),
+                    group: rg.group.clone(),
+                });
+                emitted_groups_warning = true;
+            }
+        }
+
+        // Union this binding's file grants into the group's, by path.
+        if !binding_file_grants.is_empty() {
+            let mut all = std::mem::take(&mut groups[idx].file_grants);
+            all.extend(binding_file_grants);
+            groups[idx].file_grants = catalog::union_resolved_file_grants(all);
+        }
+
+        // Record the contributing role (dedup, insertion order).
+        if !groups[idx].bound_roles.contains(&rg.role) {
+            groups[idx].bound_roles.push(rg.role.clone());
+        }
+    }
+
+    Ok((groups, warnings))
 }
 
 #[cfg(test)]
@@ -260,6 +483,7 @@ mod tests {
             replace: false,
             includes: Vec::new(),
             include_categories: Vec::new(),
+            files: Vec::new(),
         }
     }
 
@@ -324,6 +548,12 @@ uid = 9010
             groups: acct.groups.clone(),
             sudo_role: acct.sudo_role.clone(),
             sudo_commands: acct.sudo_commands.clone(),
+            file_grants: acct
+                .file_grants
+                .iter()
+                .map(crate::state::ManagedFileGrant::from_resolved)
+                .collect(),
+            provenance: acct.provenance,
             from_version: 1,
         }
     }
@@ -571,6 +801,71 @@ uid = 9010
     }
 
     #[test]
+    fn permission_carrying_dir_file_grant_lands_on_resolved_account() {
+        use crate::catalog::{Access, FileGrant, Shape};
+        let (_tmp, decl) = fixture("[payload]\npermissions = [\"fs-edit\"]\n");
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                files: vec![FileGrant {
+                    path: "/etc/ssh".to_owned(),
+                    access: Access::Rw,
+                    recursive: true,
+                }],
+                ..def("fs-edit")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let a = &resolved[0];
+        assert_eq!(a.file_grants.len(), 1);
+        assert_eq!(a.file_grants[0].path, "/etc/ssh");
+        assert_eq!(a.file_grants[0].access, Access::Rw);
+        assert!(a.file_grants[0].recursive);
+        assert_eq!(a.file_grants[0].shape, Shape::Dir);
+    }
+
+    #[test]
+    fn file_grants_union_across_two_permissions_by_path() {
+        use crate::catalog::{Access, FileGrant};
+        // Two permissions grant the SAME path: ro+non-recursive and rw+recursive.
+        // The account-level union widens access to rw and ORs recursive to true.
+        let (_tmp, decl) = fixture("[payload]\npermissions = [\"fs-read\", \"fs-edit\"]\n");
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    files: vec![FileGrant {
+                        path: "/etc/ssh".to_owned(),
+                        access: Access::Ro,
+                        recursive: false,
+                    }],
+                    ..def("fs-read")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    files: vec![FileGrant {
+                        path: "/etc/ssh".to_owned(),
+                        access: Access::Rw,
+                        recursive: true,
+                    }],
+                    ..def("fs-edit")
+                },
+            );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let a = &resolved[0];
+        assert_eq!(a.file_grants.len(), 1, "same path unions to one grant");
+        assert_eq!(a.file_grants[0].access, Access::Rw, "access widens to rw");
+        assert!(a.file_grants[0].recursive, "recursive ORs to true");
+        assert_eq!(a.file_grants[0].sources.len(), 2, "both contributors recorded");
+    }
+
+    #[test]
     fn raw_and_permission_groups_union_with_lint_warning() {
         // Role declares BOTH a raw group and a permission. The result is the
         // union, and a lint warning flags the raw primitive.
@@ -674,5 +969,216 @@ uid = 9010
         let os = OsTarget::new("linux", "debian", None).unwrap();
         let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
         assert_eq!(resolved[0].limits, Limits { nofile: Some(4096), nproc: None });
+    }
+
+    #[test]
+    fn resolve_emits_created_provenance() {
+        // A created account (uid present) carries Created provenance.
+        let (_tmp, decl) = fixture("[payload]\ngroups = [\"wheel\"]\n");
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(resolved[0].provenance, Provenance::Created);
+    }
+
+    // ---- group-grants slice 2: resolve_groups + provenance ----
+
+    /// A role-store directory holding the named slices, plus a declaration whose
+    /// `[[group]]`/`[[role_group]]` blocks are appended via `decl_extra`. Each
+    /// slice in `slices` is `(role, payload_body)` where `payload_body` is the
+    /// `[payload]` section text. Returns the temp dir (kept alive) and the parsed
+    /// declaration.
+    fn group_fixture(
+        slices: &[(&str, &str)],
+        decl_extra: &str,
+    ) -> (tempfile::TempDir, Declaration) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (role, payload) in slices {
+            let mut f = std::fs::File::create(tmp.path().join(format!("{role}.toml"))).unwrap();
+            f.write_all(
+                format!(
+                    "role = \"{role}\"\nversion = 1\nos = \"linux\"\nname = \"{role}\"\nlevel = 5\n{payload}"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
+        let store = tmp.path().display().to_string();
+        let decl_text = format!(
+            r#"
+version = 4
+role_store = "{store}"
+[defaults]
+uid_range = [9000, 9999]
+shell = "/bin/bash"
+home_base = "/var/lib/census/home"
+{decl_extra}
+"#
+        );
+        let decl = Declaration::parse(&decl_text).unwrap();
+        (tmp, decl)
+    }
+
+    #[test]
+    fn role_group_projects_role_grants_onto_group() {
+        // A non-adopted group bound to a role gets the role's sudo, file grants,
+        // and limits; provenance is Created and gid keeps its pin.
+        let (_tmp, decl) = group_fixture(
+            &[(
+                "netops",
+                "[payload]\npermissions = [\"net-admin\"]\n",
+            )],
+            "[[group]]\nname = \"ops\"\ngid = 8020\n[[role_group]]\nrole = \"netops\"\ngroup = \"ops\"\n",
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                limits: Some(crate::catalog::CatalogLimits { nofile: Some(4096), nproc: None }),
+                files: vec![crate::catalog::FileGrant {
+                    path: "/etc/net".to_owned(),
+                    access: crate::catalog::Access::Rw,
+                    recursive: true,
+                }],
+                ..def("net-admin")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        // Versionless OS so no UnknownOsVersion warning masks the clean-binding
+        // assertion (mirrors the account-side clean-resolve tests).
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (groups, warnings) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!(g.name, "ops");
+        assert_eq!(g.gid, Some(8020));
+        assert_eq!(g.provenance, Provenance::Created);
+        assert_eq!(g.sudo_commands, vec!["/usr/sbin/ip"]);
+        assert_eq!(g.limits, Limits { nofile: Some(4096), nproc: None });
+        assert_eq!(g.file_grants.len(), 1);
+        assert_eq!(g.file_grants[0].path, "/etc/net");
+        assert_eq!(g.bound_roles, vec!["netops"]);
+        assert!(warnings.is_empty(), "clean binding must not warn: {warnings:?}");
+    }
+
+    #[test]
+    fn adopted_group_has_none_gid_and_adopted_provenance() {
+        // An adopted group: provenance Adopted, gid observed at apply (None here),
+        // members carried verbatim.
+        let (_tmp, decl) = group_fixture(
+            &[("netops", "[payload]\npermissions = [\"net-admin\"]\n")],
+            // `netops` must be a managed account to be a member of an adopted group
+            // (slice-1 invariant: never drag a third party into a pre-existing group).
+            "[[role_account]]\nrole = \"netops\"\nuid = 9010\n\
+             [[group]]\nname = \"wheel\"\nadopt = true\nmembers = [\"netops\"]\n\
+             [[role_group]]\nrole = \"netops\"\ngroup = \"wheel\"\n",
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                ..def("net-admin")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (groups, _) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let g = &groups[0];
+        assert_eq!(g.provenance, Provenance::Adopted);
+        assert_eq!(g.gid, None, "adopted group's gid is observed, not assigned");
+        assert_eq!(g.members, vec!["netops"]);
+    }
+
+    #[test]
+    fn multiple_roles_on_one_group_union() {
+        // Two roles bound to the same group: sudo commands union, bound_roles
+        // holds both in insertion order.
+        let (_tmp, decl) = group_fixture(
+            &[
+                ("netops", "[payload]\npermissions = [\"net\"]\n"),
+                ("dbops", "[payload]\npermissions = [\"db\"]\n"),
+            ],
+            "[[group]]\nname = \"ops\"\n\
+             [[role_group]]\nrole = \"netops\"\ngroup = \"ops\"\n\
+             [[role_group]]\nrole = \"dbops\"\ngroup = \"ops\"\n",
+        );
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                    ..def("net")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/bin/psql".to_owned()]),
+                    ..def("db")
+                },
+            );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (groups, _) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let g = &groups[0];
+        assert_eq!(g.sudo_commands, vec!["/usr/sbin/ip", "/usr/bin/psql"]);
+        assert_eq!(g.bound_roles, vec!["netops", "dbops"]);
+    }
+
+    #[test]
+    fn groups_primitive_on_group_target_warns_and_is_dropped() {
+        // A permission whose expansion includes a group-membership primitive
+        // (`groups`) bound to a group target: warn-and-skip. ResolvedGroup carries
+        // no `groups` field, so the only observable effect is the warning.
+        let (_tmp, decl) = group_fixture(
+            &[("netops", "[payload]\npermissions = [\"net-admin\"]\n")],
+            "[[group]]\nname = \"ops\"\n[[role_group]]\nrole = \"netops\"\ngroup = \"ops\"\n",
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                groups: ListOverride::Replace(vec!["netdev".to_owned()]),
+                sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                ..def("net-admin")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (groups, warnings) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        // The sudo grant still lands; only the membership primitive is dropped.
+        assert_eq!(groups[0].sudo_commands, vec!["/usr/sbin/ip"]);
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ResolveWarning::GroupsPrimitiveOnGroupTarget { role, group }
+                    if role == "netops" && group == "ops"
+            )),
+            "groups primitive on a group target must warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn role_group_to_missing_role_slice_fails_closed() {
+        // The role bound to the group has no role-store slice → resolve_groups
+        // fails closed (this is where role existence is finally checked).
+        let (_tmp, decl) = group_fixture(
+            &[("netops", "[payload]\npermissions = [\"net\"]\n")],
+            "[[group]]\nname = \"ops\"\n[[role_group]]\nrole = \"ghost\"\ngroup = \"ops\"\n",
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                ..def("net")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let err = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::RoleStore(RoleStoreError::NotFound(_))),
+            "binding to a role with no slice must fail closed: {err:?}"
+        );
     }
 }

@@ -69,6 +69,8 @@ const CHECK_GROUP_REGISTRY: &str = "group-registry-integrity";
 const CHECK_UNREACHABLE: &str = "unreachability";
 const CHECK_ANTILOCKOUT: &str = "anti-lockout";
 const CHECK_DRIFT: &str = "drift";
+const CHECK_FILE_ACCESS_DRIFT: &str = "file-access-drift";
+const CHECK_ADOPTED_GROUP_DRIFT: &str = "adopted-group-drift";
 
 /// Run all read-only doctor checks. `managed` is the registry-authoritative
 /// state; `inspector` reads the live system; `targets` (if given) is the
@@ -152,7 +154,13 @@ pub fn run_doctor(
                 message: "registry group has no live group (managed group vanished)".to_owned(),
             }),
             Some(facts) => {
-                if facts.gid != record.gid {
+                // GID drift is a hard integrity Error only for a Created group:
+                // Census assigned that GID, so a renumber out of band breaks the
+                // invariant. An Adopted group's GID was observed, not assigned, so
+                // its drift is advisory and handled below against the baseline as a
+                // Warn — never double-reported here.
+                if facts.gid != record.gid && record.provenance == crate::model::Provenance::Created
+                {
                     findings.push(Finding {
                         severity: Severity::Error,
                         check: CHECK_GROUP_REGISTRY,
@@ -163,6 +171,99 @@ pub fn run_doctor(
                         ),
                     });
                 }
+            }
+        }
+    }
+
+    // --- adopted-group baseline drift (Warn) ---
+    // For an Adopted group with a recorded baseline, advisory checks against the
+    // live system: a GID that diverged from the adopt-time baseline, our own
+    // `census-grp-<group>` sudoers fragment removed out of band while the registry
+    // still records group sudo commands, or a Census-added member that is no
+    // longer in the live group. All advisory (re-apply repairs) — never an Error:
+    // a released/altered adopted object is drift, not a broken security invariant.
+    for (name, record) in &managed.managed_groups() {
+        if record.provenance != crate::model::Provenance::Adopted {
+            continue;
+        }
+        let Some(baseline) = &record.adopt_baseline else {
+            continue;
+        };
+
+        // GID drift vs the adopt-time baseline.
+        if let Some(facts) = inspector.group(name) {
+            if facts.gid != baseline.gid {
+                findings.push(Finding {
+                    severity: Severity::Warn,
+                    check: CHECK_ADOPTED_GROUP_DRIFT,
+                    target: name.clone(),
+                    message: format!(
+                        "live gid {} != adopt baseline gid {} (adopted group renumbered out of band)",
+                        facts.gid, baseline.gid
+                    ),
+                });
+            }
+        }
+
+        // Our sudoers fragment removed while the registry still records group sudo
+        // commands. Best-effort: only a positive `Some(false)` is a finding.
+        if !record.sudo_commands.is_empty()
+            && inspector.group_sudoers_fragment_present(name) == Some(false)
+        {
+            findings.push(Finding {
+                severity: Severity::Warn,
+                check: CHECK_ADOPTED_GROUP_DRIFT,
+                target: name.clone(),
+                message: format!(
+                    "census-grp-{name} sudoers fragment is gone but the registry records \
+                     group sudo commands (drift; re-apply to repair)"
+                ),
+            });
+        }
+
+        // A member Census added to the adopted group is no longer in the live
+        // group's member list. Best-effort: when the inspector reports no members
+        // at all (default-impl / unreadable) we make no claim. We only flag a
+        // member that is genuinely absent from a non-empty live list.
+        let live_members = inspector.group_members(name);
+        if !live_members.is_empty() {
+            for added in &record.members_added {
+                if !live_members.iter().any(|m| m == added) {
+                    findings.push(Finding {
+                        severity: Severity::Warn,
+                        check: CHECK_ADOPTED_GROUP_DRIFT,
+                        target: name.clone(),
+                        message: format!(
+                            "census-added member {added} is no longer in adopted group {name} \
+                             (drift; re-apply to repair)"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // --- file-access drift (Warn) ---
+    // For each managed file grant, check via the live system whether the account
+    // still has its ACL entry on the path. A missing entry is drift (the grant was
+    // recorded but the ACL is gone — manual edit, restore, rotation that dropped
+    // it), repaired by a re-apply. Best-effort and READ-ONLY: the inspector shells
+    // out to `getfacl` (argv-only, no mutation), and an indeterminate result
+    // (`None` — no getfacl, path absent) is NOT a finding (we never claim drift we
+    // could not verify). Like resource-map drift, this is a Warn, never an Error.
+    for (name, record) in &registry {
+        for grant in &record.file_grants {
+            if inspector.file_access_present(&grant.path, name) == Some(false) {
+                findings.push(Finding {
+                    severity: Severity::Warn,
+                    check: CHECK_FILE_ACCESS_DRIFT,
+                    target: name.clone(),
+                    message: format!(
+                        "managed file grant on {} has no live ACL entry for the account \
+                         (drift; re-apply to repair)",
+                        grant.path
+                    ),
+                });
             }
         }
     }
@@ -264,6 +365,8 @@ mod tests {
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
             sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            provenance: crate::model::Provenance::Created,
             from_version: 1,
         }
     }
@@ -304,7 +407,9 @@ mod tests {
             sudo_role: None,
             sudo_commands: Vec::new(),
             limits: Limits::default(),
+            file_grants: Vec::new(),
             locked_password: true,
+            provenance: crate::model::Provenance::Created,
         }
     }
 
@@ -410,7 +515,16 @@ mod tests {
     }
 
     fn mgroup(name: &str, gid: u32) -> ManagedGroup {
-        ManagedGroup { name: name.to_owned(), gid, from_version: 1 }
+        ManagedGroup {
+            name: name.to_owned(),
+            gid,
+            provenance: crate::model::Provenance::Created,
+            members_added: Vec::new(),
+            sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            adopt_baseline: None,
+            from_version: 1,
+        }
     }
 
     #[test]
@@ -463,6 +577,150 @@ mod tests {
             .find(|f| f.check == CHECK_GROUP_REGISTRY && f.target == "atm-operators")
             .expect("gid drift finding");
         assert!(f.message.contains("gid"));
+    }
+
+    // ---- adopted-group baseline drift (Warn) ----
+
+    /// An adopted managed group with a recorded baseline and (optionally) our own
+    /// grants/members. `record.gid` equals the baseline gid (observed at adopt).
+    fn adopted_mgroup(
+        name: &str,
+        gid: u32,
+        baseline_members: &[&str],
+        members_added: &[&str],
+        sudo_commands: &[&str],
+    ) -> ManagedGroup {
+        ManagedGroup {
+            name: name.to_owned(),
+            gid,
+            provenance: crate::model::Provenance::Adopted,
+            members_added: members_added.iter().map(|m| m.to_string()).collect(),
+            sudo_commands: sudo_commands.iter().map(|c| c.to_string()).collect(),
+            file_grants: Vec::new(),
+            adopt_baseline: Some(crate::state::GroupBaseline {
+                gid,
+                members: baseline_members.iter().map(|m| m.to_string()).collect(),
+            }),
+            from_version: 1,
+        }
+    }
+
+    #[test]
+    fn adopted_group_in_sync_has_no_drift_finding() {
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![adopted_mgroup("wheel", 10, &["root"], &["oper"], &["/usr/sbin/ip"])],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
+        insp.group_members
+            .insert("wheel".into(), vec!["root".into(), "oper".into()]);
+        insp.group_sudoers_fragments.insert("wheel".into(), true);
+        let report = run_doctor(&st, &insp, None);
+        assert!(
+            !report.findings.iter().any(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT),
+            "in-sync adopted group must have no drift finding: {:?}",
+            report.findings
+        );
+        // And no false GID Error (the Created-only gid check must not fire here).
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_GROUP_REGISTRY && f.target == "wheel"),
+            "adopted group must not trip the Created gid Error: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn adopted_group_gid_drift_is_warn_not_error() {
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![adopted_mgroup("wheel", 10, &["root"], &[], &[])],
+        );
+        let mut insp = healthy_inspector();
+        // Live gid diverged from the adopt baseline (10 → 12).
+        insp.groups.insert("wheel".into(), GroupFacts { gid: 12 });
+        insp.group_members.insert("wheel".into(), vec!["root".into()]);
+        let report = run_doctor(&st, &insp, None);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT && f.target == "wheel")
+            .expect("adopted gid drift finding");
+        assert_eq!(f.severity, Severity::Warn, "adopted gid drift is advisory");
+        assert!(f.message.contains("gid"));
+        // It must NOT also be reported as a Created-group integrity Error.
+        assert!(
+            !report.findings.iter().any(|f| f.check == CHECK_GROUP_REGISTRY
+                && f.target == "wheel"
+                && f.severity == Severity::Error),
+            "adopted gid drift must not double-report as a Created Error: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn adopted_group_missing_fragment_is_warn() {
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            // Registry records group sudo commands, so a missing fragment is drift.
+            vec![adopted_mgroup("wheel", 10, &["root"], &[], &["/usr/sbin/ip"])],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
+        insp.group_members.insert("wheel".into(), vec!["root".into()]);
+        insp.group_sudoers_fragments.insert("wheel".into(), false); // removed out of band
+        let report = run_doctor(&st, &insp, None);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT && f.message.contains("fragment"))
+            .expect("missing-fragment drift finding");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.message.contains("census-grp-wheel"));
+    }
+
+    #[test]
+    fn adopted_group_dropped_member_is_warn() {
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            // We added `oper`; baseline (foreign) member is `root`.
+            vec![adopted_mgroup("wheel", 10, &["root"], &["oper"], &[])],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
+        // Live group lists only the foreign member — our `oper` was dropped.
+        insp.group_members.insert("wheel".into(), vec!["root".into()]);
+        let report = run_doctor(&st, &insp, None);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT && f.message.contains("oper"))
+            .expect("dropped-member drift finding");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.message.contains("no longer in"));
+    }
+
+    #[test]
+    fn created_group_with_missing_fragment_yields_no_adopted_drift() {
+        // The adopted-drift check is scoped to Adopted groups: a Created group
+        // (no baseline) must never produce an adopted-drift finding even if its
+        // fragment seam reports absent.
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![mgroup("atm-operators", 8010)],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        insp.group_sudoers_fragments.insert("atm-operators".into(), false);
+        let report = run_doctor(&st, &insp, None);
+        assert!(
+            !report.findings.iter().any(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT),
+            "created group must not produce adopted-drift findings: {:?}",
+            report.findings
+        );
     }
 
     // ---- §8 unreachability ----
@@ -565,6 +823,65 @@ mod tests {
         let targets = vec![target("oper", 9010, "/bin/bash", &["wheel"])];
         let report = run_doctor(&st, &healthy_inspector(), Some(&targets));
         assert!(!report.findings.iter().any(|f| f.check == CHECK_DRIFT));
+    }
+
+    // ---- file-access drift ----
+
+    use crate::state::ManagedFileGrant;
+
+    fn managed_acct_with_grant(name: &str, path: &str) -> ManagedAccount {
+        ManagedAccount {
+            file_grants: vec![ManagedFileGrant {
+                path: path.to_owned(),
+                access: crate::catalog::Access::Rw,
+                recursive: true,
+            }],
+            ..managed_acct(name, 9010, "/bin/bash", &["wheel"])
+        }
+    }
+
+    #[test]
+    fn file_access_grant_present_no_finding() {
+        let st = state_of(vec![managed_acct_with_grant("oper", "/etc/ssh")]);
+        let mut insp = healthy_inspector();
+        // ACL entry present on the path for the account.
+        insp.file_acls.insert(("/etc/ssh".into(), "oper".into()), true);
+        let report = run_doctor(&st, &insp, None);
+        assert!(
+            !report.findings.iter().any(|f| f.check == CHECK_FILE_ACCESS_DRIFT),
+            "present ACL must not drift: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn file_access_grant_missing_is_warn() {
+        let st = state_of(vec![managed_acct_with_grant("oper", "/etc/ssh")]);
+        let mut insp = healthy_inspector();
+        // Path readable but the account's ACL entry is gone → drift.
+        insp.file_acls.insert(("/etc/ssh".into(), "oper".into()), false);
+        let report = run_doctor(&st, &insp, None);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_FILE_ACCESS_DRIFT)
+            .expect("file-access drift warning");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.message.contains("/etc/ssh"));
+        assert!(!report.has_errors(), "file-access drift is a warning, never an error");
+    }
+
+    #[test]
+    fn file_access_indeterminate_is_not_a_finding() {
+        // No `file_acls` entry → inspector returns None (cannot verify). Best-effort
+        // means we do NOT claim drift we could not confirm.
+        let st = state_of(vec![managed_acct_with_grant("oper", "/etc/ssh")]);
+        let report = run_doctor(&st, &healthy_inspector(), None);
+        assert!(
+            !report.findings.iter().any(|f| f.check == CHECK_FILE_ACCESS_DRIFT),
+            "indeterminate ACL must not be a finding: {:?}",
+            report.findings
+        );
     }
 
     #[test]

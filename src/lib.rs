@@ -6,6 +6,7 @@ pub mod cli;
 pub mod coverage;
 pub mod declaration;
 pub mod doctor;
+pub mod fileaccess;
 pub mod inspect;
 pub mod l10n;
 pub mod lockout;

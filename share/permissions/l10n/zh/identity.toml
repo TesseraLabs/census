@@ -37,3 +37,8 @@ risk_note = "重新定义身份来源可改变谁映射到哪个 uid/组。"
 title     = "Polkit 配置"
 summary   = "查看并重载 polkit 授权（pkaction、restart polkit）。"
 risk_note = "polkit 规则管控特权操作——宽松的规则即一条提权途径。"
+
+[astra-ad-integration]
+title     = "Astra AD 集成"
+summary   = "通知用户 AD/Kerberos 密码即将过期（ad-password-expiry-notify.sh）。"
+risk_note = "受限：仅读取过期状态并发出通知。"

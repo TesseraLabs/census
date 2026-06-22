@@ -2,3 +2,10 @@ id       = "repo-config"
 risk     = "escalation-capable"
 category = "packages"
 sudo     = ["/usr/bin/apt-get", "/usr/bin/apt"]
+
+# APT source drop-in directory. Adding a repo lets root-level packages install
+# from an attacker-chosen origin (escalation-capable).
+[[file]]
+path      = "/etc/apt/sources.list.d"
+access    = "rw"
+recursive = true

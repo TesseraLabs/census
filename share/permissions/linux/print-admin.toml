@@ -2,4 +2,12 @@ id       = "print-admin"
 risk     = "contained"
 category = "peripheral"
 groups   = ["lpadmin"]
-sudo     = ["/usr/sbin/cupsctl", "/usr/sbin/lpadmin"]
+sudo     = [
+    "/usr/sbin/cupsctl",
+    "/usr/sbin/lpadmin",
+    "/usr/sbin/cupsaccept",
+    "/usr/sbin/lpc",
+    "/usr/sbin/lpinfo",
+    "/usr/sbin/lpmove",
+    "/usr/sbin/ippeveprinter",
+]

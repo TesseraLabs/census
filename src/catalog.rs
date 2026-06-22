@@ -139,6 +139,121 @@ impl From<CatalogLimits> for Limits {
     }
 }
 
+/// File-access mode a grant requests.
+///
+/// `ro` maps to POSIX ACL `r-X` (read + traverse-only on directories — the `X`
+/// is execute *only* on dirs, so a reader can walk into a tree without gaining
+/// execute on regular files); `rw` maps to `rwX`. The two values form an ordered
+/// lattice for the resolve-time union (`Ro` < `Rw`): two grants on the same path
+/// merge to the wider access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub enum Access {
+    /// Read + directory-traverse (`r-X`).
+    #[serde(rename = "ro")]
+    Ro,
+    /// Read + write + directory-traverse (`rwX`).
+    #[serde(rename = "rw")]
+    Rw,
+}
+
+impl Access {
+    /// Severity rank for the union: `Ro` < `Rw`. An explicit method (not derived
+    /// `Ord`) so the widening order is a documented domain decision rather than an
+    /// accident of variant declaration order.
+    fn rank(self) -> u8 {
+        match self {
+            Access::Ro => 0,
+            Access::Rw => 1,
+        }
+    }
+
+    /// The wider of two accesses (used when unioning grants on the same path).
+    fn max(self, other: Access) -> Access {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// The structural form of a file-grant path, derived deterministically from the
+/// path string plus the grant's `recursive` flag. The form selects which backend
+/// capability must cover the grant (see [`crate::fileaccess`]): `Dir` → `dir`,
+/// `File` → `per_path`, `Pattern` → `pattern`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// A directory grant — the only form the open `AclBackend` enforces reliably
+    /// (recursive + default-ACL, rewrite-proof). New files created in the tree
+    /// inherit the access, so a directory grant survives edit-via-rename and log
+    /// rotation.
+    Dir,
+    /// A grant on one concrete file. Not rewrite-proof via ACL alone (a rename
+    /// makes a new inode), so it needs a capability-`per_path` backend.
+    File,
+    /// A grant on a glob pattern (`*`, `?`, `[`). The filesystem hands out access
+    /// by inode/dir, never by name, so a pattern needs a capability-`pattern`
+    /// backend (watcher / MAC labels).
+    Pattern,
+}
+
+/// Whether a path component string contains a shell-glob metacharacter. Used to
+/// classify a grant as [`Shape::Pattern`]. Only the three POSIX glob metacharacters
+/// are recognised; a literal path with none of these is a concrete dir/file.
+fn has_glob_metachar(path: &str) -> bool {
+    path.contains('*') || path.contains('?') || path.contains('[')
+}
+
+/// A single file-access grant as written in a catalog record, parsed *strictly*.
+///
+/// Strict (`deny_unknown_fields`) for the same reason the whole catalog is: Census
+/// owns this format and materializes it as root (setfacl). An unrecognised key is a
+/// typo or a smuggled field, not something to silently ignore.
+///
+/// The `path` is validated (absolute, no control chars, no `..` component) at the
+/// read boundary; `{param}` placeholders are filled and re-validated at resolve
+/// time, mirroring the parametrized-sudo path exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileGrant {
+    /// Absolute path to a directory, file, or glob pattern.
+    pub path: String,
+    /// Read-only or read-write.
+    pub access: Access,
+    /// For directories: apply recursively and set a default-ACL so new files in
+    /// the tree inherit the access. Absent defaults to `false`.
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+impl FileGrant {
+    /// Derive the structural [`Shape`] of this grant deterministically.
+    ///
+    /// The rule (fixed and documented so authors and the engine agree):
+    ///   1. the path contains a glob metachar (`*`, `?`, `[`) → [`Shape::Pattern`];
+    ///   2. else `recursive == true` OR the path ends with `/` → [`Shape::Dir`];
+    ///   3. else → [`Shape::File`].
+    ///
+    /// Rationale: the filesystem hands out access by inode/dir, never by name, so a
+    /// glob is always a Pattern (needs a pattern-capable backend). Among concrete
+    /// paths the *author's intent* is what disambiguates a directory from a file:
+    /// a directory grant is the rewrite-proof form (recursive + default-ACL), and an
+    /// author who wants a directory writes `recursive = true` (or a trailing slash).
+    /// A bare path with neither marker is treated as a single file — which the open
+    /// `AclBackend` deliberately refuses, steering the author to widen it to a
+    /// directory or install a per-file backend. This matches the design's examples:
+    /// the canonical directory grant there is `path = "/etc/ssh" recursive = true`.
+    pub fn shape(&self) -> Shape {
+        if has_glob_metachar(&self.path) {
+            Shape::Pattern
+        } else if self.recursive || self.path.ends_with('/') {
+            Shape::Dir
+        } else {
+            Shape::File
+        }
+    }
+}
+
 /// A single catalog policy record, parsed strictly.
 ///
 /// One `PermissionDef` is one *layer's* statement about an id. The cross-layer
@@ -181,6 +296,11 @@ pub struct PermissionDef {
     /// Categories this permission aggregates. Inert in slice 1.
     #[serde(default)]
     pub include_categories: Vec<String>,
+
+    /// File-access grants this permission carries (`[[file]]` sub-tables). Each
+    /// is parsed strictly and its path validated at the read boundary.
+    #[serde(default, rename = "file")]
+    pub files: Vec<FileGrant>,
 }
 
 impl PermissionDef {
@@ -230,6 +350,32 @@ impl PermissionDef {
                 });
             }
         }
+        // Every file-grant path is materialized into a root `setfacl` target.
+        // Validate each literal path here so a relative/`..`/control-bearing path
+        // fails closed at parse, naming the offending id. A templated path
+        // (`{param}`) is validated after substitution by the resolver; the static
+        // gate still rejects the always-illegal defects (control chars, empty).
+        for grant in &self.files {
+            if let Some(reason) = file_path_static_defect(&grant.path) {
+                return Err(CatalogError::InvalidFilePath {
+                    id: self.id.clone(),
+                    path: grant.path.clone(),
+                    reason,
+                });
+            }
+            // A trailing '/' denotes a directory grant (Shape::Dir), which the
+            // AclBackend always materializes recursively with a default-ACL. Pairing
+            // it with `recursive = false` is contradictory: the flag would be
+            // silently ineffective. Reject it so the author resolves the intent
+            // explicitly rather than being surprised by a recursive grant.
+            if grant.path.ends_with('/') && !grant.recursive && !has_placeholder(&grant.path) {
+                return Err(CatalogError::InvalidFilePath {
+                    id: self.id.clone(),
+                    path: grant.path.clone(),
+                    reason: "trailing '/' denotes a recursive directory grant; set recursive=true or remove the trailing slash for a file grant",
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -275,6 +421,64 @@ fn sudo_command_static_defect(value: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Validate a file-grant path destined for `setfacl`/`getfacl` as root. Returns
+/// the rejection reason, or `None` if the path is a fit absolute path.
+///
+/// The same threat shape as a sudo Cmnd, plus path-traversal: Census runs
+/// `setfacl -R --physical -m u:<acct>:… <path>` as root, so a path with a control
+/// char (an embedded newline could split an argv-built command in a future
+/// shell-using context, and is meaningless in a real path), a non-absolute path
+/// (we only ever operate on absolute targets), or a `..` component (a traversal
+/// primitive that could point the recursive ACL mutation outside the intended
+/// tree) is unfit. Empty is rejected too. This is the static gate applied to a
+/// literal path at parse time *and* — via [`file_path_defect_substituted`] — to a
+/// `{param}`-rendered path before it reaches root.
+fn file_path_static_defect(path: &str) -> Option<&'static str> {
+    if path.chars().any(char::is_control) {
+        Some("contains a control character")
+    } else if path.trim().is_empty() {
+        Some("is empty or whitespace-only")
+    } else if has_placeholder(path) {
+        // A template path is validated AFTER substitution (the literal `{path}` is
+        // not yet a concrete target). We still rejected control chars / empties
+        // above; the absolute-path and `..` checks are deferred to the rendered
+        // result so a placeholder that legitimately supplies the leading segment is
+        // not wrongly rejected here. The post-substitution gate is authoritative.
+        None
+    } else if !path.starts_with('/') {
+        Some("must be an absolute path (start with '/')")
+    } else if has_dotdot_component(path) {
+        Some("must not contain a `..` path component")
+    } else {
+        None
+    }
+}
+
+/// The post-substitution file-path gate: the SAME rule a literal path passes, but
+/// applied unconditionally (no placeholder escape) to a concrete rendered path.
+/// A `{param}`-filled path that turns out non-absolute, control-bearing, or
+/// `..`-bearing fails closed here before any root `setfacl`.
+fn file_path_defect_substituted(path: &str) -> Option<&'static str> {
+    if path.chars().any(char::is_control) {
+        Some("contains a control character")
+    } else if path.trim().is_empty() {
+        Some("is empty or whitespace-only")
+    } else if !path.starts_with('/') {
+        Some("must be an absolute path (start with '/')")
+    } else if has_dotdot_component(path) {
+        Some("must not contain a `..` path component")
+    } else {
+        None
+    }
+}
+
+/// Whether `path` has a `..` as a whole `/`-separated component. A literal `..`
+/// inside a longer name (`a..b`) is not a traversal and is allowed; only the bare
+/// `..` component is a climb-the-tree primitive.
+fn has_dotdot_component(path: &str) -> bool {
+    path.split('/').any(|c| c == "..")
 }
 
 /// The OS target a catalog is resolved against, and the source of the layer
@@ -747,6 +951,39 @@ pub struct SourcedPrimitive {
     pub via: Option<String>,
 }
 
+/// A file-access grant after resolve: its path, access, recursion, derived
+/// [`Shape`], and the per-grant provenance (which layers — and, through a bundle,
+/// which member — contributed it). Grants on the same path are unioned across
+/// layers/members: access widens to the max (`Ro` < `Rw`), `recursive` is the OR,
+/// and provenance accumulates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFileGrant {
+    /// Absolute path (literal, already `{param}`-substituted if it was templated).
+    pub path: String,
+    /// Effective access (the max over every contributing grant on this path).
+    pub access: Access,
+    /// Effective recursion (the OR over every contributing grant on this path).
+    pub recursive: bool,
+    /// Structural form, derived from the path + effective `recursive` flag. Selects
+    /// the backend capability that must cover this grant.
+    pub shape: Shape,
+    /// Every layer (and bundle member, via) that contributed to this grant.
+    pub sources: Vec<SourcedFileGrant>,
+}
+
+/// Provenance of a single contributing file-grant: the layer that stated it and,
+/// when it reached the result through a bundle, the member id that declared it.
+/// Per-grant (not per-permission) because a permission's file grants can come from
+/// different layers, and audit must show the exact source of each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedFileGrant {
+    /// The catalog layer that contributed this grant.
+    pub layer: String,
+    /// The member permission id that pulled it in via a bundle, or `None` for a
+    /// grant the resolved permission declares itself (leaf resolve sets `None`).
+    pub via: Option<String>,
+}
+
 /// A fully-resolved single permission: primitives with per-primitive provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPermission {
@@ -758,6 +995,8 @@ pub struct ResolvedPermission {
     pub groups: Vec<SourcedPrimitive>,
     /// Sudo commands, each tagged with its source layer.
     pub sudo: Vec<SourcedPrimitive>,
+    /// File-access grants, unioned by path with per-grant provenance.
+    pub file_grants: Vec<ResolvedFileGrant>,
     /// Resource limits, if any layer set them.
     pub limits: Option<Limits>,
     /// The layer that contributed `limits`, if any.
@@ -863,6 +1102,20 @@ pub enum CatalogError {
         id: String,
         /// The rejected sudo command value.
         value: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+    /// A `[[file]]` grant path is unfit to materialize into a root `setfacl`
+    /// target. Census runs `setfacl -R --physical` on this path as root, so a
+    /// non-absolute path, a `..` component (a traversal that could point the
+    /// recursive ACL mutation outside the intended tree), a control char, or an
+    /// empty value is rejected at the read boundary — before root materialization.
+    #[error("invalid file path {path:?} in permission {id}: {reason}")]
+    InvalidFilePath {
+        /// The permission id carrying the bad path.
+        id: String,
+        /// The rejected file path.
+        path: String,
         /// Why it was rejected.
         reason: &'static str,
     },
@@ -978,6 +1231,12 @@ pub fn resolve_leaf(
 
     let mut groups: Vec<SourcedPrimitive> = Vec::new();
     let mut sudo: Vec<SourcedPrimitive> = Vec::new();
+    // File grants accumulate per layer as (grant, contributing layer) before the
+    // by-path union. They follow the SAME `replace=true` wipe semantics as the
+    // list primitives: a full-override layer drops everything lower layers
+    // contributed. Across non-replacing layers grants simply accumulate (then
+    // union below), since file grants have no per-grant bare-vs-append distinction.
+    let mut raw_files: Vec<(FileGrant, String)> = Vec::new();
     let mut risk: Option<Risk> = None;
     let mut limits: Option<Limits> = None;
     let mut limits_layer: Option<String> = None;
@@ -994,12 +1253,16 @@ pub fn resolve_leaf(
         if def.replace {
             groups.clear();
             sudo.clear();
+            raw_files.clear();
             limits = None;
             limits_layer = None;
         }
 
         apply_list_override(&mut groups, &def.groups, layer, None);
         apply_list_override(&mut sudo, &def.sudo, layer, None);
+        for grant in def.files {
+            raw_files.push((grant, layer.clone()));
+        }
 
         if let Some(r) = def.risk {
             risk = Some(r); // topmost setter wins
@@ -1014,12 +1277,15 @@ pub fn resolve_leaf(
         return Err(CatalogError::UnknownPermission(id.to_owned()));
     }
 
+    let file_grants = union_file_grants(raw_files, None);
+
     Ok((
         ResolvedPermission {
             id: id.to_owned(),
             risk,
             groups,
             sudo,
+            file_grants,
             limits,
             limits_layer,
             category_members: Vec::new(),
@@ -1027,6 +1293,75 @@ pub fn resolve_leaf(
         },
         warnings,
     ))
+}
+
+/// Union raw `(FileGrant, layer)` pairs into [`ResolvedFileGrant`]s keyed by path.
+///
+/// Grants on the same `path` merge: access widens to the max (`Ro` < `Rw`),
+/// `recursive` is the OR, and every contributing layer/member is recorded in
+/// `sources`. Path order is the first-seen order so the resolved list is stable.
+/// `shape` is derived from the path plus the *effective* (OR'd) `recursive` flag,
+/// so a path stated once as a file and once as recursive resolves to a directory.
+/// `via` tags the bundle member that pulled grants in (`None` for a leaf).
+fn union_file_grants(raw: Vec<(FileGrant, String)>, via: Option<&str>) -> Vec<ResolvedFileGrant> {
+    let mut out: Vec<ResolvedFileGrant> = Vec::new();
+    for (grant, layer) in raw {
+        let source = SourcedFileGrant {
+            layer,
+            via: via.map(str::to_owned),
+        };
+        if let Some(existing) = out.iter_mut().find(|g| g.path == grant.path) {
+            existing.access = existing.access.max(grant.access);
+            existing.recursive = existing.recursive || grant.recursive;
+            // Recompute the derived shape against the now-effective recursive flag.
+            existing.shape = FileGrant {
+                path: existing.path.clone(),
+                access: existing.access,
+                recursive: existing.recursive,
+            }
+            .shape();
+            existing.sources.push(source);
+        } else {
+            out.push(ResolvedFileGrant {
+                path: grant.path.clone(),
+                access: grant.access,
+                recursive: grant.recursive,
+                shape: grant.shape(),
+                sources: vec![source],
+            });
+        }
+    }
+    out
+}
+
+/// Union already-resolved file grants from several permissions into one set,
+/// keyed by path — the SAME merge rule the in-permission resolve uses (access
+/// widens to the max, `recursive` is the OR, `shape` is recomputed against the
+/// effective recursive flag, and every contributing grant's `sources` are
+/// concatenated). Used by [`crate::model::resolve`] to combine the file grants
+/// of all the permissions a single role-account carries; a role declaring two
+/// permissions that both grant the same path must end up with one widened grant,
+/// not two. Path order is first-seen so the result is stable.
+pub fn union_resolved_file_grants(
+    grants: impl IntoIterator<Item = ResolvedFileGrant>,
+) -> Vec<ResolvedFileGrant> {
+    let mut out: Vec<ResolvedFileGrant> = Vec::new();
+    for grant in grants {
+        if let Some(existing) = out.iter_mut().find(|g| g.path == grant.path) {
+            existing.access = existing.access.max(grant.access);
+            existing.recursive = existing.recursive || grant.recursive;
+            existing.shape = FileGrant {
+                path: existing.path.clone(),
+                access: existing.access,
+                recursive: existing.recursive,
+            }
+            .shape();
+            existing.sources.extend(grant.sources);
+        } else {
+            out.push(grant);
+        }
+    }
+    out
 }
 
 /// Apply a [`ListOverride`] from `layer` onto an accumulator, tagging each new
@@ -1184,6 +1519,7 @@ fn resolve_inner(
     let (own, mut warnings) = resolve_leaf(id, os, catalog)?;
     let mut groups = own.groups;
     let mut sudo = own.sudo;
+    let mut file_grants = own.file_grants;
     let mut limits = own.limits;
     let mut limits_layer = own.limits_layer;
     let declared_risk = own.risk;
@@ -1248,6 +1584,7 @@ fn resolve_inner(
         // provenance points at the member this bundle directly references.
         union_member_primitives(&mut groups, resolved.groups, member);
         union_member_primitives(&mut sudo, resolved.sudo, member);
+        union_member_file_grants(&mut file_grants, resolved.file_grants, member);
 
         // A member's limits fill in only if the bundle (and earlier members) set
         // none — explicit bundle/own limits win over inherited ones.
@@ -1297,6 +1634,7 @@ fn resolve_inner(
             risk,
             groups,
             sudo,
+            file_grants,
             limits,
             limits_layer,
             category_members,
@@ -1304,6 +1642,44 @@ fn resolve_inner(
         },
         warnings,
     ))
+}
+
+/// Union a member's resolved file grants into the bundle accumulator, merging by
+/// path (access = max, recursive = OR, shape recomputed) and recording the member
+/// id that pulled each grant in via `via`.
+///
+/// Mirrors [`union_file_grants`] but operates on already-resolved member grants,
+/// re-tagging provenance with the directly-referenced member so audit shows which
+/// member this aggregate names — paralleling [`union_member_primitives`].
+fn union_member_file_grants(
+    acc: &mut Vec<ResolvedFileGrant>,
+    members: Vec<ResolvedFileGrant>,
+    via: &str,
+) {
+    for grant in members {
+        if let Some(existing) = acc.iter_mut().find(|g| g.path == grant.path) {
+            existing.access = existing.access.max(grant.access);
+            existing.recursive = existing.recursive || grant.recursive;
+            existing.shape = FileGrant {
+                path: existing.path.clone(),
+                access: existing.access,
+                recursive: existing.recursive,
+            }
+            .shape();
+            // Re-tag each contributing source with the member id this bundle
+            // directly references (the nearest provenance), as primitives do.
+            for mut src in grant.sources {
+                src.via = Some(via.to_owned());
+                existing.sources.push(src);
+            }
+        } else {
+            let mut grant = grant;
+            for src in &mut grant.sources {
+                src.via = Some(via.to_owned());
+            }
+            acc.push(grant);
+        }
+    }
 }
 
 /// Union a member's primitives into the accumulator, deduping by value and
@@ -1460,6 +1836,8 @@ pub fn resolve_with_params(
         substitute_primitives(&resolved.id, resolved.groups, params, &mut used_params, false)?;
     resolved.sudo =
         substitute_primitives(&resolved.id, resolved.sudo, params, &mut used_params, true)?;
+    resolved.file_grants =
+        substitute_file_grants(&resolved.id, resolved.file_grants, params, &mut used_params)?;
 
     for key in params.keys() {
         if !used_params.contains(key) {
@@ -1507,6 +1885,82 @@ fn substitute_primitives(
                 layer: prim.layer.clone(),
                 via: prim.via.clone(),
             });
+        }
+    }
+    Ok(out)
+}
+
+/// Apply parameter substitution to resolved file-grant paths.
+///
+/// A grant `path` may carry `{param}` placeholders, filled exactly as sudo/group
+/// templates are (a list param expands into one grant per element). Each rendered
+/// path is re-validated by the post-substitution file-path gate (absolute, no
+/// `..`, no control char) — the authoritative check for a templated path that the
+/// parse-time static gate deferred — and its `shape` is recomputed against the now
+/// concrete path. After substitution, grants are re-unioned by path so two params
+/// that render to the same path collapse (access = max, recursive = OR).
+fn substitute_file_grants(
+    permission: &str,
+    grants: Vec<ResolvedFileGrant>,
+    params: &std::collections::BTreeMap<String, toml::Value>,
+    used_params: &mut Vec<String>,
+) -> Result<Vec<ResolvedFileGrant>, CatalogError> {
+    let mut rendered: Vec<ResolvedFileGrant> = Vec::new();
+    for grant in grants {
+        let paths = render_template(permission, &grant.path, params, used_params)?;
+        for path in paths {
+            // The post-substitution gate is authoritative for a templated path:
+            // a `{param}` that rendered to a non-absolute, `..`-bearing, or
+            // control-bearing path fails closed here, before any root setfacl.
+            if let Some(reason) = file_path_defect_substituted(&path) {
+                return Err(CatalogError::InvalidFilePath {
+                    id: permission.to_owned(),
+                    path,
+                    reason,
+                });
+            }
+            // Same contradiction the parse-time gate rejects, applied to the
+            // concrete rendered path: a trailing '/' (Shape::Dir) with
+            // `recursive = false` would silently materialize as a recursive grant.
+            if path.ends_with('/') && !grant.recursive {
+                return Err(CatalogError::InvalidFilePath {
+                    id: permission.to_owned(),
+                    path,
+                    reason: "trailing '/' denotes a recursive directory grant; set recursive=true or remove the trailing slash for a file grant",
+                });
+            }
+            let shape = FileGrant {
+                path: path.clone(),
+                access: grant.access,
+                recursive: grant.recursive,
+            }
+            .shape();
+            rendered.push(ResolvedFileGrant {
+                path,
+                access: grant.access,
+                recursive: grant.recursive,
+                shape,
+                sources: grant.sources.clone(),
+            });
+        }
+    }
+
+    // Re-union by path: distinct templated grants may render to the same concrete
+    // path and must collapse exactly as literal duplicates do.
+    let mut out: Vec<ResolvedFileGrant> = Vec::new();
+    for grant in rendered {
+        if let Some(existing) = out.iter_mut().find(|g| g.path == grant.path) {
+            existing.access = existing.access.max(grant.access);
+            existing.recursive = existing.recursive || grant.recursive;
+            existing.shape = FileGrant {
+                path: existing.path.clone(),
+                access: existing.access,
+                recursive: existing.recursive,
+            }
+            .shape();
+            existing.sources.extend(grant.sources);
+        } else {
+            out.push(grant);
         }
     }
     Ok(out)
@@ -1800,6 +2254,7 @@ include_categories = ["network"]
             replace: false,
             includes: Vec::new(),
             include_categories: Vec::new(),
+            files: Vec::new(),
         }
     }
 
@@ -3352,5 +3807,328 @@ include_categories = ["network"]
         // resolve() (no params) leaves the template literal — proving parse passed.
         let (r, _) = resolve("svc", &os, &cat, &ctx()).unwrap();
         assert_eq!(values(&r.sudo), vec!["/usr/bin/systemctl restart {unit}"]);
+    }
+
+    // --- file-access grants (slice 1: format + resolve + shape) ---
+
+    #[test]
+    fn parses_file_grant_ro_rw_recursive() {
+        let def: PermissionDef = toml::from_str(
+            r#"
+id = "ssh-admin"
+[[file]]
+path = "/etc/ssh"
+access = "rw"
+recursive = true
+[[file]]
+path = "/var/log/auth.log"
+access = "ro"
+"#,
+        )
+        .unwrap();
+        assert_eq!(def.files.len(), 2);
+        assert_eq!(def.files[0].path, "/etc/ssh");
+        assert_eq!(def.files[0].access, Access::Rw);
+        assert!(def.files[0].recursive);
+        assert_eq!(def.files[1].access, Access::Ro);
+        // recursive defaults to false when absent.
+        assert!(!def.files[1].recursive);
+    }
+
+    #[test]
+    fn file_grant_unknown_field_rejected() {
+        // deny_unknown_fields on the sub-table: a typo'd key must not be dropped.
+        let src = r#"
+id = "a"
+[[file]]
+path = "/etc/ssh"
+access = "rw"
+bogus = true
+"#;
+        assert!(toml::from_str::<PermissionDef>(src).is_err());
+    }
+
+    #[test]
+    fn file_grant_bad_access_rejected() {
+        let src = r#"
+id = "a"
+[[file]]
+path = "/etc/ssh"
+access = "wo"
+"#;
+        assert!(toml::from_str::<PermissionDef>(src).is_err());
+    }
+
+    fn file_def(id: &str, grants: Vec<FileGrant>) -> PermissionDef {
+        PermissionDef {
+            files: grants,
+            ..def(id)
+        }
+    }
+
+    fn grant(path: &str, access: Access, recursive: bool) -> FileGrant {
+        FileGrant {
+            path: path.to_owned(),
+            access,
+            recursive,
+        }
+    }
+
+    #[test]
+    fn file_path_relative_rejected_at_read_boundary() {
+        // A relative path would become a root setfacl target resolved against cwd.
+        let cat = FakeCatalog::new();
+        let bad = file_def("a", vec![grant("etc/ssh", Access::Rw, true)]);
+        // validate() runs at the read boundary; FakeCatalog.read_layer triggers it.
+        let cat = cat.with("linux", bad);
+        let err = resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CatalogError::InvalidFilePath { ref id, reason, .. }
+                if id == "a" && reason.contains("absolute")
+        ));
+    }
+
+    #[test]
+    fn file_path_dotdot_component_rejected() {
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("a", vec![grant("/etc/ssh/../shadow", Access::Ro, false)]),
+        );
+        let err = resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CatalogError::InvalidFilePath { reason, .. } if reason.contains("..")
+        ));
+    }
+
+    #[test]
+    fn file_path_control_char_rejected() {
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("a", vec![grant("/etc/ss\nh", Access::Ro, false)]),
+        );
+        let err = resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CatalogError::InvalidFilePath { reason, .. } if reason.contains("control")
+        ));
+    }
+
+    #[test]
+    fn dotdot_inside_name_is_allowed() {
+        // `a..b` as a longer component is not a traversal; only a bare `..` is.
+        let g = grant("/etc/my..app", Access::Ro, true);
+        assert_eq!(file_path_static_defect(&g.path), None);
+    }
+
+    #[test]
+    fn shape_derivation_rule() {
+        // recursive=true → Dir.
+        assert_eq!(grant("/etc/ssh", Access::Rw, true).shape(), Shape::Dir);
+        // trailing slash → Dir even without recursive.
+        assert_eq!(grant("/etc/ssh/", Access::Rw, false).shape(), Shape::Dir);
+        // bare path, no recursive, no slash → File (the AclBackend refuses these,
+        // steering authors to widen to a directory).
+        assert_eq!(grant("/etc/ssh", Access::Rw, false).shape(), Shape::File);
+        // glob metachar → Pattern, regardless of recursive.
+        assert_eq!(grant("/var/log/*.log", Access::Ro, false).shape(), Shape::Pattern);
+        assert_eq!(grant("/var/log/*.log", Access::Ro, true).shape(), Shape::Pattern);
+        assert_eq!(grant("/etc/conf?", Access::Ro, false).shape(), Shape::Pattern);
+        assert_eq!(grant("/etc/[abc]", Access::Ro, false).shape(), Shape::Pattern);
+    }
+
+    #[test]
+    fn trailing_slash_with_recursive_false_rejected_at_read_boundary() {
+        // A trailing '/' marks Shape::Dir, which the AclBackend always materializes
+        // recursively; pairing it with recursive=false is contradictory (the flag
+        // is silently ineffective) and must fail closed at the read boundary.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("a", vec![grant("/etc/ssh/", Access::Rw, false)]),
+        );
+        let err = resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CatalogError::InvalidFilePath { ref id, reason, .. }
+                if id == "a" && reason.contains("trailing '/'")
+        ));
+
+        // trailing slash + recursive=true → accepted, resolves as Dir.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("b", vec![grant("/etc/ssh/", Access::Rw, true)]),
+        );
+        let (r, _) =
+            resolve_leaf("b", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap();
+        assert_eq!(r.file_grants[0].shape, Shape::Dir);
+
+        // no trailing slash + recursive=true → accepted, Dir.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("c", vec![grant("/etc/ssh", Access::Rw, true)]),
+        );
+        let (r, _) =
+            resolve_leaf("c", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap();
+        assert_eq!(r.file_grants[0].shape, Shape::Dir);
+
+        // no trailing slash + recursive=false → accepted, File (unchanged).
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("d", vec![grant("/etc/ssh", Access::Rw, false)]),
+        );
+        let (r, _) =
+            resolve_leaf("d", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap();
+        assert_eq!(r.file_grants[0].shape, Shape::File);
+    }
+
+    #[test]
+    fn resolve_collects_file_grant_with_provenance() {
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("ssh-admin", vec![grant("/etc/ssh", Access::Rw, true)]),
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (r, _) = resolve_leaf("ssh-admin", &os, &cat).unwrap();
+        assert_eq!(r.file_grants.len(), 1);
+        let fg = &r.file_grants[0];
+        assert_eq!(fg.path, "/etc/ssh");
+        assert_eq!(fg.access, Access::Rw);
+        assert!(fg.recursive);
+        assert_eq!(fg.shape, Shape::Dir);
+        assert_eq!(fg.sources.len(), 1);
+        assert_eq!(fg.sources[0].layer, "linux");
+        assert!(fg.sources[0].via.is_none());
+    }
+
+    #[test]
+    fn resolve_unions_file_grants_max_access_recursive_or() {
+        // Same path across two layers: ro+rw → rw, and recursive false|true → true.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                file_def("ssh-admin", vec![grant("/etc/ssh", Access::Ro, false)]),
+            )
+            .with(
+                "linux-debian",
+                file_def("ssh-admin", vec![grant("/etc/ssh", Access::Rw, true)]),
+            );
+        let (r, _) = resolve_leaf("ssh-admin", &debian12(), &cat).unwrap();
+        assert_eq!(r.file_grants.len(), 1, "same path must union, not duplicate");
+        let fg = &r.file_grants[0];
+        assert_eq!(fg.access, Access::Rw, "access widens to max");
+        assert!(fg.recursive, "recursive is OR");
+        // Effective recursive flips the file→dir shape.
+        assert_eq!(fg.shape, Shape::Dir);
+        // Both contributing layers are recorded.
+        assert_eq!(fg.sources.len(), 2);
+        assert_eq!(fg.sources[0].layer, "linux");
+        assert_eq!(fg.sources[1].layer, "linux-debian");
+    }
+
+    #[test]
+    fn replace_layer_wipes_file_grants() {
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                file_def("a", vec![grant("/etc/ssh", Access::Ro, true)]),
+            )
+            .with(
+                "linux-debian",
+                PermissionDef {
+                    replace: true,
+                    files: vec![grant("/etc/pam.d", Access::Rw, true)],
+                    ..def("a")
+                },
+            );
+        let (r, _) = resolve_leaf("a", &debian12(), &cat).unwrap();
+        assert_eq!(r.file_grants.len(), 1);
+        assert_eq!(r.file_grants[0].path, "/etc/pam.d");
+    }
+
+    #[test]
+    fn distinct_paths_preserved_in_order() {
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def(
+                "a",
+                vec![
+                    grant("/etc/ssh", Access::Rw, true),
+                    grant("/var/log", Access::Ro, true),
+                ],
+            ),
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (r, _) = resolve_leaf("a", &os, &cat).unwrap();
+        let paths: Vec<&str> = r.file_grants.iter().map(|g| g.path.as_str()).collect();
+        assert_eq!(paths, vec!["/etc/ssh", "/var/log"]);
+    }
+
+    #[test]
+    fn templated_file_path_substitutes_and_revalidates() {
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("app-config", vec![grant("/etc/{app}", Access::Rw, true)]),
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("app", toml::Value::String("nginx".to_owned()))]);
+        let (r, w) = resolve_with_params("app-config", &p, &os, &cat, &ctx()).unwrap();
+        assert_eq!(r.file_grants.len(), 1);
+        assert_eq!(r.file_grants[0].path, "/etc/nginx");
+        assert_eq!(r.file_grants[0].shape, Shape::Dir);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn templated_file_path_list_expands_to_multiple_grants() {
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("app-config", vec![grant("/etc/{app}", Access::Rw, true)]),
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("app", arr(&["nginx", "redis"]))]);
+        let (r, _) = resolve_with_params("app-config", &p, &os, &cat, &ctx()).unwrap();
+        let paths: Vec<&str> = r.file_grants.iter().map(|g| g.path.as_str()).collect();
+        assert_eq!(paths, vec!["/etc/nginx", "/etc/redis"]);
+    }
+
+    #[test]
+    fn templated_file_path_injection_rejected() {
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("app-config", vec![grant("/etc/{app}", Access::Rw, true)]),
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        // A `..` smuggled via the param renders to a traversal path — must be
+        // rejected by the post-substitution gate. The param-value gate also blocks
+        // many metachars; this asserts the file-path gate as the authoritative one
+        // for a value that survives param validation as a plain token.
+        let p = params(vec![("app", toml::Value::String("ssh".to_owned()))]);
+        // Sanity: a clean value passes (so the rejection below is about injection).
+        assert!(resolve_with_params("app-config", &p, &os, &cat, &ctx()).is_ok());
+        // A param-level metachar (`/`) is blocked at the param-value gate before
+        // it can build a traversal path.
+        let bad = params(vec![("app", toml::Value::String("../shadow".to_owned()))]);
+        assert!(resolve_with_params("app-config", &bad, &os, &cat, &ctx()).is_err());
+    }
+
+    #[test]
+    fn templated_whole_path_param_revalidated_by_file_gate() {
+        // The whole path is the placeholder, so the parse-time absolute check was
+        // deferred; the post-substitution file gate must catch a non-absolute or
+        // `..`-bearing render. Use a param value that passes the param-value token
+        // gate but is non-absolute, proving the file gate is the one that fires.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def("a", vec![grant("/{p}", Access::Ro, false)]),
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        // Renders to "/etc" — absolute, fine.
+        let ok = params(vec![("p", toml::Value::String("etc".to_owned()))]);
+        assert!(resolve_with_params("a", &ok, &os, &cat, &ctx()).is_ok());
     }
 }

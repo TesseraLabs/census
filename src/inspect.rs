@@ -48,6 +48,15 @@ pub trait SystemInspector {
     /// free. Used to detect a GID-pin conflict against a DIFFERENT existing
     /// group (the pinned GID is already taken). Read-only.
     fn group_name_by_gid(&self, gid: u32) -> Option<String>;
+    /// The members of group `name` as the OS currently lists them (the
+    /// comma-separated member field of `getent group`). Empty when the group is
+    /// absent or has no members. Read-only — used at adopt time to snapshot the
+    /// group's pre-existing members into its baseline, so a later release can
+    /// strip only Census-added members and leave the foreign ones intact. A
+    /// default impl returns empty so pre-existing fakes/callers keep compiling.
+    fn group_members(&self, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// `Some(true)` if the shadow password field is locked (starts with `!` or
     /// `*`), `Some(false)` if unlocked, `None` if the account/shadow entry is
     /// absent or unreadable.
@@ -57,6 +66,29 @@ pub trait SystemInspector {
     /// Accounts whose GECOS field carries a Census role marker
     /// (`census-role-…`). Used to detect a spoofed marker not in the registry.
     fn census_marked_accounts(&self) -> Vec<String>;
+    /// Whether the `census-grp-<group>` sudoers fragment Census owns for `group`
+    /// is present on disk.
+    ///
+    /// `Some(true)` if the fragment file exists, `Some(false)` if it is absent,
+    /// `None` if presence cannot be determined (the sudoers directory is
+    /// unreadable). Read-only — checks file existence only, never the contents.
+    /// Used by doctor's adopted-group drift check: an adopted group whose
+    /// registry records group sudo commands but whose fragment was removed out of
+    /// band has drifted. A default impl returns `None` so fakes/callers that
+    /// predate the check keep compiling and the check stays best-effort (a `None`
+    /// is never a finding).
+    fn group_sudoers_fragment_present(&self, _group: &str) -> Option<bool> {
+        None
+    }
+    /// Whether `account` currently has its own POSIX ACL access entry on `path`.
+    ///
+    /// `Some(true)` if a `user:<account>:…` access entry is present, `Some(false)`
+    /// if the path is readable but carries no such entry (a managed file grant that
+    /// drifted away), `None` if the answer cannot be determined (no `getfacl`, path
+    /// absent/unreadable). Read-only: `getfacl` never mutates. Used by doctor's
+    /// file-access drift check, which is best-effort — a `None` is not a finding.
+    fn file_access_present(&self, path: &str, account: &str) -> Option<bool>;
+
     /// Accounts NOT in `managed` that can actually log in — the rescue/break-glass
     /// set the anti-lockout check (§7) wants to be non-empty.
     ///
@@ -162,6 +194,22 @@ impl LiveInspector {
     fn is_rescue_eligible(is_login_shell: bool, password_locked: Option<bool>, has_keys: bool) -> bool {
         is_login_shell && (password_locked == Some(false) || has_keys)
     }
+
+    /// Whether a `getfacl` dump carries a NAMED user ACL entry for `account`.
+    ///
+    /// `getfacl` lines look like `user:alice:rwx` (named) vs `user::rwx` (the file
+    /// owner — an EMPTY name field). We must match only the named form for our
+    /// account, so the check is on the exact `user:<account>:` prefix; the bare
+    /// owner entry `user::…` never matches a non-empty account. A `default:user:…`
+    /// (default-ACL) line for the account also counts — it is how a directory grant
+    /// makes new files inherit access. Pure so it is unit-tested without `getfacl`.
+    fn acl_has_user_entry(dump: &str, account: &str) -> bool {
+        let named = format!("user:{account}:");
+        let default_named = format!("default:user:{account}:");
+        dump.lines().map(str::trim).any(|line| {
+            line.starts_with(&named) || line.starts_with(&default_named)
+        })
+    }
 }
 
 impl SystemInspector for LiveInspector {
@@ -192,6 +240,27 @@ impl SystemInspector for LiveInspector {
         Some(name)
     }
 
+    fn group_members(&self, name: &str) -> Vec<String> {
+        // `getent group <name>` → `name:passwd:gid:member1,member2`. Field 3 is
+        // the comma-separated member list (empty when none). Absent group → none.
+        let Some(text) = Self::getent("group", Some(name)) else {
+            return Vec::new();
+        };
+        let Some(line) = text.lines().next() else {
+            return Vec::new();
+        };
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() < 4 {
+            return Vec::new();
+        }
+        f[3]
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn password_locked(&self, name: &str) -> Option<bool> {
         // `getent shadow <name>` → `name:passwd:...`. The second field is the
         // hash; a leading `!` or `*` means locked/no-login. Empty field = absent
@@ -205,6 +274,19 @@ impl SystemInspector for LiveInspector {
 
     fn has_authorized_keys(&self, _name: &str, home: &Path) -> bool {
         home.join(".ssh").join("authorized_keys").exists()
+    }
+
+    fn group_sudoers_fragment_present(&self, group: &str) -> Option<bool> {
+        // The fragment Census owns for a role-bound group lives at
+        // `<SUDOERS_DIR>/census-grp-<group>`. Read-only existence check: if the
+        // sudoers directory itself is unreadable we cannot tell (None), otherwise
+        // the file either exists (Some(true)) or was removed (Some(false)).
+        let dir = Path::new(crate::sudoers::SUDOERS_DIR);
+        if std::fs::metadata(dir).is_err() {
+            return None;
+        }
+        let fragment = dir.join(crate::sudoers::sudoers_group_filename(group));
+        Some(fragment.exists())
     }
 
     fn census_marked_accounts(&self) -> Vec<String> {
@@ -223,6 +305,24 @@ impl SystemInspector for LiveInspector {
             }
         }
         out
+    }
+
+    fn file_access_present(&self, path: &str, account: &str) -> Option<bool> {
+        // `getfacl --omit-header --absolute-names <path>` lists the ACL entries.
+        // Read-only, argv array (no shell). A spawn failure (no getfacl) or a
+        // non-zero exit (path absent/unreadable) yields `None` — best-effort, not a
+        // finding. The `user:<account>:` entry is what `setfacl -m u:<acct>:…` set.
+        let out = Command::new("getfacl")
+            .arg("--omit-header")
+            .arg("--absolute-names")
+            .arg(path)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(out.stdout).ok()?;
+        Some(Self::acl_has_user_entry(&text, account))
     }
 
     fn login_capable_non_managed(&self, managed: &BTreeSet<String>) -> Vec<String> {
@@ -262,6 +362,9 @@ pub struct FakeInspector {
     pub accounts: std::collections::BTreeMap<String, AccountFacts>,
     /// Live groups keyed by name.
     pub groups: std::collections::BTreeMap<String, GroupFacts>,
+    /// Live group members keyed by group name (the OS member list). Used to
+    /// snapshot an adopted group's baseline members.
+    pub group_members: std::collections::BTreeMap<String, Vec<String>>,
     /// Per-account password lock state (absent = `None`).
     pub locked: std::collections::BTreeMap<String, bool>,
     /// Accounts that have `authorized_keys`.
@@ -270,6 +373,15 @@ pub struct FakeInspector {
     pub marked: Vec<String>,
     /// Login-capable accounts (used to derive the non-managed rescue set).
     pub login_capable: BTreeSet<String>,
+    /// File-access ACL state for the drift check, keyed by `(path, account)`:
+    /// `true` = entry present, `false` = path readable but no entry. A key that is
+    /// absent maps to `None` (cannot determine — best-effort).
+    pub file_acls: std::collections::BTreeMap<(String, String), bool>,
+    /// Presence of the `census-grp-<group>` sudoers fragment, keyed by group
+    /// name: `true` = on disk, `false` = removed. An absent key maps to `None`
+    /// (cannot determine — best-effort), matching the live inspector's behavior
+    /// when the sudoers directory is unreadable.
+    pub group_sudoers_fragments: std::collections::BTreeMap<String, bool>,
 }
 
 #[cfg(test)]
@@ -289,6 +401,10 @@ impl SystemInspector for FakeInspector {
             .map(|(n, _)| n.clone())
     }
 
+    fn group_members(&self, name: &str) -> Vec<String> {
+        self.group_members.get(name).cloned().unwrap_or_default()
+    }
+
     fn password_locked(&self, name: &str) -> Option<bool> {
         self.locked.get(name).copied()
     }
@@ -297,8 +413,18 @@ impl SystemInspector for FakeInspector {
         self.authorized_keys.contains(name)
     }
 
+    fn group_sudoers_fragment_present(&self, group: &str) -> Option<bool> {
+        self.group_sudoers_fragments.get(group).copied()
+    }
+
     fn census_marked_accounts(&self) -> Vec<String> {
         self.marked.clone()
+    }
+
+    fn file_access_present(&self, path: &str, account: &str) -> Option<bool> {
+        self.file_acls
+            .get(&(path.to_owned(), account.to_owned()))
+            .copied()
     }
 
     fn login_capable_non_managed(&self, managed: &BTreeSet<String>) -> Vec<String> {
@@ -358,6 +484,16 @@ mod tests {
     }
 
     #[test]
+    fn fake_group_members_round_trip() {
+        let mut fake = FakeInspector::default();
+        fake.group_members
+            .insert("wheel".into(), vec!["root".into(), "admin".into()]);
+        assert_eq!(fake.group_members("wheel"), vec!["root", "admin"]);
+        // Absent group → empty member list (the default-impl behavior too).
+        assert!(fake.group_members("absent").is_empty());
+    }
+
+    #[test]
     fn parse_passwd_line_rejects_non_numeric_uid() {
         let line = "oper:x:notanum:9010:gecos:/home/oper:/bin/bash";
         assert!(LiveInspector::parse_passwd_line(line).is_none());
@@ -394,6 +530,28 @@ mod tests {
 
         // Login shell + unreadable shadow but has keys: IS a rescue.
         assert!(LiveInspector::is_rescue_eligible(true, None, true));
+    }
+
+    #[test]
+    fn acl_has_user_entry_matches_named_not_owner() {
+        // A getfacl dump: owner entry `user::`, named entries `user:alice:` and a
+        // default-ACL `default:user:alice:`. Only the NAMED account matches; the
+        // bare owner `user::rwx` must NOT be read as a match for "alice".
+        let dump = "\
+user::rwx
+user:alice:r-x
+group::r-x
+mask::r-x
+other::r-x
+default:user:alice:rwx
+";
+        assert!(LiveInspector::acl_has_user_entry(dump, "alice"));
+        assert!(LiveInspector::acl_has_user_entry(dump, "alice")); // default form too
+        // A different account is not present.
+        assert!(!LiveInspector::acl_has_user_entry(dump, "bob"));
+        // The owner entry (empty name) must not match an account named "".
+        let owner_only = "user::rwx\ngroup::r-x\nother::r-x\n";
+        assert!(!LiveInspector::acl_has_user_entry(owner_only, "alice"));
     }
 
     #[test]

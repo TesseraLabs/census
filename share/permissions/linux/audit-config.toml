@@ -2,3 +2,9 @@ id       = "audit-config"
 risk     = "escalation-capable"
 category = "observability"
 sudo     = ["/usr/sbin/auditctl", "/usr/sbin/augenrules"]
+
+# auditd.conf and the rules.d drop-ins under /etc/audit are what this role edits.
+[[file]]
+path      = "/etc/audit"
+access    = "rw"
+recursive = true

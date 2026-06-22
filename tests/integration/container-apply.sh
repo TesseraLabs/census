@@ -464,5 +464,215 @@ assert     "unknown class rejected (non-zero)" "[ $rc27b -ne 0 ]"
 out27c="$(COV --class group --min-coverage 0)"; rc27c=$?
 assert     "min-coverage 0 always met (exit 0)" "[ $rc27c -eq 0 ]"
 
+echo "== scenario 28-31: FILE-ACCESS (POSIX ACL) — directory grant materialized as ACL =="
+# Isolated subtree. Role `faop` carries the catalog permission `ssh-admin`, whose
+# `[[file]] path="/etc/ssh" recursive=true access="rw"` is a DIRECTORY grant. The
+# free `AclBackend` enforces it via `setfacl -R --physical -m u:faop:rwX /etc/ssh`
+# plus a default-ACL pass (so new files in the tree inherit the access — rewrite-
+# proof). File/Pattern (non-directory) grants are capability-gated: the free
+# backend refuses them fail-closed (sc.31). Real catalog facts asserted from
+# share/permissions/linux/ssh-admin.toml.
+FROOT="$ROOT/fa"; FSTORE="$FROOT/roles"; FMAN="$FROOT/managed.toml"
+mkdir -p "$FSTORE"
+# /etc/ssh exists on bookworm; create it defensively so the ACL target is present.
+[ -d /etc/ssh ] || mkdir -p /etc/ssh
+f_store() { # $1 = permissions array contents (e.g. '"ssh-admin"')
+  cat > "$FSTORE/faop.toml" <<EOF
+role = "faop"
+version = 1
+os = "linux"
+name = "FileAccessOp"
+level = 5
+[payload]
+permissions = [$1]
+EOF
+}
+f_decl() { # $1 = version
+  cat > "$FROOT/decl.toml" <<EOF
+version = $1
+role_store = "$FSTORE"
+[defaults]
+uid_range = [9000, 9999]
+shell = "/bin/bash"
+home_base = "/var/lib/census/home"
+[[role_account]]
+role = "faop"
+uid = 9070
+EOF
+}
+f_apply() { "$CENSUS" apply --declaration "$FROOT/decl.toml" --managed "$FMAN" --trust-fs --i-understand-no-rescue --catalog-dir /work/share/permissions 2>&1; }
+
+echo "-- 28: directory grant materializes as access + default ACL (any-tool access) --"
+f_store '"ssh-admin"'
+f_decl 1
+echo ":: $(f_apply)"
+assert     "faop account exists"                     "getent passwd faop >/dev/null"
+assert     "faop uid is 9070"                         "[ \"\$(id -u faop)\" = 9070 ]"
+assert     "getfacl /etc/ssh has user:faop:rwx"       "getfacl --omit-header /etc/ssh 2>/dev/null | grep -q '^user:faop:rwx'"
+assert     "getfacl /etc/ssh has default:user:faop:rwx" "getfacl --omit-header /etc/ssh 2>/dev/null | grep -q '^default:user:faop:rwx'"
+assert     "managed.toml records faop file_grants"    "grep -qE 'file_grants|/etc/ssh' $FMAN"
+
+echo "-- 29: rewrite-proof — a NEW file in the tree inherits the default ACL --"
+# Simulate an edit-by-create (attacker/admin drops a fresh file); the default ACL
+# means faop still has access without any re-apply.
+touch /etc/ssh/test_newfile.conf
+assert     "new file inherits user:faop:rw"           "getfacl --omit-header /etc/ssh/test_newfile.conf 2>/dev/null | grep -q '^user:faop:rw'"
+rm -f /etc/ssh/test_newfile.conf
+
+echo "-- 30: revoke removes ONLY our entry; a foreign ACL entry survives --"
+# Plant a foreign named-user ACL entry first, so revocation precision is provable.
+useradd -M faother 2>/dev/null || true
+setfacl -m u:faother:rx /etc/ssh
+f_store ''                                            # faop drops ssh-admin (no permissions)
+f_decl 2                                              # bump version
+echo ":: $(f_apply)"
+assert_not "faop ACL entry removed on /etc/ssh"       "getfacl --omit-header /etc/ssh 2>/dev/null | grep -q '^user:faop:'"
+assert     "foreign faother ACL entry intact"         "getfacl --omit-header /etc/ssh 2>/dev/null | grep -q '^user:faother:'"
+assert     "faop account retained"                    "getent passwd faop >/dev/null"
+
+echo "-- 31: File/Pattern grant is capability-gated — refused fail-closed, no mutation --"
+# Author a SMALL local catalog with one permission whose grant is a BARE FILE
+# (no recursive, no trailing slash → Shape::File). The free AclBackend enforces
+# directory grants only, so apply must FAIL and mutate nothing.
+FCAT="$FROOT/cat"; mkdir -p "$FCAT/linux"
+cat > "$FCAT/linux/fa-file.toml" <<'EOF'
+id       = "fa-file"
+risk     = "escalation-capable"
+category = "identity"
+
+[[file]]
+path   = "/etc/hosts"
+access = "rw"
+EOF
+f_store '"fa-file"'
+f_decl 3                                              # bump version
+out31="$("$CENSUS" apply --declaration "$FROOT/decl.toml" --managed "$FMAN" --trust-fs --i-understand-no-rescue --catalog-dir "$FCAT" 2>&1)"; rc31=$?
+echo ":: $out31"
+assert     "file-grant apply fails (capability-gated)" "[ $rc31 -ne 0 ]"
+assert     "error names file/backend/directory"        "echo \"\$out31\" | grep -qiE 'file|backend|director|capab'"
+assert_not "no faop ACL entry on /etc/hosts (no mutation)" "getfacl --omit-header /etc/hosts 2>/dev/null | grep -q '^user:faop:'"
+
+echo "== scenario 32-38: GROUP-GRANTS (role_group → %group sudoers + g:group ACL + managed members + adopt/release/delete) =="
+# Isolated subtree. A role bound to a group via [[role_group]] projects the role's
+# catalog-expanded grants ONTO the group: its sudo commands become a `%group`
+# sudoers fragment (census-grp-<g>) and its directory file grants become g:group
+# ACLs. The free backend enforces directory grants only (same gate as sc.28-31).
+# Two catalog permissions drive the grants — real facts from share/permissions:
+#   network-admin → sudo=[/usr/sbin/ip, …], groups=[netdev] (dropped on a group target)
+#   ssh-admin     → sudo=[…], file [[/etc/ssh]] recursive rw  (the g:group ACL unit)
+# Both are bound to one Created group `netadmins`, so a single apply materializes
+# the sudo fragment AND the ACL; sc.32/33 assert each facet of that same state.
+#
+# The security invariant under test (sc.35/36): an ADOPTED group is never created
+# or deleted by Census and its pre-existing (foreign) members are never touched —
+# release returns it to baseline (groupdel is FORBIDDEN on adopted), while a
+# CREATED group is fully groupdel'd when it leaves the declaration (sc.37).
+GGROOT="$ROOT/gg"; GGSTORE="$GGROOT/roles"; GGMAN="$GGROOT/managed.toml"
+mkdir -p "$GGSTORE"
+# The role bound to the group carries ONLY catalog permissions (group grants are
+# permission-expanded — raw sudo_role/groups have no group-target meaning).
+cat > "$GGSTORE/grpadmin.toml" <<EOF
+role = "grpadmin"
+version = 1
+os = "linux"
+name = "GroupAdmin"
+level = 5
+[payload]
+permissions = ["network-admin", "ssh-admin"]
+EOF
+
+# gg_decl writes the declaration from explicit group/role_group/account blocks.
+# $1 = version ; $2 = body (the [[group]]/[[role_group]]/[[role_account]] blocks).
+gg_decl() {
+  cat > "$GGROOT/decl.toml" <<EOF
+version = $1
+role_store = "$GGSTORE"
+[defaults]
+uid_range = [9000, 9999]
+shell = "/bin/bash"
+home_base = "/var/lib/census/home"
+$2
+EOF
+}
+gg_apply() { "$CENSUS" apply --declaration "$GGROOT/decl.toml" --managed "$GGMAN" --trust-fs --i-understand-no-rescue --catalog-dir /work/share/permissions 2>&1; }
+
+# /etc/ssh exists on bookworm; create it defensively so the g:group ACL target is present.
+[ -d /etc/ssh ] || mkdir -p /etc/ssh
+
+echo "-- 32 & 33: created group netadmins gets %group sudoers + g:group ACL from a bound role --"
+# netadmins is CREATED (no adopt). grpadmin's grants project onto it via [[role_group]].
+GG_BODY_CREATE=$'[[group]]\nname = "netadmins"\ngid = 8700\n\n[[role_group]]\nrole = "grpadmin"\ngroup = "netadmins"'
+gg_decl 1 "$GG_BODY_CREATE"
+echo ":: $(gg_apply)"
+# 32 — group sudo grant
+assert     "netadmins group created"                  "getent group netadmins >/dev/null"
+assert     "netadmins has pinned gid 8700"            "[ \"\$(getent group netadmins | cut -d: -f3)\" = 8700 ]"
+assert     "census-grp-netadmins fragment present"    "test -f $SUDOERS/census-grp-netadmins"
+assert     "census-grp-netadmins passes visudo"       "visudo -c -f $SUDOERS/census-grp-netadmins >/dev/null 2>&1"
+assert     "fragment has %netadmins subject"          "grep -q '%netadmins' $SUDOERS/census-grp-netadmins"
+assert     "fragment has concrete /usr/sbin/ip"       "grep -q '/usr/sbin/ip' $SUDOERS/census-grp-netadmins"
+assert     "managed.toml records netadmins group"     "grep -q 'name = \"netadmins\"' $GGMAN"
+assert     "managed.toml netadmins provenance created" "grep -A8 'name = \"netadmins\"' $GGMAN | grep -q 'provenance = \"created\"'"
+# 33 — group file grant (g:group ACL on the /etc/ssh directory unit)
+assert     "getfacl /etc/ssh has group:netadmins:rwx"         "getfacl --omit-header /etc/ssh 2>/dev/null | grep -q '^group:netadmins:rwx'"
+assert     "getfacl /etc/ssh has default:group:netadmins:rwx" "getfacl --omit-header /etc/ssh 2>/dev/null | grep -q '^default:group:netadmins:rwx'"
+
+echo "-- 34: managed members are added via gpasswd (surgical) --"
+# someuser is a real (non-member) account; declaring it under the group's members
+# must fold it in via `gpasswd -a` and record it in members_added.
+useradd -M someuser 2>/dev/null || true
+GG_BODY_MEMBER=$'[[group]]\nname = "netadmins"\ngid = 8700\nmembers = ["someuser"]\n\n[[role_group]]\nrole = "grpadmin"\ngroup = "netadmins"'
+gg_decl 2 "$GG_BODY_MEMBER"
+echo ":: $(gg_apply)"
+assert     "someuser is a member of netadmins"        "id -nG someuser | grep -qw netadmins"
+assert     "managed.toml records members_added"       "grep -A10 'name = \"netadmins\"' $GGMAN | grep -q 'members_added' && grep -A10 'name = \"netadmins\"' $GGMAN | grep -q 'someuser'"
+
+echo "-- 35: ADOPT a pre-existing group — never recreated, foreign members preserved --"
+# adopted_grp is created OUTSIDE Census with a foreign member; Census adopts it,
+# binds the role's grants, but must NOT renumber it or evict the foreign member.
+groupadd adopted_grp
+ADOPTED_GID="$(getent group adopted_grp | cut -d: -f3)"
+useradd -M foreignmember 2>/dev/null || true
+gpasswd -a foreignmember adopted_grp >/dev/null 2>&1
+GG_BODY_ADOPT="$GG_BODY_MEMBER"$'\n\n[[group]]\nname = "adopted_grp"\nadopt = true\n\n[[role_group]]\nrole = "grpadmin"\ngroup = "adopted_grp"'
+gg_decl 3 "$GG_BODY_ADOPT"
+echo ":: $(gg_apply)"
+assert     "adopted_grp still exists"                 "getent group adopted_grp >/dev/null"
+assert     "adopted_grp gid unchanged (not recreated)" "[ \"\$(getent group adopted_grp | cut -d: -f3)\" = \"$ADOPTED_GID\" ]"
+assert     "foreignmember still in adopted_grp"       "id -nG foreignmember | grep -qw adopted_grp"
+assert     "census-grp-adopted_grp fragment present"  "test -f $SUDOERS/census-grp-adopted_grp"
+assert     "adopted_grp %group grant applied"         "grep -q '%adopted_grp' $SUDOERS/census-grp-adopted_grp"
+assert     "adopted_grp g:group ACL applied"          "getfacl --omit-header /etc/ssh 2>/dev/null | grep -q '^group:adopted_grp:rwx'"
+assert     "managed.toml adopted_grp provenance adopted" "grep -A12 'name = \"adopted_grp\"' $GGMAN | grep -q 'provenance = \"adopted\"'"
+assert     "managed.toml adopted_grp has adopt_baseline"  "grep -q 'adopt_baseline' $GGMAN"
+
+echo "-- 36: RELEASE the adopted group — grants stripped, group SURVIVES (no groupdel) --"
+# Drop adopted_grp (and its binding) from the declaration. Census must strip ONLY
+# its own %group/ACL grants and return to baseline — the group and its foreign
+# member MUST remain (the adopted-never-groupdel safety invariant).
+gg_decl 4 "$GG_BODY_MEMBER"
+echo ":: $(gg_apply)"
+assert_not "census-grp-adopted_grp fragment removed"  "test -f $SUDOERS/census-grp-adopted_grp"
+assert_not "adopted_grp g:group ACL removed"          "getfacl --omit-header /etc/ssh 2>/dev/null | grep -q '^group:adopted_grp:'"
+assert     "adopted_grp STILL EXISTS (never deleted)" "getent group adopted_grp >/dev/null"
+assert     "foreignmember STILL in adopted_grp (baseline intact)" "id -nG foreignmember | grep -qw adopted_grp"
+
+echo "-- 37: DELETE a created group — fully groupdel'd, its fragment removed --"
+# Drop netadmins entirely from the declaration. A CREATED group leaves with a real
+# groupdel (contrast with the adopted release above).
+gg_decl 5 ''
+echo ":: $(gg_apply)"
+assert_not "netadmins group deleted (groupdel)"       "getent group netadmins >/dev/null"
+assert_not "census-grp-netadmins fragment removed"    "test -f $SUDOERS/census-grp-netadmins"
+
+echo "-- 38: idempotent re-apply of an unchanged group declaration is a no-op --"
+# Recreate netadmins (created group + bound role), then re-apply the SAME version
+# state to prove a second pass mutates nothing.
+gg_decl 6 "$GG_BODY_CREATE"
+echo ":: $(gg_apply)"
+assert     "netadmins recreated"                      "getent group netadmins >/dev/null"
+out38="$(gg_apply)"; echo ":: $out38"
+assert     "second group apply is no-op"              "echo \"\$out38\" | grep -qiE 'no changes|plan is empty|0 mutation'"
+
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

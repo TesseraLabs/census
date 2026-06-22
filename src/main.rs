@@ -144,6 +144,11 @@ enum CatalogSub {
         /// parametrized permissions contribute named units/paths/groups.
         #[arg(long)]
         roles: Option<std::path::PathBuf>,
+        /// Declaration whose `[[role_group]]` bindings are resolved so a `group`
+        /// object with a bound grant counts as covered. Optional; without it
+        /// coverage sees only membership-covered groups.
+        #[arg(long)]
+        declaration: Option<std::path::PathBuf>,
         /// A parametrized record with no role instance does NOT count as covering.
         #[arg(long)]
         strict: bool,
@@ -160,6 +165,28 @@ enum CatalogSub {
         /// Accept (no-op) — surface caching is not yet implemented.
         #[arg(long)]
         cache: bool,
+    },
+    /// Read-only reverse lookup: given an absolute path or command, report which
+    /// catalog permissions grant access to it and how. Always exits 0 (a query).
+    WhichGrants {
+        /// The absolute path (file or binary) or command to look up.
+        arg: String,
+        /// Emit machine-readable JSON instead of the human view.
+        #[arg(long)]
+        json: bool,
+        /// Override the OS target as `family-distro-version` (e.g.
+        /// `linux-debian-12`); autodetected from /etc/os-release if absent.
+        #[arg(long)]
+        os_target: Option<String>,
+        /// Extra catalog root for permission expansion (repeatable; appended to
+        /// the defaults in precedence order — later wins).
+        #[arg(long = "catalog-dir")]
+        catalog_dir: Vec<std::path::PathBuf>,
+        /// Declaration whose `[[role_group]]` bindings are resolved so group
+        /// grants (`via %group sudoers` / `via g:group ACL`) appear in the
+        /// lookup. Optional; without it only account grants are reported.
+        #[arg(long)]
+        declaration: Option<std::path::PathBuf>,
     },
 }
 
@@ -250,6 +277,7 @@ fn main() -> std::process::ExitCode {
                 os_target,
                 catalog_dir,
                 roles,
+                declaration,
                 strict,
                 class,
                 min_coverage,
@@ -273,6 +301,7 @@ fn main() -> std::process::ExitCode {
                     os_target,
                     catalog_roots: catalog_roots_with_overrides(catalog_dir),
                     roles,
+                    declaration,
                     strict,
                     classes,
                     min_coverage,
@@ -280,6 +309,19 @@ fn main() -> std::process::ExitCode {
                     cache,
                 })
             }
+            CatalogSub::WhichGrants {
+                arg,
+                json,
+                os_target,
+                catalog_dir,
+                declaration,
+            } => census::cli::run_which_grants(census::cli::WhichGrantsOpts {
+                arg,
+                json,
+                os_target,
+                catalog_roots: catalog_roots_with_overrides(catalog_dir),
+                declaration,
+            }),
         },
     }
 }

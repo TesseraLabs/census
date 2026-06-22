@@ -2,3 +2,16 @@ id       = "ca-trust-admin"
 risk     = "escalation-capable"
 category = "security"
 sudo     = ["/usr/sbin/update-ca-certificates"]
+
+# Installing/removing trust anchors: the local-anchor source dir and the
+# generated trust store. Writing the trust store is root-equivalent (a forged
+# anchor subverts TLS for the whole host).
+[[file]]
+path      = "/usr/local/share/ca-certificates"
+access    = "rw"
+recursive = true
+
+[[file]]
+path      = "/etc/ssl/certs"
+access    = "rw"
+recursive = true

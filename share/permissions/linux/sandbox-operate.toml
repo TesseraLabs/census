@@ -1,0 +1,7 @@
+id       = "sandbox-operate"
+risk     = "contained"
+category = "security"
+# Membership in the firejail group lets a user launch the firejail SUID sandbox
+# helper to confine their own processes. It restricts rather than expands the
+# host surface, so it is contained.
+groups   = ["firejail"]

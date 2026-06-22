@@ -17,7 +17,7 @@
 //! The orchestrator ([`crate::apply`]) depends on the trait, so it can be driven
 //! by a fake in tests.
 
-use crate::model::ResolvedAccount;
+use crate::model::{ResolvedAccount, ResolvedGroup};
 use crate::state::ManagedAccount;
 use std::process::Command;
 
@@ -207,6 +207,33 @@ pub fn build_delete_group_argv(name: &str) -> Vec<Vec<String>> {
     vec![vec!["groupdel".to_owned(), name.to_owned()]]
 }
 
+/// Build the argv to **add** a member to a group: `gpasswd -a <member> <group>`.
+/// `gpasswd -a` adds one user to the supplementary member list without touching
+/// the rest of it — the surgical add Census needs so it only ever manages its
+/// own members and never disturbs the group's pre-existing/foreign membership.
+/// argv array — no shell, no injection surface.
+pub fn build_gpasswd_add_argv(group: &str, member: &str) -> Vec<Vec<String>> {
+    vec![vec![
+        "gpasswd".to_owned(),
+        "-a".to_owned(),
+        member.to_owned(),
+        group.to_owned(),
+    ]]
+}
+
+/// Build the argv to **remove** a member from a group: `gpasswd -d <member>
+/// <group>`. `gpasswd -d` removes one user from the supplementary member list,
+/// leaving every other member intact — the surgical removal that lets a release
+/// strip only Census-added members without evicting the group's baseline ones.
+pub fn build_gpasswd_del_argv(group: &str, member: &str) -> Vec<Vec<String>> {
+    vec![vec![
+        "gpasswd".to_owned(),
+        "-d".to_owned(),
+        member.to_owned(),
+        group.to_owned(),
+    ]]
+}
+
 /// Backup/restore hook used by the orchestrator for atomicity (spec R2).
 ///
 /// The orchestrator wraps mutation in `snapshot()` … (phases) … and on any
@@ -237,6 +264,24 @@ pub trait Provisioner {
     /// Remove the `census-<name>` sudoers fragment for a deleted role
     /// (idempotent: absent fragment is success).
     fn remove_sudoers(&mut self, name: &str) -> Result<(), ProvisionError>;
+    /// Materialize (or clear) the `%group` sudoers fragment for a group: if the
+    /// group's bound roles grant sudo commands
+    /// ([`crate::sudoers::build_group_sudoers_content`] yields `Some`), write &
+    /// validate `census-grp-<group>`; otherwise ensure the fragment does not
+    /// exist (a group that dropped its last sudo grant must lose its file).
+    fn apply_group_sudoers(&mut self, group: &ResolvedGroup) -> Result<(), ProvisionError>;
+    /// Remove the `census-grp-<group>` sudoers fragment Census owns for a group
+    /// (idempotent: absent fragment is success). Named distinctly from
+    /// [`crate::sudoers::remove_group_sudoers`] so the trait method and the free
+    /// function do not collide at call sites.
+    fn remove_group_sudoers_for(&mut self, group: &str) -> Result<(), ProvisionError>;
+    /// Add `member` to `group` via `gpasswd -a` (surgical: only this member is
+    /// touched, the group's other members are left intact).
+    fn add_group_member(&mut self, group: &str, member: &str) -> Result<(), ProvisionError>;
+    /// Remove `member` from `group` via `gpasswd -d` (surgical: only this member
+    /// is removed; the group's pre-existing/foreign members stay).
+    fn remove_group_member(&mut self, group: &str, member: &str)
+        -> Result<(), ProvisionError>;
     /// Register a sudoers fragment path in the pre-mutation backup set, so a
     /// later-phase failure rolls the fragment back too (spec R2). Called by the
     /// orchestrator for every touched fragment BEFORE [`Provisioner::snapshot`].
@@ -370,6 +415,32 @@ impl Provisioner for ShadowUtilsProvisioner<'_> {
         Ok(())
     }
 
+    fn apply_group_sudoers(&mut self, group: &ResolvedGroup) -> Result<(), ProvisionError> {
+        match crate::sudoers::build_group_sudoers_content(group) {
+            Some(content) => {
+                crate::sudoers::write_group_sudoers(&self.sudoers_dir, &group.name, &content)?;
+            }
+            None => {
+                // No group sudo grant → the %group fragment must not exist.
+                crate::sudoers::remove_group_sudoers(&self.sudoers_dir, &group.name)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_group_sudoers_for(&mut self, group: &str) -> Result<(), ProvisionError> {
+        crate::sudoers::remove_group_sudoers(&self.sudoers_dir, group)?;
+        Ok(())
+    }
+
+    fn add_group_member(&mut self, group: &str, member: &str) -> Result<(), ProvisionError> {
+        Self::run_all(&build_gpasswd_add_argv(group, member))
+    }
+
+    fn remove_group_member(&mut self, group: &str, member: &str) -> Result<(), ProvisionError> {
+        Self::run_all(&build_gpasswd_del_argv(group, member))
+    }
+
     fn track_sudoers_backup(&mut self, path: std::path::PathBuf) {
         self.backup.add_file(path);
     }
@@ -403,7 +474,9 @@ mod tests {
             sudo_role: None,
             sudo_commands: Vec::new(),
             limits: Limits::default(),
+            file_grants: Vec::new(),
             locked_password: true,
+            provenance: crate::model::Provenance::Created,
         }
     }
 
@@ -415,6 +488,8 @@ mod tests {
             groups: groups.iter().map(|g| g.to_string()).collect(),
             sudo_role: None,
             sudo_commands: Vec::new(),
+            file_grants: Vec::new(),
+            provenance: crate::model::Provenance::Created,
             from_version: 1,
         }
     }
@@ -537,6 +612,19 @@ mod tests {
     fn delete_group_uses_groupdel() {
         let cmds = build_delete_group_argv("atm-operators");
         assert_eq!(cmds, vec![vec!["groupdel", "atm-operators"]]);
+    }
+
+    #[test]
+    fn gpasswd_add_uses_dash_a_member_then_group() {
+        // `gpasswd -a <member> <group>` — member precedes group (gpasswd order).
+        let cmds = build_gpasswd_add_argv("wheel", "netops");
+        assert_eq!(cmds, vec![vec!["gpasswd", "-a", "netops", "wheel"]]);
+    }
+
+    #[test]
+    fn gpasswd_del_uses_dash_d_member_then_group() {
+        let cmds = build_gpasswd_del_argv("wheel", "netops");
+        assert_eq!(cmds, vec![vec!["gpasswd", "-d", "netops", "wheel"]]);
     }
 
     #[test]

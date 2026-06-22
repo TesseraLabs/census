@@ -1,14 +1,16 @@
-//! sudoers.d materialization for role accounts (spec R6).
+//! sudoers.d materialization for role accounts and role-bound groups (spec R6).
 //!
 //! If a role carries a sudo role, Census owns a single file
-//! `/etc/sudoers.d/census-<role>`. The **content builder** here is pure and
-//! unit-tested; the actual write (temp file → `visudo -c -f <temp>` →
-//! atomic rename) is an OS-execution concern done at apply time / integration
-//! and is intentionally NOT unit-tested (it requires `visudo`).
+//! `/etc/sudoers.d/census-<role>` with a per-user rule. A role-bound group whose
+//! roles grant sudo commands gets `/etc/sudoers.d/census-grp-<group>` with a
+//! `%group` rule. The **content builders** here are pure and unit-tested; the
+//! actual write (temp file → `visudo -c -f <temp>` → atomic rename) is an
+//! OS-execution concern done at apply time / integration and is intentionally
+//! NOT unit-tested (it requires `visudo`).
 //!
-//! Census never edits foreign sudoers files — only `census-*`.
+//! Census never edits foreign sudoers files — only `census-*` / `census-grp-*`.
 
-use crate::model::ResolvedAccount;
+use crate::model::{ResolvedAccount, ResolvedGroup};
 use std::path::{Path, PathBuf};
 
 /// Default directory Census owns role sudoers fragments in. Injectable as a
@@ -18,6 +20,13 @@ pub const SUDOERS_DIR: &str = "/etc/sudoers.d";
 /// Filename (basename) Census owns for a role's sudoers fragment.
 pub fn sudoers_filename(role: &str) -> String {
     format!("census-{role}")
+}
+
+/// Filename (basename) Census owns for a group's `%group` sudoers fragment. The
+/// `grp-` infix keeps group fragments in a distinct namespace from per-role
+/// account fragments so a group can never collide with a same-named role.
+pub fn sudoers_group_filename(group: &str) -> String {
+    format!("census-grp-{group}")
 }
 
 /// Errors raised while materializing or removing a role sudoers fragment.
@@ -47,10 +56,11 @@ pub enum SudoersError {
     },
     /// `visudo -c -f <temp>` rejected the generated fragment. The temp file has
     /// been removed; the live fragment is NOT activated.
-    #[error("visudo -c rejected sudoers fragment for role {role}: {stderr}")]
+    #[error("visudo -c rejected sudoers fragment for {subject}: {stderr}")]
     VisudoRejected {
-        /// Role whose fragment failed validation.
-        role: String,
+        /// Subject whose fragment failed validation — a role name for an account
+        /// fragment, or a group name for a `%group` fragment.
+        subject: String,
         /// Captured visudo stderr (trimmed).
         stderr: String,
     },
@@ -77,6 +87,11 @@ pub fn sudoers_path(dir: &Path, role: &str) -> PathBuf {
     dir.join(sudoers_filename(role))
 }
 
+/// Absolute path of the live `%group` fragment Census owns for `group` under `dir`.
+pub fn sudoers_group_path(dir: &Path, group: &str) -> PathBuf {
+    dir.join(sudoers_group_filename(group))
+}
+
 /// Materialize a role sudoers fragment: write `content` to a temp file in `dir`,
 /// validate it with `visudo -c -f <temp>`, and only on success atomically rename
 /// it into `<dir>/census-<role>`. The file is `0440` (sudoers convention) before
@@ -84,7 +99,46 @@ pub fn sudoers_path(dir: &Path, role: &str) -> PathBuf {
 /// fragment is left untouched (never activated). Atomic: a partial/invalid file
 /// is never visible at the canonical path.
 pub fn write_sudoers(dir: &Path, role: &str, content: &str) -> Result<(), SudoersError> {
-    let tmp = dir.join(format!(".census-{role}.tmp"));
+    write_fragment(dir, &sudoers_filename(role), content, role)
+}
+
+/// Remove the role sudoers fragment Census owns under `dir`. Idempotent: an
+/// absent fragment is success (a role that lost its sudo right, or was never
+/// granted one, must have no fragment).
+pub fn remove_sudoers(dir: &Path, role: &str) -> Result<(), SudoersError> {
+    remove_fragment(dir, &sudoers_filename(role))
+}
+
+/// Materialize a group `%group` sudoers fragment into `<dir>/census-grp-<group>`.
+/// Behaves exactly like [`write_sudoers`] (temp → `visudo -c -f` → atomic
+/// rename, 0440, never activates an invalid fragment), only the target file and
+/// the diagnostic subject differ.
+pub fn write_group_sudoers(dir: &Path, group: &str, content: &str) -> Result<(), SudoersError> {
+    write_fragment(dir, &sudoers_group_filename(group), content, group)
+}
+
+/// Remove the group `%group` sudoers fragment Census owns under `dir`.
+/// Idempotent: an absent fragment is success (a group that lost its sudo grant,
+/// or never had one, must have no fragment).
+pub fn remove_group_sudoers(dir: &Path, group: &str) -> Result<(), SudoersError> {
+    remove_fragment(dir, &sudoers_group_filename(group))
+}
+
+/// Shared write core for any Census-owned sudoers fragment (account `census-<role>`
+/// or group `census-grp-<group>`). Writes `content` to a temp file in `dir`,
+/// validates it with `visudo -c -f <temp>`, and only on success atomically
+/// renames it into `<dir>/<filename>`. The file is `0440` (sudoers convention)
+/// before activation. On `visudo -c` failure the temp file is removed and the
+/// live fragment is left untouched (never activated). Atomic: a partial/invalid
+/// file is never visible at the canonical path. `subject` labels the fragment in
+/// a [`SudoersError::VisudoRejected`] (a role or group name) for diagnostics only.
+fn write_fragment(
+    dir: &Path,
+    filename: &str,
+    content: &str,
+    subject: &str,
+) -> Result<(), SudoersError> {
+    let tmp = dir.join(format!(".{filename}.tmp"));
 
     // Write the candidate fragment via O_EXCL (`create_new`): the open fails if
     // the path already exists, so a pre-planted symlink at this temp path cannot
@@ -143,13 +197,13 @@ pub fn write_sudoers(dir: &Path, role: &str, content: &str) -> Result<(), Sudoer
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp);
         return Err(SudoersError::VisudoRejected {
-            role: role.to_owned(),
+            subject: subject.to_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
 
     // Atomic activation: rename the validated temp over the canonical path.
-    let dest = sudoers_path(dir, role);
+    let dest = dir.join(filename);
     std::fs::rename(&tmp, &dest).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         SudoersError::Activate {
@@ -159,11 +213,10 @@ pub fn write_sudoers(dir: &Path, role: &str, content: &str) -> Result<(), Sudoer
     })
 }
 
-/// Remove the role sudoers fragment Census owns under `dir`. Idempotent: an
-/// absent fragment is success (a role that lost its sudo right, or was never
-/// granted one, must have no fragment).
-pub fn remove_sudoers(dir: &Path, role: &str) -> Result<(), SudoersError> {
-    let path = sudoers_path(dir, role);
+/// Shared idempotent remove for any Census-owned sudoers fragment. An absent
+/// fragment is success.
+fn remove_fragment(dir: &Path, filename: &str) -> Result<(), SudoersError> {
+    let path = dir.join(filename);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -252,6 +305,47 @@ pub fn build_sudoers_content(acct: &ResolvedAccount) -> Option<String> {
     ))
 }
 
+/// Build the `%group` sudoers.d fragment content for a role-bound group, or
+/// `None` when the group's bound roles grant no sudo commands (no file exists).
+///
+/// The subject is the Unix group, written `%<group>`, so the rule applies to
+/// every effective member of that group — including users folded in by LDAP
+/// nested-group membership, which the kernel resolves transparently behind the
+/// group name. The command set is the group's concrete `sudo_commands` (already
+/// unioned across every bound role at resolve), comma-joined as one Cmnd list.
+///
+/// `NOPASSWD` mirrors the account fragment: the group's members are real, often
+/// human users with their own passwords, but the design grants the `%group`
+/// rule without a password prompt deliberately — a group sudo grant is a managed
+/// capability, not an interactive re-auth checkpoint. (See [`build_sudoers_content`]
+/// for the account-side rationale; here it is a conscious design choice, not a
+/// consequence of locked passwords.)
+///
+/// Unlike the account builder there is no `Cmnd_Alias` escape-hatch path: a
+/// [`ResolvedGroup`] carries only concrete `sudo_commands`, never a raw
+/// `sudo_role`. Each command is run through [`escape_sudoers_command`] so a
+/// metacharacter can neither split the list nor act as a runas/negation directive.
+pub fn build_group_sudoers_content(group: &ResolvedGroup) -> Option<String> {
+    if group.sudo_commands.is_empty() {
+        return None;
+    }
+    let cmds = group
+        .sudo_commands
+        .iter()
+        .map(|c| escape_sudoers_command(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "# Managed by Census — group {group}. Do not edit by hand.\n\
+         # Concrete commands expanded from the bound roles' permissions.\n\
+         # Subject is the Unix group (%): every effective member inherits the rule,\n\
+         # including LDAP nested-group members resolved behind the group name.\n\
+         # NOPASSWD: a managed group sudo grant is not an interactive re-auth point.\n\
+         %{group} ALL=(ALL) NOPASSWD: {cmds}\n",
+        group = group.name,
+    ))
+}
+
 /// Escape a command string for inclusion in a comma-separated sudoers Cmnd list.
 ///
 /// Control characters (notably a newline, which would split the rule into a
@@ -306,7 +400,9 @@ mod tests {
             sudo_role: sudo_role.map(|s| s.to_owned()),
             sudo_commands: Vec::new(),
             limits: Limits::default(),
+            file_grants: Vec::new(),
             locked_password: true,
+            provenance: crate::model::Provenance::Created,
         }
     }
 
@@ -316,6 +412,21 @@ mod tests {
         ResolvedAccount {
             sudo_commands: cmds.iter().map(|c| c.to_string()).collect(),
             ..acct(name, None)
+        }
+    }
+
+    /// A resolved group carrying the given concrete sudo commands (the only
+    /// field the `%group` sudoers builder reads).
+    fn group_cmds(name: &str, cmds: &[&str]) -> ResolvedGroup {
+        ResolvedGroup {
+            name: name.to_owned(),
+            gid: None,
+            provenance: crate::model::Provenance::Created,
+            members: Vec::new(),
+            sudo_commands: cmds.iter().map(|c| c.to_string()).collect(),
+            file_grants: Vec::new(),
+            limits: Limits::default(),
+            bound_roles: Vec::new(),
         }
     }
 
@@ -521,5 +632,113 @@ mod tests {
             "invalid fragment must NOT be activated"
         );
         assert!(!dir.path().join(".census-oper.tmp").exists(), "temp must be cleaned up");
+    }
+
+    // ---- group-grants slice 5b: %group sudoers fragment ----
+
+    #[test]
+    fn group_concrete_commands_render_nopasswd_percent_rule() {
+        let content = build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+            .expect("non-empty sudo commands yield content");
+        // Subject is the Unix group (`%`), comma-joined Cmnd list, NOPASSWD.
+        assert!(
+            content.contains("%wheel ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli"),
+            "got: {content}"
+        );
+        assert!(content.contains("Managed by Census"), "must carry the managed header");
+        assert!(content.contains("NOPASSWD"));
+        // Group fragments never emit a Cmnd_Alias indirection (no sudo_role path).
+        assert!(!content.contains("CENSUS_"), "group path must not emit an alias: {content}");
+    }
+
+    #[test]
+    fn group_no_sudo_commands_yields_no_file() {
+        assert!(build_group_sudoers_content(&group_cmds("wheel", &[])).is_none());
+    }
+
+    #[test]
+    fn group_rule_has_valid_sudoers_shape() {
+        // Exactly one rule line, subject is a single `%group` token, NOPASSWD tag.
+        let content =
+            build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"])).unwrap();
+        let rule_lines: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .collect();
+        assert_eq!(rule_lines.len(), 1, "exactly one rule line: {content}");
+        let line = rule_lines[0];
+        assert!(line.starts_with("%wheel ALL=(ALL) NOPASSWD: "));
+        assert_eq!(line.split_whitespace().next(), Some("%wheel"));
+    }
+
+    #[test]
+    fn group_command_metacharacters_are_escaped() {
+        // The same escaper guards the group path: a comma must not split the list.
+        let content = build_group_sudoers_content(&group_cmds("wheel", &["/usr/bin/odd,name"])).unwrap();
+        assert!(content.contains(r"/usr/bin/odd\,name"), "comma must be escaped: {content}");
+    }
+
+    #[test]
+    fn census_owns_only_grp_prefixed_group_files() {
+        assert_eq!(sudoers_group_filename("wheel"), "census-grp-wheel");
+        assert!(sudoers_group_filename("wheel").starts_with("census-grp-"));
+        assert_eq!(
+            sudoers_group_path(std::path::Path::new("/etc/sudoers.d"), "wheel"),
+            PathBuf::from("/etc/sudoers.d/census-grp-wheel")
+        );
+    }
+
+    #[test]
+    fn remove_group_sudoers_is_ok_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        remove_group_sudoers(dir.path(), "wheel").unwrap();
+        assert!(!sudoers_group_path(dir.path(), "wheel").exists());
+    }
+
+    #[test]
+    fn remove_group_sudoers_deletes_present_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sudoers_group_path(dir.path(), "wheel");
+        std::fs::write(&path, b"%wheel ALL=(ALL) NOPASSWD: /usr/sbin/ip\n").unwrap();
+        assert!(path.exists());
+        remove_group_sudoers(dir.path(), "wheel").unwrap();
+        assert!(!path.exists(), "present fragment must be removed");
+    }
+
+    #[test]
+    fn write_group_sudoers_validates_and_activates_atomically() {
+        if !visudo_available() {
+            eprintln!("skipping write_group_sudoers test: visudo not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let content = build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+            .expect("non-empty sudo commands yield content");
+        write_group_sudoers(dir.path(), "wheel", &content).unwrap();
+        let dest = sudoers_group_path(dir.path(), "wheel");
+        assert!(dest.exists(), "validated group fragment must be activated");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), content);
+        // No temp file left behind.
+        assert!(!dir.path().join(".census-grp-wheel.tmp").exists());
+    }
+
+    #[test]
+    fn write_group_sudoers_rejects_invalid_fragment_and_does_not_activate() {
+        if !visudo_available() {
+            eprintln!("skipping invalid group-fragment test: visudo not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_group_sudoers(dir.path(), "wheel", "this is not valid sudoers !!!\n")
+            .expect_err("invalid sudoers must be rejected");
+        assert!(matches!(err, SudoersError::VisudoRejected { .. }));
+        assert!(
+            !sudoers_group_path(dir.path(), "wheel").exists(),
+            "invalid fragment must NOT be activated"
+        );
+        assert!(
+            !dir.path().join(".census-grp-wheel.tmp").exists(),
+            "temp must be cleaned up"
+        );
     }
 }

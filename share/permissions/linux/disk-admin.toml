@@ -2,4 +2,36 @@ id       = "disk-admin"
 risk     = "escalation-capable"
 category = "storage"
 groups   = ["disk"]
-sudo     = ["/usr/sbin/parted", "/usr/sbin/fdisk", "/usr/sbin/mkfs.ext4", "/usr/sbin/mkfs.xfs", "/usr/sbin/lvm", "/usr/sbin/blkid"]
+sudo     = [
+    "/usr/sbin/parted",
+    "/usr/sbin/fdisk",
+    "/usr/sbin/mkfs.ext4",
+    # mkfs.ext4 / fsck.ext4 are symlinks to mke2fs / e2fsck; coverage canonicalises
+    # to the real binary, so the canonical names are listed too (and double as the
+    # generic ext maintenance tools).
+    "/usr/sbin/mke2fs",
+    "/usr/sbin/e2fsck",
+    "/usr/sbin/fsck.ext4",
+    "/usr/sbin/mkfs.xfs",
+    "/usr/sbin/lvm",
+    "/usr/sbin/blkid",
+    "/usr/sbin/dmsetup",
+    "/usr/sbin/mkfs.fat",
+    "/usr/sbin/fsck.fat",
+    "/usr/sbin/fsck",
+    "/usr/sbin/tune2fs",
+    "/usr/sbin/resize2fs",
+    "/usr/sbin/dumpe2fs",
+    "/usr/sbin/badblocks",
+    "/usr/sbin/blockdev",
+    "/usr/sbin/wipefs",
+    "/usr/sbin/fstrim",
+    "/usr/sbin/xfs_repair",
+    "/usr/sbin/xfs_copy",
+    "/usr/sbin/xfs_rtcp",
+    "/usr/sbin/e4defrag",
+    "/usr/sbin/e2scrub_all",
+    "/usr/sbin/ntfslabel",
+    "/usr/sbin/hdparm",
+    "/usr/sbin/isosize",
+]

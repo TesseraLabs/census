@@ -1,0 +1,20 @@
+id       = "astra-mac-control"
+risk     = "escalation-capable"
+category = "security"
+# Astra Special Edition hardening toggles: lock/unlock interpreter macros,
+# toggle the security monitor, and lock/unlock ptrace. These flip mandatory
+# protection switches host-wide — loosening any of them removes a confinement
+# barrier — so the permission is escalation-capable.
+sudo = [
+    "/usr/sbin/astra-macros-lock",
+    "/usr/sbin/astra-security-monitor",
+    "/usr/sbin/astra-ptrace-lock",
+]
+
+# PARSEC MAC configuration tree (mandatory integrity/confidentiality control,
+# capabilities). Editing it is root-equivalent on Astra SE — it defines the
+# mandatory protection the whole host runs under.
+[[file]]
+path      = "/etc/parsec"
+access    = "rw"
+recursive = true
