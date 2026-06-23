@@ -1,0 +1,271 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RegistryFile",
+  "description": "On-disk shape of the managed registry (`managed.toml`): the `[[account]]`\nand `[[group]]` arrays. Strict (`deny_unknown_fields`) — Census owns this\nfile and an unknown key is a typo or a smuggled field. `pub` so the\ninterface-contract test can generate its golden schema.",
+  "type": "object",
+  "properties": {
+    "account": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ManagedAccount"
+      }
+    },
+    "group": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ManagedGroup"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Access": {
+      "description": "File-access mode a grant requests.\n\n`ro` maps to POSIX ACL `r-X` (read + traverse-only on directories — the `X`\nis execute *only* on dirs, so a reader can walk into a tree without gaining\nexecute on regular files); `rw` maps to `rwX`. The two values form an ordered\nlattice for the resolve-time union (`Ro` < `Rw`): two grants on the same path\nmerge to the wider access.",
+      "oneOf": [
+        {
+          "description": "Read + directory-traverse (`r-X`).",
+          "type": "string",
+          "const": "ro"
+        },
+        {
+          "description": "Read + write + directory-traverse (`rwX`).",
+          "type": "string",
+          "const": "rw"
+        }
+      ]
+    },
+    "GroupBaseline": {
+      "description": "Snapshot of an adopted group's state at the moment Census adopted it — so a\nlater release can return it to \"how it was\" (its GID and pre-existing\nmembers) without deleting the group itself.",
+      "type": "object",
+      "properties": {
+        "gid": {
+          "description": "GID the group had at adopt time, or `None` when Census could not read it\nback at adopt. `None` is \"GID unknown\", kept distinct from a real GID `0`\n(root group): a later drift check skips an unknown baseline GID rather\nthan spuriously flagging the live GID against `0`. `#[serde(default)]` so\na baseline written before the field was optional reads cleanly as `None`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 0
+        },
+        "members": {
+          "description": "Members the group had at adopt time (pre-existing, foreign — preserved on\nrelease). `#[serde(default)]` so a baseline written with no members reads\nas empty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ManagedAccount": {
+      "description": "A single managed account as last recorded by Census.",
+      "type": "object",
+      "properties": {
+        "file_grants": {
+          "description": "Recorded file-access grants (permission-expanded). Persisted so granting\nor revoking a permission that changes the file-grant set is visible to\nthe plan diff and so the backend knows which ACL entries to revoke when a\ngrant disappears (the registry is the authority for revocation).\n`#[serde(default)]` so a registry written before this field existed still\nreads (empty set).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ManagedFileGrant"
+          }
+        },
+        "from_version": {
+          "description": "Declaration `version` this account was created/updated from.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "groups": {
+          "description": "Recorded groups.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "Unix login name.",
+          "type": "string"
+        },
+        "provenance": {
+          "description": "Provenance: `Created` — Census made the account (teardown is a full\n`userdel`); `Adopted` — the account was external and Census only bound\ngrants to it (teardown strips the grants, the user is NEVER deleted).\n`#[serde(default)]` so a registry written before this field existed reads\nas `Created`. (No account-baseline is stored: an adopted user has no\nattributes to restore — Census only removes its own grants — so\n`provenance = Adopted` is enough.)",
+          "$ref": "#/$defs/Provenance",
+          "default": "created"
+        },
+        "shell": {
+          "description": "Recorded shell.",
+          "type": "string"
+        },
+        "sudo_commands": {
+          "description": "Recorded concrete sudo commands (permission-expanded), each paired with\nthe account it runs as. Persisted so that granting, revoking, or\n*re-targeting* (root → service account) a permission which changes the\nsudo command set is visible to the plan diff — the same\nprivilege-revocation correctness that `sudo_role` gets, but for the\nconcrete-command path (otherwise a stale NOPASSWD rule, or a stale\nrun-spec, would leak after a permission changes). Each entry serializes as\na bare string for a root command (`\"/usr/sbin/ip\"`) and as a `{ command,\nrunas }` table only when narrowed, so a registry written before `runas`\nexisted — and every all-root account — keeps its on-disk form unchanged.\n`#[serde(default)]` so a registry written before this field existed still\nreads (empty set).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SudoCommand"
+          }
+        },
+        "sudo_role": {
+          "description": "Recorded sudo role grant, if any. `None` means the account has no\nCensus-owned sudoers fragment. Persisted so a sudo-only grant/revocation\nis visible to the plan diff (otherwise a revoked fragment leaks).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "uid": {
+          "description": "Recorded UID.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "uid",
+        "shell",
+        "from_version"
+      ]
+    },
+    "ManagedFileGrant": {
+      "description": "A single file-access grant as last recorded by Census for an account.\n\nPersisted so granting or revoking a permission that changes the file-grant\nset is visible to the plan diff — the same privilege-revocation correctness\n`sudo_commands` gets. The registry is the authority for *what to revoke*: a\ngrant that drops out of the resolved set but is still recorded here is the\nbackend's signal to remove its ACL entry (otherwise a revoked grant would\nleak as a stale ACL). Only the enforcement-relevant fields are stored\n(`path`/`access`/`recursive`); provenance and the derived shape are\nrecomputable from these at resolve time and need not be persisted.",
+      "type": "object",
+      "properties": {
+        "access": {
+          "description": "Read-only or read-write.",
+          "$ref": "#/$defs/Access"
+        },
+        "path": {
+          "description": "Absolute path the grant targets.",
+          "type": "string"
+        },
+        "recursive": {
+          "description": "Whether the grant applied recursively (directory grant).",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "access",
+        "recursive"
+      ]
+    },
+    "ManagedGroup": {
+      "description": "A single managed group as last recorded by Census. A group is recorded here\nwhether Census created it (`groupadd`) or adopted a pre-existing one; the\n`provenance` field distinguishes the two and drives the teardown contract\n(full `groupdel` for `Created`, release-to-baseline for `Adopted`). The\nregistry stores what Census actually applied — its own grants and its own\nadded members — not the recomputable bindings.",
+      "type": "object",
+      "properties": {
+        "adopt_baseline": {
+          "description": "Baseline snapshot captured at adopt (`None` for `Created`). Restored on\nrelease. `#[serde(default)]` so an old registry reads as `None`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GroupBaseline"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "file_grants": {
+          "description": "File-access grants on the group (`g:group` ACL) — for diff and the\nauthority of revocation. `#[serde(default)]` so an old registry reads as\nempty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ManagedFileGrant"
+          }
+        },
+        "from_version": {
+          "description": "Declaration `version` this group was created from.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "gid": {
+          "description": "Recorded GID (the GID the group had when Census created it — pinned or\nOS-assigned), or `None` when Census could not read it back at apply time.\n`None` is \"GID unknown\", kept distinct from a real GID `0` (root group):\ndrift checks skip an unknown GID rather than spuriously flagging it against\n`0`. `#[serde(default)]` so a registry that omits the field (or was written\nbefore it was optional) reads cleanly as `None`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 0
+        },
+        "members_added": {
+          "description": "Members Census itself added to this group (for surgical removal on\nrelease / membership change: drop ONLY our own, never the foreign /\nbaseline members). `#[serde(default)]` so an old registry reads as empty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "Group name.",
+          "type": "string"
+        },
+        "provenance": {
+          "description": "Provenance: `Created` (Census made the group; teardown is `groupdel`) or\n`Adopted` (pre-existing; teardown releases to baseline, never deletes).\n`#[serde(default)]` so a registry written before this field existed reads\nas `Created`.",
+          "$ref": "#/$defs/Provenance",
+          "default": "created"
+        },
+        "sudo_commands": {
+          "description": "Concrete sudo commands bound to the group (for diff / revocation — same\nauthority the account record carries), each paired with the account it\nruns as. Serializes a root command as a bare string and a narrowed one as\na `{ command, runas }` table, keeping an all-root group's on-disk form\nunchanged. `#[serde(default)]` so an old registry reads as empty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SudoCommand"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "from_version"
+      ]
+    },
+    "Provenance": {
+      "description": "How an object (account or group) came under Census management. Drives the\nteardown contract: a `Created` object Census made itself, so removing it from\nthe declaration means a full delete (`userdel`/`groupdel`); an `Adopted`\nobject pre-existed and Census only took its grants under management, so\nremoval means *release* to baseline (strip Census's own grants/members) and\nnever delete the underlying user or group. Reused by the persisted state in a\nlater slice, so the resolve layer and the state layer agree on the contract.",
+      "oneOf": [
+        {
+          "description": "Census created the object; on removal it is fully deleted.",
+          "type": "string",
+          "const": "created"
+        },
+        {
+          "description": "The object pre-existed and was taken under management; on removal Census\nreleases it back to baseline and never deletes it.",
+          "type": "string",
+          "const": "adopted"
+        }
+      ]
+    },
+    "SudoCommand": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "runas": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "command"
+          ]
+        }
+      ]
+    }
+  }
+}

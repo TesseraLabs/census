@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 /// (`path`/`access`/`recursive`); provenance and the derived shape are
 /// recomputable from these at resolve time and need not be persisted.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ManagedFileGrant {
     /// Absolute path the grant targets.
@@ -45,10 +46,16 @@ impl ManagedFileGrant {
 /// later release can return it to "how it was" (its GID and pre-existing
 /// members) without deleting the group itself.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GroupBaseline {
-    /// GID the group had at adopt time.
-    pub gid: u32,
+    /// GID the group had at adopt time, or `None` when Census could not read it
+    /// back at adopt. `None` is "GID unknown", kept distinct from a real GID `0`
+    /// (root group): a later drift check skips an unknown baseline GID rather
+    /// than spuriously flagging the live GID against `0`. `#[serde(default)]` so
+    /// a baseline written before the field was optional reads cleanly as `None`.
+    #[serde(default)]
+    pub gid: Option<u32>,
     /// Members the group had at adopt time (pre-existing, foreign — preserved on
     /// release). `#[serde(default)]` so a baseline written with no members reads
     /// as empty.
@@ -58,6 +65,7 @@ pub struct GroupBaseline {
 
 /// A single managed account as last recorded by Census.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ManagedAccount {
     /// Unix login name.
@@ -74,14 +82,20 @@ pub struct ManagedAccount {
     /// is visible to the plan diff (otherwise a revoked fragment leaks).
     #[serde(default)]
     pub sudo_role: Option<String>,
-    /// Recorded concrete sudo commands (permission-expanded). Persisted so that
-    /// granting or revoking a permission which changes the sudo command set is
-    /// visible to the plan diff — the same privilege-revocation correctness that
-    /// `sudo_role` gets, but for the concrete-command path (otherwise a stale
-    /// NOPASSWD rule would leak after a permission is dropped). `#[serde(default)]`
-    /// so a registry written before this field existed still reads (empty set).
+    /// Recorded concrete sudo commands (permission-expanded), each paired with
+    /// the account it runs as. Persisted so that granting, revoking, or
+    /// *re-targeting* (root → service account) a permission which changes the
+    /// sudo command set is visible to the plan diff — the same
+    /// privilege-revocation correctness that `sudo_role` gets, but for the
+    /// concrete-command path (otherwise a stale NOPASSWD rule, or a stale
+    /// run-spec, would leak after a permission changes). Each entry serializes as
+    /// a bare string for a root command (`"/usr/sbin/ip"`) and as a `{ command,
+    /// runas }` table only when narrowed, so a registry written before `runas`
+    /// existed — and every all-root account — keeps its on-disk form unchanged.
+    /// `#[serde(default)]` so a registry written before this field existed still
+    /// reads (empty set).
     #[serde(default)]
-    pub sudo_commands: Vec<String>,
+    pub sudo_commands: Vec<crate::model::SudoCommand>,
     /// Recorded file-access grants (permission-expanded). Persisted so granting
     /// or revoking a permission that changes the file-grant set is visible to
     /// the plan diff and so the backend knows which ACL entries to revoke when a
@@ -110,13 +124,19 @@ pub struct ManagedAccount {
 /// registry stores what Census actually applied — its own grants and its own
 /// added members — not the recomputable bindings.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ManagedGroup {
     /// Group name.
     pub name: String,
     /// Recorded GID (the GID the group had when Census created it — pinned or
-    /// OS-assigned). Doctor flags a live GID that diverges from this.
-    pub gid: u32,
+    /// OS-assigned), or `None` when Census could not read it back at apply time.
+    /// `None` is "GID unknown", kept distinct from a real GID `0` (root group):
+    /// drift checks skip an unknown GID rather than spuriously flagging it against
+    /// `0`. `#[serde(default)]` so a registry that omits the field (or was written
+    /// before it was optional) reads cleanly as `None`.
+    #[serde(default)]
+    pub gid: Option<u32>,
     /// Provenance: `Created` (Census made the group; teardown is `groupdel`) or
     /// `Adopted` (pre-existing; teardown releases to baseline, never deletes).
     /// `#[serde(default)]` so a registry written before this field existed reads
@@ -129,10 +149,12 @@ pub struct ManagedGroup {
     #[serde(default)]
     pub members_added: Vec<String>,
     /// Concrete sudo commands bound to the group (for diff / revocation — same
-    /// authority the account record carries). `#[serde(default)]` so an old
-    /// registry reads as empty.
+    /// authority the account record carries), each paired with the account it
+    /// runs as. Serializes a root command as a bare string and a narrowed one as
+    /// a `{ command, runas }` table, keeping an all-root group's on-disk form
+    /// unchanged. `#[serde(default)]` so an old registry reads as empty.
     #[serde(default)]
-    pub sudo_commands: Vec<String>,
+    pub sudo_commands: Vec<crate::model::SudoCommand>,
     /// File-access grants on the group (`g:group` ACL) — for diff and the
     /// authority of revocation. `#[serde(default)]` so an old registry reads as
     /// empty.
@@ -164,9 +186,14 @@ pub struct RegistryState {
     groups: BTreeMap<String, ManagedGroup>,
 }
 
-#[derive(serde::Deserialize, Default)]
+/// On-disk shape of the managed registry (`managed.toml`): the `[[account]]`
+/// and `[[group]]` arrays. Strict (`deny_unknown_fields`) — Census owns this
+/// file and an unknown key is a typo or a smuggled field. `pub` so the
+/// interface-contract test can generate its golden schema.
+#[derive(Debug, serde::Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
-struct RegistryFile {
+pub struct RegistryFile {
     #[serde(default, rename = "account")]
     accounts: Vec<ManagedAccount>,
     #[serde(default, rename = "group")]
@@ -175,13 +202,26 @@ struct RegistryFile {
 
 /// Errors reading the managed registry.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StateError {
     /// Registry file exists but cannot be read.
-    #[error("cannot read managed registry {path}: {reason}")]
-    Io { path: PathBuf, reason: String },
+    #[error("cannot read managed registry {path}: {source}")]
+    Io {
+        /// The registry path consulted.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// Registry TOML is malformed.
-    #[error("managed registry {path} is invalid: {reason}")]
-    TomlParse { path: PathBuf, reason: String },
+    #[error("managed registry {path} is invalid: {source}")]
+    TomlParse {
+        /// The registry path consulted.
+        path: PathBuf,
+        /// The underlying TOML deserialization error.
+        #[source]
+        source: toml::de::Error,
+    },
 }
 
 impl RegistryState {
@@ -199,13 +239,13 @@ impl RegistryState {
         if !path.exists() {
             return Ok(RegistryState::default_empty());
         }
-        let text = std::fs::read_to_string(path).map_err(|e| StateError::Io {
+        let text = std::fs::read_to_string(path).map_err(|source| StateError::Io {
             path: path.to_path_buf(),
-            reason: e.to_string(),
+            source,
         })?;
-        let file: RegistryFile = toml::from_str(&text).map_err(|e| StateError::TomlParse {
+        let file: RegistryFile = toml::from_str(&text).map_err(|source| StateError::TomlParse {
             path: path.to_path_buf(),
-            reason: e.to_string(),
+            source,
         })?;
         let accounts = file
             .accounts
@@ -233,7 +273,7 @@ impl SystemState for RegistryState {
 
 /// In-memory state for tests.
 #[cfg(test)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct FakeState {
     /// The managed accounts this fake reports.
     pub accounts: BTreeMap<String, ManagedAccount>,
@@ -254,8 +294,9 @@ impl SystemState for FakeState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     #[test]
     fn missing_registry_is_empty() {
@@ -308,7 +349,69 @@ from_version = 3
         .unwrap();
         let st = RegistryState::load(&path).unwrap();
         let oper = &st.managed_accounts()["oper"];
-        assert_eq!(oper.sudo_commands, vec!["/usr/sbin/ip", "/usr/bin/nmcli"]);
+        assert_eq!(
+            oper.sudo_commands,
+            vec![
+                crate::model::SudoCommand::root("/usr/sbin/ip"),
+                crate::model::SudoCommand::root("/usr/bin/nmcli"),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_sudo_command_serializes_as_a_bare_string_keeping_registry_back_compat() {
+        // A root command (runas: None) must serialize as a bare TOML string, so a
+        // registry of all-root accounts keeps its historical `sudo_commands =
+        // ["..."]` shape — the on-disk format does not change until a command is
+        // actually narrowed.
+        let acct = ManagedAccount {
+            name: "oper".to_owned(),
+            uid: 9010,
+            shell: "/bin/bash".to_owned(),
+            groups: vec![],
+            sudo_role: None,
+            sudo_commands: vec![crate::model::SudoCommand::root("/usr/sbin/ip")],
+            file_grants: vec![],
+            provenance: crate::model::Provenance::Created,
+            from_version: 1,
+        };
+        let toml = toml::to_string(&acct).unwrap();
+        assert!(
+            toml.contains(r#"sudo_commands = ["/usr/sbin/ip"]"#),
+            "root command must serialize as a bare string array: {toml}"
+        );
+    }
+
+    #[test]
+    fn narrowed_sudo_command_round_trips_through_the_table_form() {
+        // A narrowed command (runas: Some) serializes as a `{ command, runas }`
+        // table and reads back identically — the run-as account survives the
+        // registry round-trip so the diff can detect a stale run-spec.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[account]]
+name = "oper"
+uid = 9010
+shell = "/bin/bash"
+from_version = 3
+
+[[account.sudo_commands]]
+command = "/opt/QToolplus"
+runas = "bfs_solutions"
+"#,
+        )
+        .unwrap();
+        let st = RegistryState::load(&path).unwrap();
+        assert_eq!(
+            st.managed_accounts()["oper"].sudo_commands,
+            vec![crate::model::SudoCommand::as_user(
+                "/opt/QToolplus",
+                "bfs_solutions"
+            )]
+        );
     }
 
     #[test]
@@ -453,7 +556,7 @@ from_version = 3
         let groups = st.managed_groups();
         assert_eq!(groups.len(), 1);
         let g = &groups["atm-operators"];
-        assert_eq!(g.gid, 8010);
+        assert_eq!(g.gid, Some(8010));
         assert_eq!(g.from_version, 3);
         // accounts still load alongside.
         assert_eq!(st.managed_accounts().len(), 1);
@@ -489,17 +592,17 @@ bogus = "nope"
         use crate::model::Provenance;
         let group = ManagedGroup {
             name: "wheel".to_owned(),
-            gid: 10,
+            gid: Some(10),
             provenance: Provenance::Adopted,
             members_added: vec!["netops".to_owned()],
-            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            sudo_commands: vec![crate::model::SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![ManagedFileGrant {
                 path: "/etc/net".to_owned(),
                 access: crate::catalog::Access::Rw,
                 recursive: true,
             }],
             adopt_baseline: Some(GroupBaseline {
-                gid: 10,
+                gid: Some(10),
                 members: vec!["root".to_owned(), "admin".to_owned()],
             }),
             from_version: 7,
@@ -531,6 +634,22 @@ bogus = "nope"
         assert!(g.sudo_commands.is_empty());
         assert!(g.file_grants.is_empty());
         assert_eq!(g.adopt_baseline, None);
+    }
+
+    #[test]
+    fn group_without_gid_reads_as_none() {
+        // The GID is now optional (`Option<u32>`, serde default): a registry that
+        // omits `gid` must read cleanly as `None` ("GID unknown"), not be rejected
+        // and not be coerced to a `0` sentinel.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            "[[group]]\nname = \"atm-operators\"\nfrom_version = 3\n",
+        )
+        .unwrap();
+        let st = RegistryState::load(&path).unwrap();
+        assert_eq!(st.managed_groups()["atm-operators"].gid, None);
     }
 
     #[test]
@@ -569,7 +688,10 @@ bogus = "nope"
         )
         .unwrap();
         let st = RegistryState::load(&path).unwrap();
-        assert_eq!(st.managed_accounts()["oper"].provenance, Provenance::Created);
+        assert_eq!(
+            st.managed_accounts()["oper"].provenance,
+            Provenance::Created
+        );
     }
 
     #[test]

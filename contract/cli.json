@@ -1,0 +1,706 @@
+{
+  "name": "census",
+  "about_present": true,
+  "subcommands": [
+    {
+      "name": "apply",
+      "about_present": true,
+      "subcommands": [],
+      "args": [
+        {
+          "id": "catalog_dir",
+          "long": "catalog-dir",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": true,
+          "num_args": null
+        },
+        {
+          "id": "declaration",
+          "long": "declaration",
+          "takes_value": true,
+          "required": false,
+          "default": "/etc/census/declaration.toml",
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "i_understand_no_rescue",
+          "long": "i-understand-no-rescue",
+          "takes_value": false,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "managed",
+          "long": "managed",
+          "takes_value": true,
+          "required": false,
+          "default": "/var/lib/census/managed.toml",
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "os_target",
+          "long": "os-target",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "sessions_file",
+          "long": "sessions-file",
+          "takes_value": true,
+          "required": false,
+          "default": "/run/tessera/sessions.json",
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "trust_fs",
+          "long": "trust-fs",
+          "takes_value": false,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        }
+      ]
+    },
+    {
+      "name": "catalog",
+      "about_present": true,
+      "subcommands": [
+        {
+          "name": "coverage",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "cache",
+              "long": "cache",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "catalog_dir",
+              "long": "catalog-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "class",
+              "long": "class",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "declaration",
+              "long": "declaration",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "include_low_priority",
+              "long": "include-low-priority",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "json",
+              "long": "json",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "min_coverage",
+              "long": "min-coverage",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "os_target",
+              "long": "os-target",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "roles",
+              "long": "roles",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "strict",
+              "long": "strict",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            }
+          ]
+        },
+        {
+          "name": "which-grants",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "arg",
+              "long": null,
+              "takes_value": true,
+              "required": true,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "catalog_dir",
+              "long": "catalog-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "declaration",
+              "long": "declaration",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "json",
+              "long": "json",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "os_target",
+              "long": "os-target",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            }
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "compile",
+      "about_present": true,
+      "subcommands": [],
+      "args": [
+        {
+          "id": "catalog_dir",
+          "long": "catalog-dir",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": true,
+          "num_args": null
+        },
+        {
+          "id": "declaration",
+          "long": "declaration",
+          "takes_value": true,
+          "required": false,
+          "default": "/etc/census/declaration.toml",
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "json",
+          "long": "json",
+          "takes_value": false,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "lint",
+          "long": "lint",
+          "takes_value": false,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "os_target",
+          "long": "os-target",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "role",
+          "long": null,
+          "takes_value": true,
+          "required": true,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        }
+      ]
+    },
+    {
+      "name": "doctor",
+      "about_present": true,
+      "subcommands": [],
+      "args": [
+        {
+          "id": "declaration",
+          "long": "declaration",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "managed",
+          "long": "managed",
+          "takes_value": true,
+          "required": false,
+          "default": "/var/lib/census/managed.toml",
+          "repeatable": false,
+          "num_args": null
+        }
+      ]
+    },
+    {
+      "name": "framework",
+      "about_present": true,
+      "subcommands": [
+        {
+          "name": "coverage",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "format",
+              "long": "format",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "framework_dir",
+              "long": "framework-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "fw",
+              "long": null,
+              "takes_value": true,
+              "required": true,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "os_target",
+              "long": "os-target",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            }
+          ]
+        },
+        {
+          "name": "lint",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "catalog_dir",
+              "long": "catalog-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "format",
+              "long": "format",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "framework_dir",
+              "long": "framework-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "os_target",
+              "long": "os-target",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            }
+          ]
+        },
+        {
+          "name": "list",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "format",
+              "long": "format",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "framework_dir",
+              "long": "framework-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "os_target",
+              "long": "os-target",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            }
+          ]
+        },
+        {
+          "name": "risk",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "format",
+              "long": "format",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "framework_dir",
+              "long": "framework-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "fw",
+              "long": null,
+              "takes_value": true,
+              "required": true,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "lang",
+              "long": "lang",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "os_target",
+              "long": "os-target",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            }
+          ]
+        },
+        {
+          "name": "show",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "format",
+              "long": "format",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "framework_dir",
+              "long": "framework-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "fw",
+              "long": null,
+              "takes_value": true,
+              "required": true,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "lang",
+              "long": "lang",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "os_target",
+              "long": "os-target",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            }
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "plan",
+      "about_present": true,
+      "subcommands": [],
+      "args": [
+        {
+          "id": "catalog_dir",
+          "long": "catalog-dir",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": true,
+          "num_args": null
+        },
+        {
+          "id": "declaration",
+          "long": "declaration",
+          "takes_value": true,
+          "required": false,
+          "default": "/etc/census/declaration.toml",
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "diff",
+          "long": "diff",
+          "takes_value": false,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "managed",
+          "long": "managed",
+          "takes_value": true,
+          "required": false,
+          "default": "/var/lib/census/managed.toml",
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "os_target",
+          "long": "os-target",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        }
+      ]
+    },
+    {
+      "name": "show",
+      "about_present": true,
+      "subcommands": [],
+      "args": [
+        {
+          "id": "catalog_dir",
+          "long": "catalog-dir",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": true,
+          "num_args": null
+        },
+        {
+          "id": "declaration",
+          "long": "declaration",
+          "takes_value": true,
+          "required": false,
+          "default": "/etc/census/declaration.toml",
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "format",
+          "long": "format",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "framework",
+          "long": "framework",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "framework_dir",
+          "long": "framework-dir",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": true,
+          "num_args": null
+        },
+        {
+          "id": "lang",
+          "long": "lang",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "os_target",
+          "long": "os-target",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "role",
+          "long": null,
+          "takes_value": true,
+          "required": true,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        }
+      ]
+    },
+    {
+      "name": "status",
+      "about_present": true,
+      "subcommands": [],
+      "args": [
+        {
+          "id": "declaration",
+          "long": "declaration",
+          "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "managed",
+          "long": "managed",
+          "takes_value": true,
+          "required": false,
+          "default": "/var/lib/census/managed.toml",
+          "repeatable": false,
+          "num_args": null
+        }
+      ]
+    }
+  ],
+  "args": []
+}

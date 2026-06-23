@@ -1,0 +1,18 @@
+# Deterministic formatting for census. Stable options apply on any toolchain.
+#
+# The options below the "nightly-only" marker are gated by rustfmt's unstable
+# feature flag and are silently ignored by stable `cargo fmt` (they take effect
+# only under `cargo +nightly fmt`). They are kept here so a nightly run produces
+# the same canonical layout the team agreed on, without breaking stable runs.
+
+# --- stable ---
+max_width = 100
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# --- nightly-only (require `cargo +nightly fmt`; ignored on stable) ---
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+wrap_comments = true
+comment_width = 100
+format_code_in_doc_comments = true

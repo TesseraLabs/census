@@ -1,207 +1,49 @@
-use clap::{Parser, Subcommand};
+#![forbid(unsafe_code)]
+
+use std::io::IsTerminal;
+
+use census::cli_def::{CatalogSub, Cli, Command, FrameworkSub};
 use census::coverage::SurfaceClass;
+use clap::Parser;
 
-#[derive(Parser)]
-#[command(name = "census", version, about = "Declarative Unix access provisioner")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Show the create/update/delete plan without mutating anything.
-    Plan {
-        /// Path to the declaration TOML.
-        #[arg(long, default_value = "/etc/census/declaration.toml")]
-        declaration: std::path::PathBuf,
-        /// Path to the managed registry (current Census-managed state).
-        #[arg(long, default_value = "/var/lib/census/managed.toml")]
-        managed: std::path::PathBuf,
-        /// Extra catalog root for permission expansion (repeatable; appended to
-        /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
-        /// Override the OS target as `family-distro-version` (e.g.
-        /// `linux-debian-12`); autodetected from /etc/os-release if absent.
-        #[arg(long)]
-        os_target: Option<String>,
-    },
-    /// Apply the plan: materialize accounts via shadow-utils (requires root).
-    Apply {
-        /// Path to the declaration TOML.
-        #[arg(long, default_value = "/etc/census/declaration.toml")]
-        declaration: std::path::PathBuf,
-        /// Path to the managed registry (current Census-managed state).
-        #[arg(long, default_value = "/var/lib/census/managed.toml")]
-        managed: std::path::PathBuf,
-        /// Trust the declaration based on filesystem integrity (standalone).
-        #[arg(long)]
-        trust_fs: bool,
-        /// Proceed even if no rescue/break-glass login path is configured.
-        #[arg(long)]
-        i_understand_no_rescue: bool,
-        /// Path to Tessera's live-session registry. A delete over an account with
-        /// a live session is deferred (§12). Absent file → no live sessions.
-        #[arg(long, default_value = "/run/tessera/sessions.json")]
-        sessions_file: std::path::PathBuf,
-        /// Extra catalog root for permission expansion (repeatable; appended to
-        /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
-        /// Override the OS target as `family-distro-version` (e.g.
-        /// `linux-debian-12`); autodetected from /etc/os-release if absent.
-        #[arg(long)]
-        os_target: Option<String>,
-    },
-    /// Read-only diagnostics: verify the §4/§7/§8 invariants hold. Non-zero exit
-    /// on any error-severity finding (for monitoring/CI).
-    Doctor {
-        /// Optional declaration TOML; enables the drift check when present.
-        #[arg(long)]
-        declaration: Option<std::path::PathBuf>,
-        /// Path to the managed registry (current Census-managed state).
-        #[arg(long, default_value = "/var/lib/census/managed.toml")]
-        managed: std::path::PathBuf,
-    },
-    /// Read-only state summary: managed accounts, persisted version, drift.
-    /// Always exits 0.
-    Status {
-        /// Optional declaration TOML; enables the drift summary when present.
-        #[arg(long)]
-        declaration: Option<std::path::PathBuf>,
-        /// Path to the managed registry (current Census-managed state).
-        #[arg(long, default_value = "/var/lib/census/managed.toml")]
-        managed: std::path::PathBuf,
-    },
-    /// Read-only: expand a role into its flat compiled primitives with
-    /// provenance. With --lint, exits non-zero on any lint ERROR (for CI).
-    Compile {
-        /// The role id to compile.
-        role: String,
-        /// Path to the declaration TOML.
-        #[arg(long, default_value = "/etc/census/declaration.toml")]
-        declaration: std::path::PathBuf,
-        /// Extra catalog root for permission expansion (repeatable; appended to
-        /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
-        /// Override the OS target as `family-distro-version` (e.g.
-        /// `linux-debian-12`); autodetected from /etc/os-release if absent.
-        #[arg(long)]
-        os_target: Option<String>,
-        /// Run catalog/role lint; exit non-zero on any lint ERROR.
-        #[arg(long)]
-        lint: bool,
-        /// Emit machine-readable JSON instead of the human view.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Read-only: render a role as a tree of permissions/bundles → primitives
-    /// with localized descriptions and advisory risk classes.
-    Show {
-        /// The role id to show.
-        role: String,
-        /// Path to the declaration TOML.
-        #[arg(long, default_value = "/etc/census/declaration.toml")]
-        declaration: std::path::PathBuf,
-        /// Extra catalog root for permission expansion (repeatable; appended to
-        /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
-        /// Override the OS target as `family-distro-version` (e.g.
-        /// `linux-debian-12`); autodetected from /etc/os-release if absent.
-        #[arg(long)]
-        os_target: Option<String>,
-        /// Display language (e.g. `ru`); falls back to LC_MESSAGES, LANG, en.
-        #[arg(long)]
-        lang: Option<String>,
-    },
-    /// Catalog operations.
-    Catalog {
-        #[command(subcommand)]
-        sub: CatalogSub,
-    },
-}
-
-#[derive(Subcommand)]
-enum CatalogSub {
-    /// Read-only audit: enumerate the device's live privileged surface and report
-    /// what the installed catalog does NOT cover. Never mutates or runs binaries.
-    Coverage {
-        /// Emit machine-readable JSON instead of the human view.
-        #[arg(long)]
-        json: bool,
-        /// Override the OS target as `family-distro-version` (e.g.
-        /// `linux-debian-12`); autodetected from /etc/os-release if absent.
-        #[arg(long)]
-        os_target: Option<String>,
-        /// Extra catalog root for permission expansion (repeatable; appended to
-        /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
-        /// Role-store dir whose roles are resolved into concrete instances so
-        /// parametrized permissions contribute named units/paths/groups.
-        #[arg(long)]
-        roles: Option<std::path::PathBuf>,
-        /// Declaration whose `[[role_group]]` bindings are resolved so a `group`
-        /// object with a bound grant counts as covered. Optional; without it
-        /// coverage sees only membership-covered groups.
-        #[arg(long)]
-        declaration: Option<std::path::PathBuf>,
-        /// A parametrized record with no role instance does NOT count as covering.
-        #[arg(long)]
-        strict: bool,
-        /// Restrict to a comma-separated subset of classes
-        /// (sudo_bin,config,unit,group,capfile,setuid). Default: all.
-        #[arg(long)]
-        class: Option<String>,
-        /// Exit non-zero (CI-gate) when overall coverage is below this percent.
-        #[arg(long)]
-        min_coverage: Option<f64>,
-        /// Include low-priority objects in the human report.
-        #[arg(long)]
-        include_low_priority: bool,
-        /// Accept (no-op) — surface caching is not yet implemented.
-        #[arg(long)]
-        cache: bool,
-    },
-    /// Read-only reverse lookup: given an absolute path or command, report which
-    /// catalog permissions grant access to it and how. Always exits 0 (a query).
-    WhichGrants {
-        /// The absolute path (file or binary) or command to look up.
-        arg: String,
-        /// Emit machine-readable JSON instead of the human view.
-        #[arg(long)]
-        json: bool,
-        /// Override the OS target as `family-distro-version` (e.g.
-        /// `linux-debian-12`); autodetected from /etc/os-release if absent.
-        #[arg(long)]
-        os_target: Option<String>,
-        /// Extra catalog root for permission expansion (repeatable; appended to
-        /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
-        /// Declaration whose `[[role_group]]` bindings are resolved so group
-        /// grants (`via %group sudoers` / `via g:group ACL`) appear in the
-        /// lookup. Optional; without it only account grants are reported.
-        #[arg(long)]
-        declaration: Option<std::path::PathBuf>,
-    },
+/// Install the process-wide `tracing` subscriber. Diagnostics go to STDERR so
+/// they never contaminate the machine-readable STDOUT (`--json` output, the
+/// plan/coverage renders) or the program's exit code. The filter reads
+/// `CENSUS_LOG` first, then `RUST_LOG`, defaulting to `warn`; ANSI colour is
+/// enabled only when stderr is a terminal. `try_init` is used so a second call
+/// (e.g. from a test harness in the same process) is a no-op rather than a panic.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("CENSUS_LOG")
+        .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_env_filter(filter)
+        .try_init();
 }
 
 /// The default catalog roots plus any `--catalog-dir` overrides, in precedence
 /// order (lowest first). Overrides are appended so a site dir given on the CLI
 /// wins over the packaged defaults.
-fn catalog_roots_with_overrides(
-    overrides: Vec<std::path::PathBuf>,
-) -> Vec<std::path::PathBuf> {
+fn catalog_roots_with_overrides(overrides: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
     let mut roots = census::cli::default_catalog_roots();
     roots.extend(overrides);
     roots
 }
 
+/// The default framework roots plus any `--framework-dir` overrides, in
+/// precedence order (lowest first). Overrides are appended so a dir given on the
+/// CLI (or a test tree) wins over the packaged defaults — paralleling
+/// [`catalog_roots_with_overrides`].
+fn framework_roots_with_overrides(overrides: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    let mut roots = census::framework::default_framework_roots();
+    roots.extend(overrides);
+    roots
+}
+
 fn main() -> std::process::ExitCode {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command {
         Command::Plan {
@@ -209,11 +51,13 @@ fn main() -> std::process::ExitCode {
             managed,
             catalog_dir,
             os_target,
+            diff,
         } => census::cli::run_plan(
             &declaration,
             &managed,
             catalog_roots_with_overrides(catalog_dir),
             os_target.as_deref(),
+            diff,
         ),
         Command::Apply {
             declaration,
@@ -235,10 +79,14 @@ fn main() -> std::process::ExitCode {
             catalog_roots: catalog_roots_with_overrides(catalog_dir),
             os_target,
         }),
-        Command::Doctor { declaration, managed } => {
-            census::cli::run_doctor(declaration.as_deref(), &managed)
-        }
-        Command::Status { declaration, managed } => census::cli::run_status(
+        Command::Doctor {
+            declaration,
+            managed,
+        } => census::cli::run_doctor(declaration.as_deref(), &managed),
+        Command::Status {
+            declaration,
+            managed,
+        } => census::cli::run_status(
             declaration.as_deref(),
             &managed,
             std::path::Path::new(census::trust::DEFAULT_PERSIST_DIR),
@@ -264,13 +112,19 @@ fn main() -> std::process::ExitCode {
             catalog_dir,
             os_target,
             lang,
-        } => census::cli::run_show(
-            &role,
-            &declaration,
-            catalog_roots_with_overrides(catalog_dir),
-            os_target.as_deref(),
-            lang.as_deref(),
-        ),
+            framework,
+            framework_dir,
+            format,
+        } => census::cli::run_show(census::cli::ShowOpts {
+            role: &role,
+            declaration: &declaration,
+            catalog_roots: catalog_roots_with_overrides(catalog_dir),
+            os_target: os_target.as_deref(),
+            lang: lang.as_deref(),
+            framework: framework.as_deref(),
+            framework_roots: framework_roots_with_overrides(framework_dir),
+            format: format.as_deref(),
+        }),
         Command::Catalog { sub } => match sub {
             CatalogSub::Coverage {
                 json,
@@ -284,6 +138,21 @@ fn main() -> std::process::ExitCode {
                 include_low_priority,
                 cache,
             } => {
+                // Validate --min-coverage up front. The gate compares
+                // `overall_pct < threshold`; a non-finite threshold (NaN/inf) or
+                // one outside 0..=100 would make that comparison meaningless and
+                // could let a CI coverage gate silently pass (`x < NaN` is always
+                // false). Reject it before any scanning runs. This is a runtime
+                // check rather than a clap value_parser so the CLI help golden
+                // stays byte-stable.
+                if let Some(m) = min_coverage {
+                    if !m.is_finite() || !(0.0..=100.0).contains(&m) {
+                        eprintln!(
+                            "census: --min-coverage must be a finite percentage in 0..=100, got {m}"
+                        );
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
                 // Parse the optional --class filter up front so an unknown class is
                 // a clean error before any scanning runs.
                 let classes = match class {
@@ -322,6 +191,65 @@ fn main() -> std::process::ExitCode {
                 catalog_roots: catalog_roots_with_overrides(catalog_dir),
                 declaration,
             }),
+        },
+        Command::Framework { sub } => match sub {
+            FrameworkSub::List {
+                framework_dir,
+                os_target,
+                format,
+            } => census::cli::run_framework_list(
+                framework_roots_with_overrides(framework_dir),
+                os_target,
+                format.as_deref() == Some("json"),
+            ),
+            FrameworkSub::Show {
+                fw,
+                framework_dir,
+                os_target,
+                lang,
+                format,
+            } => census::cli::run_framework_show(
+                &fw,
+                framework_roots_with_overrides(framework_dir),
+                os_target,
+                lang,
+                format.as_deref() == Some("json"),
+            ),
+            FrameworkSub::Coverage {
+                fw,
+                framework_dir,
+                os_target,
+                format,
+            } => census::cli::run_framework_coverage(
+                &fw,
+                framework_roots_with_overrides(framework_dir),
+                os_target,
+                format.as_deref() == Some("json"),
+            ),
+            FrameworkSub::Risk {
+                fw,
+                framework_dir,
+                os_target,
+                lang,
+                format,
+            } => census::cli::run_framework_risk(
+                &fw,
+                framework_roots_with_overrides(framework_dir),
+                os_target,
+                lang,
+                format.as_deref() == Some("json"),
+            ),
+            FrameworkSub::Lint {
+                framework_dir,
+                catalog_dir,
+                os_target,
+                format,
+            } => census::cli::run_framework_lint(
+                framework_roots_with_overrides(framework_dir),
+                catalog_roots_with_overrides(catalog_dir),
+                os_target,
+                format.as_deref() == Some("json"),
+            ),
         },
     }
 }

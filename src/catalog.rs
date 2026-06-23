@@ -19,13 +19,16 @@
 //! catalog records use `deny_unknown_fields` (fail-closed, the PwnKit lesson:
 //! reject unknown structure rather than guess).
 
-use crate::rolestore::Limits;
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::rolestore::Limits;
 
 /// Risk class of a permission. Advisory only (honest labelling, not
 /// enforcement): it never blocks expansion or apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum Risk {
     /// Capability stays within its intended scope.
     #[serde(rename = "contained")]
@@ -108,6 +111,44 @@ impl<'de> Deserialize<'de> for ListOverride {
     }
 }
 
+/// Hand-written schema for [`ListOverride`]: the type has a custom
+/// `Deserialize` (a bare array OR a `{ append = [...] }` table), so its schema
+/// is written by hand to mirror exactly that one-of. A derive would not match
+/// the custom deserializer, defeating the point of the contract. The two arms
+/// are: a plain array of strings (replace), or a strict object with a required
+/// `append` array (append). Behind the `schema` feature — schema generation is a
+/// CI/contract concern, not part of the default public API.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for ListOverride {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ListOverride".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Both arms describe an array of strings. Build the element schema once
+        // per arm from the canonical `Vec<String>` schema so the element type
+        // stays in lockstep with the field type rather than being hand-spelled.
+        let replace = <Vec<String>>::json_schema(generator);
+        let append_items = <Vec<String>>::json_schema(generator);
+
+        // Arm 1: bare array → Replace. Arm 2: `{ append = [...] }` → Append
+        // (strict object, append required).
+        schemars::json_schema!({
+            "oneOf": [
+                replace,
+                {
+                    "type": "object",
+                    "required": ["append"],
+                    "properties": {
+                        "append": append_items,
+                    },
+                    "additionalProperties": false,
+                },
+            ],
+        })
+    }
+}
+
 /// The `[limits]` sub-table as written in a catalog record, parsed *strictly*.
 ///
 /// `rolestore::Limits` is intentionally tolerant (no `deny_unknown_fields`)
@@ -120,6 +161,7 @@ impl<'de> Deserialize<'de> for ListOverride {
 /// otherwise be worse than the correctly-rejected top-level form. This local
 /// strict type closes that gap without touching the tolerant role-slice parse.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CatalogLimits {
     /// `RLIMIT_NOFILE`.
@@ -139,6 +181,56 @@ impl From<CatalogLimits> for Limits {
     }
 }
 
+/// A role-supplied permission parameter value, in the census-owned param domain.
+///
+/// A role's `PermissionRef` carries parameters that fill a catalog template's
+/// `{placeholder}`s. Census reads role slices as TOML, but the parameter domain
+/// is Census's own contract — only the scalar kinds a template can splice
+/// (string/int/float/bool) plus a list of those (which expands to one rendered
+/// command per element). Keeping this a census type, rather than re-exposing
+/// `toml::Value`, means a future TOML parser bump (or a non-TOML role source) is
+/// not a breaking change to the resolve API: conversion happens once, at the
+/// slice-parse boundary ([`ParamValue::from_toml`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamValue {
+    /// A string parameter.
+    String(String),
+    /// An integer parameter.
+    Integer(i64),
+    /// A floating-point parameter.
+    Float(f64),
+    /// A boolean parameter.
+    Boolean(bool),
+    /// A list parameter; expands the template into one command per element. Only
+    /// scalar elements are valid — a nested list or table element is rejected at
+    /// resolve time.
+    Array(Vec<ParamValue>),
+    /// A value census does not splice into a template (a TOML datetime, table, or
+    /// nested non-scalar). Preserved so it round-trips and is rejected with a
+    /// clear "not a scalar" error at the point it would be substituted, rather
+    /// than silently dropped at the parse boundary.
+    Other,
+}
+
+impl ParamValue {
+    /// Convert a parsed `toml::Value` into the census param domain. The single
+    /// boundary where `toml` enters the parameter path; every downstream resolve
+    /// API speaks [`ParamValue`].
+    pub fn from_toml(value: toml::Value) -> Self {
+        match value {
+            toml::Value::String(s) => ParamValue::String(s),
+            toml::Value::Integer(i) => ParamValue::Integer(i),
+            toml::Value::Float(f) => ParamValue::Float(f),
+            toml::Value::Boolean(b) => ParamValue::Boolean(b),
+            toml::Value::Array(items) => {
+                ParamValue::Array(items.into_iter().map(ParamValue::from_toml).collect())
+            }
+            // Datetime and Table have no scalar template rendering.
+            _ => ParamValue::Other,
+        }
+    }
+}
+
 /// File-access mode a grant requests.
 ///
 /// `ro` maps to POSIX ACL `r-X` (read + traverse-only on directories — the `X`
@@ -147,6 +239,7 @@ impl From<CatalogLimits> for Limits {
 /// lattice for the resolve-time union (`Ro` < `Rw`): two grants on the same path
 /// merge to the wider access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum Access {
     /// Read + directory-traverse (`r-X`).
     #[serde(rename = "ro")]
@@ -214,6 +307,7 @@ fn has_glob_metachar(path: &str) -> bool {
 /// read boundary; `{param}` placeholders are filled and re-validated at resolve
 /// time, mirroring the parametrized-sudo path exactly.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct FileGrant {
     /// Absolute path to a directory, file, or glob pattern.
@@ -259,6 +353,7 @@ impl FileGrant {
 /// One `PermissionDef` is one *layer's* statement about an id. The cross-layer
 /// merge (see [`resolve_leaf`]) combines several of these for the same id.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PermissionDef {
     /// Permission id (top-level in slice 1; namespaced ids are slice 2).
@@ -276,6 +371,19 @@ pub struct PermissionDef {
     /// Sudo commands this permission grants.
     #[serde(default)]
     pub sudo: ListOverride,
+    /// The Unix account this permission's `sudo` commands run *as*, or `None`
+    /// for the default `(ALL)` (root) run-spec.
+    ///
+    /// A service utility must often be launched under a non-root service account
+    /// (`sudo -u bfs_solutions ./QToolplus`), never as root. Setting `runas` to
+    /// that account narrows the grant: every command this permission contributes
+    /// renders under `(<runas>)` instead of `(ALL)`, so the privilege handed out
+    /// is "be that service account for these commands", not a root-equivalent.
+    /// Overrides across layers exactly like `risk`: the topmost layer that sets
+    /// `runas` wins; a higher layer that restates `sudo` without `runas` leaves
+    /// the lower layer's run-spec standing. Validated at the read boundary.
+    #[serde(default)]
+    pub runas: Option<String>,
     /// Resource limits this permission sets. A higher layer that sets `limits`
     /// replaces wholesale (limits are a small fixed struct, not a list). Uses the
     /// strict [`CatalogLimits`] so an unknown key (notably `mac_mask`) under
@@ -350,6 +458,21 @@ impl PermissionDef {
                 });
             }
         }
+        // A `runas` token is spliced into the sudoers run-spec `(<runas>)` as
+        // root. Validate it here so a value carrying a sudoers metacharacter (a
+        // `)` that closes the run-spec early, a `,` that splits the Cmnd list, a
+        // `!` negation) — or one that is not a portable Unix username at all —
+        // fails closed at parse, naming the id, rather than reaching the renderer
+        // and relying solely on its metacharacter neutralization.
+        if let Some(runas) = &self.runas {
+            if let Some(reason) = runas_defect(runas) {
+                return Err(CatalogError::InvalidRunas {
+                    id: self.id.clone(),
+                    value: runas.clone(),
+                    reason,
+                });
+            }
+        }
         // Every file-grant path is materialized into a root `setfacl` target.
         // Validate each literal path here so a relative/`..`/control-bearing path
         // fails closed at parse, naming the offending id. A templated path
@@ -380,10 +503,11 @@ impl PermissionDef {
     }
 }
 
-/// The H1 sudo-command validation rule, factored out so it is reusable on
-/// post-substitution strings (a templated command's concrete result must pass
-/// the SAME gate the catalog parse applies to a static command). Returns the
-/// rejection reason, or `None` if the value is a fit concrete absolute-path Cmnd.
+/// The sudo-command validation gate (control-char / absolute-path / empty
+/// check), factored out so it is reusable on post-substitution strings: a
+/// templated command's concrete result must pass the SAME gate the catalog parse
+/// applies to a static command. Returns the rejection reason, or `None` if the
+/// value is a fit concrete absolute-path Cmnd.
 ///
 /// Census emits each sudo string into `/etc/sudoers.d/census-*` as root, so a
 /// value with a control char (a newline splits the rule into a second physical
@@ -396,6 +520,12 @@ fn sudo_command_defect(value: &str) -> Option<&'static str> {
         Some("is empty or whitespace-only")
     } else if !value.starts_with('/') {
         Some("must be an absolute path (start with '/')")
+    } else if has_dotdot_component(value) {
+        // sudo normalizes `..` segments, so a substituted command like
+        // `/usr/bin/../../bin/bash` collapses to a BROADER Cmnd than the literal
+        // prefix suggests. Reject any `..` component post-substitution, mirroring
+        // the file-path gate, so a hostile param value cannot widen the grant.
+        Some("must not contain a `..` path component")
     } else {
         None
     }
@@ -421,6 +551,71 @@ fn sudo_command_static_defect(value: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The maximum length Census accepts for a `runas` username. POSIX leaves the
+/// limit to the system (`LOGIN_NAME_MAX` is commonly 32, including the NUL), and
+/// `useradd` rejects longer names on Linux; 32 is the safe portable ceiling, and
+/// rejecting longer values at parse keeps a pathological token out of the
+/// sudoers run-spec.
+const RUNAS_MAX_LEN: usize = 32;
+
+/// Validate a `runas` token destined for the sudoers run-spec `(<runas>)`, run as
+/// root. Returns the rejection reason, or `None` if the value is a fit Unix
+/// username.
+///
+/// The token is spliced verbatim into `(<runas>)`, so a sudoers metacharacter
+/// would change the rule's meaning rather than name an account: `)` closes the
+/// run-spec early, `(` opens a nested one, `,` splits the Cmnd list, `!` negates,
+/// `:`/`=`/`\` are rule punctuation, and whitespace splits the field. A control
+/// char (notably a newline) would inject a second directive. Beyond "no
+/// metacharacters", the value must be a real portable Unix username — a POSIX
+/// portable name (`[a-z_][a-z0-9_-]*`) with an optional trailing `$` (the form
+/// `useradd` accepts for machine accounts) — so a structurally-wrong token that
+/// happens to carry no metacharacter (a leading digit, an uppercase letter, an
+/// embedded `{param}` we deliberately do not template here) is still rejected.
+fn runas_defect(value: &str) -> Option<&'static str> {
+    if value.is_empty() {
+        return Some("is empty");
+    }
+    if value.len() > RUNAS_MAX_LEN {
+        return Some("exceeds the maximum username length (32)");
+    }
+    if value.chars().any(char::is_control) {
+        return Some("contains a control character");
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Some("contains whitespace");
+    }
+    // Templated run-as is out of scope: a `{param}` runas would need its own
+    // substitution + re-validation path. Reject the template metacharacters
+    // explicitly so the failure names the real reason rather than the generic
+    // "not a portable username" below.
+    if value.contains('{') || value.contains('}') {
+        return Some("must not be templated ({...} is not supported for runas)");
+    }
+    if value
+        .chars()
+        .any(|c| matches!(c, ',' | ':' | '=' | '\\' | '(' | ')' | '!'))
+    {
+        return Some("contains a sudoers metacharacter ( , : = \\ ( ) ! )");
+    }
+    // POSIX portable username: first char a lowercase letter or underscore, the
+    // rest lowercase letters / digits / underscore / hyphen, with an optional
+    // single trailing `$` (machine-account form).
+    let core = value.strip_suffix('$').unwrap_or(value);
+    if core.is_empty() {
+        return Some("must be a Unix username, not a bare `$`");
+    }
+    let mut chars = core.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return Some("must start with a lowercase letter or underscore");
+    }
+    if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+        return Some("must be a portable Unix username (lowercase letters, digits, `_`, `-`)");
+    }
+    None
 }
 
 /// Validate a file-grant path destined for `setfacl`/`getfacl` as root. Returns
@@ -610,12 +805,12 @@ impl OsTarget {
 
 /// Strip surrounding single or double quotes from an os-release value.
 fn unquote_os_release(value: &str) -> String {
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return value[1..value.len() - 1].to_owned();
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|v| v.strip_suffix(quote))
+        {
+            return inner.to_owned();
         }
     }
     value.to_owned()
@@ -644,10 +839,7 @@ pub trait CatalogSource {
     /// The default walks `os.layer_names()` via [`read_layer`](CatalogSource::read_layer);
     /// a source backed by a filesystem may override for efficiency but the
     /// semantics must match.
-    fn all_definitions(
-        &self,
-        os: &OsTarget,
-    ) -> Result<Vec<(String, PermissionDef)>, CatalogError> {
+    fn all_definitions(&self, os: &OsTarget) -> Result<Vec<(String, PermissionDef)>, CatalogError> {
         let mut out = Vec::new();
         for layer in os.layer_names() {
             for def in self.read_layer(&layer)? {
@@ -722,18 +914,16 @@ impl LiveCatalog {
     /// The match is enforced at read time so a file misfiled under the wrong
     /// add-on dir (e.g. `docker.ps` placed under `k8s/`) is caught before it can
     /// expand into sudo commands, rather than silently resolving.
-    fn read_policy_file(
-        path: &Path,
-        subdir: Option<&str>,
-    ) -> Result<PermissionDef, CatalogError> {
-        let text = std::fs::read_to_string(path).map_err(|e| CatalogError::Io {
+    fn read_policy_file(path: &Path, subdir: Option<&str>) -> Result<PermissionDef, CatalogError> {
+        let text = std::fs::read_to_string(path).map_err(|source| CatalogError::Io {
             path: path.to_owned(),
-            reason: e.to_string(),
+            source,
         })?;
-        let def: PermissionDef = toml::from_str(&text).map_err(|e| CatalogError::TomlParse {
-            path: path.to_owned(),
-            reason: e.to_string(),
-        })?;
+        let def: PermissionDef =
+            toml::from_str(&text).map_err(|source| CatalogError::TomlParse {
+                path: path.to_owned(),
+                source,
+            })?;
         def.validate()?;
         let id_ns = namespace_of(&def.id);
         match (subdir, id_ns) {
@@ -748,7 +938,7 @@ impl LiveCatalog {
             }
             // Anything else is a misfiled policy.
             _ => {
-                return Err(CatalogError::TomlParse {
+                return Err(CatalogError::MisfiledPolicy {
                     path: path.to_owned(),
                     reason: format!(
                         "id {:?} namespace does not match its location (subdir {:?})",
@@ -779,13 +969,13 @@ impl LiveCatalog {
             Ok(())
         };
 
-        for entry in std::fs::read_dir(layer_dir).map_err(|e| CatalogError::Io {
+        for entry in std::fs::read_dir(layer_dir).map_err(|source| CatalogError::Io {
             path: layer_dir.to_owned(),
-            reason: e.to_string(),
+            source,
         })? {
-            let entry = entry.map_err(|e| CatalogError::Io {
+            let entry = entry.map_err(|source| CatalogError::Io {
                 path: layer_dir.to_owned(),
-                reason: e.to_string(),
+                source,
             })?;
             let path = entry.path();
             // Skip symlinked entries. As root, a symlink planted in a catalog dir
@@ -803,13 +993,13 @@ impl LiveCatalog {
                     .and_then(|n| n.to_str())
                     .unwrap_or_default()
                     .to_owned();
-                for sub in std::fs::read_dir(&path).map_err(|e| CatalogError::Io {
+                for sub in std::fs::read_dir(&path).map_err(|source| CatalogError::Io {
                     path: path.clone(),
-                    reason: e.to_string(),
+                    source,
                 })? {
-                    let sub = sub.map_err(|e| CatalogError::Io {
+                    let sub = sub.map_err(|source| CatalogError::Io {
                         path: path.clone(),
-                        reason: e.to_string(),
+                        source,
                     })?;
                     let sub_path = sub.path();
                     // Same symlink guard one level down (namespace subdir files).
@@ -949,6 +1139,19 @@ pub struct SourcedPrimitive {
     /// Audit needs to show not just which layer a sudo command came from, but
     /// which permission inside an aggregate pulled it in.
     pub via: Option<String>,
+    /// For a **sudo** primitive: the account this command runs as, or `None` for
+    /// the default `(ALL)` (root) run-spec. Tracked per primitive — not per
+    /// resolved permission — so a command keeps the run-spec of the permission
+    /// that actually declared it as it flows through a bundle union. A bundle
+    /// that pulls in a member which de-rooted its own command (`runas =
+    /// Some("svc")`) MUST NOT silently widen it back to root: the member's
+    /// command carries its own `runas` here, and the bundle's own `runas` applies
+    /// only to the bundle's own commands.
+    ///
+    /// Always `None` for a **groups** primitive (a group membership has no
+    /// run-spec); this type is shared by both the groups and sudo vectors, and
+    /// only the sudo path ever sets the field.
+    pub runas: Option<String>,
 }
 
 /// A file-access grant after resolve: its path, access, recursion, derived
@@ -957,6 +1160,7 @@ pub struct SourcedPrimitive {
 /// layers/members: access widens to the max (`Ro` < `Rw`), `recursive` is the OR,
 /// and provenance accumulates.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResolvedFileGrant {
     /// Absolute path (literal, already `{param}`-substituted if it was templated).
     pub path: String,
@@ -986,11 +1190,21 @@ pub struct SourcedFileGrant {
 
 /// A fully-resolved single permission: primitives with per-primitive provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResolvedPermission {
     /// The permission id.
     pub id: String,
     /// Risk class, if any layer set one (topmost setter wins).
     pub risk: Option<Risk>,
+    /// The account this permission's sudo commands run as, or `None` for the
+    /// default `(ALL)` (root) run-spec. Resolved topmost-setter-wins, exactly
+    /// like `risk`: the highest layer that sets `runas` wins; a higher layer that
+    /// restates `sudo` without `runas` leaves the lower layer's run-spec
+    /// standing. For a bundle, this is the bundle's OWN `runas` — a single
+    /// resolved permission carries one run-spec, applied to every sudo command it
+    /// contributes, so a bundle narrows all its members' commands to one account
+    /// rather than per-member run-specs.
+    pub runas: Option<String>,
     /// Group memberships, each tagged with its source layer.
     pub groups: Vec<SourcedPrimitive>,
     /// Sudo commands, each tagged with its source layer.
@@ -1017,6 +1231,7 @@ pub struct ResolvedPermission {
 
 /// Errors compiling/resolving the catalog.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CatalogError {
     /// No layer in the chain defines the requested id.
     #[error("unknown permission {0}")]
@@ -1037,7 +1252,9 @@ pub enum CatalogError {
     /// A bundle explicitly declares a `risk` lower than the maximum risk of its
     /// members. Honest labelling: an aggregate must not under-state the worst
     /// capability it pulls in.
-    #[error("bundle {id} declares risk {declared:?} below its members' computed risk {computed:?}")]
+    #[error(
+        "bundle {id} declares risk {declared:?} below its members' computed risk {computed:?}"
+    )]
     LoweredBundleRisk {
         /// The bundle id.
         id: String,
@@ -1047,19 +1264,31 @@ pub enum CatalogError {
         computed: Risk,
     },
     /// A catalog file could not be read.
-    #[error("cannot read catalog path {path}: {reason}")]
+    #[error("cannot read catalog path {path}: {source}")]
     Io {
         /// The path that failed.
         path: PathBuf,
-        /// Underlying reason.
-        reason: String,
+        /// The underlying I/O error (preserves `io::ErrorKind` and the source chain).
+        #[source]
+        source: std::io::Error,
     },
     /// A catalog file's TOML was malformed or violated the strict schema.
-    #[error("catalog file {path} TOML is invalid: {reason}")]
+    #[error("catalog file {path} TOML is invalid: {source}")]
     TomlParse {
         /// The path that failed.
         path: PathBuf,
-        /// Underlying reason.
+        /// The underlying TOML deserialization error.
+        #[source]
+        source: toml::de::Error,
+    },
+    /// A catalog policy file sits under the wrong namespace location (its id's
+    /// namespace does not match the subdirectory it was read from). A structural
+    /// misfiling, distinct from a malformed-TOML failure.
+    #[error("catalog file {path} is misfiled: {reason}")]
+    MisfiledPolicy {
+        /// The path that was misfiled.
+        path: PathBuf,
+        /// What did not line up (id namespace vs subdir).
         reason: String,
     },
     /// A name that becomes a filesystem path component (OS-target field or
@@ -1105,6 +1334,21 @@ pub enum CatalogError {
         /// Why it was rejected.
         reason: &'static str,
     },
+    /// A `runas` token is unfit to splice into the sudoers run-spec `(<runas>)`.
+    /// The value is rendered as root, so a token carrying a sudoers metacharacter
+    /// (which would change the rule's meaning rather than name an account), a
+    /// control char, whitespace, a `{param}` template (out of scope), or one that
+    /// is simply not a portable Unix username is rejected at the read boundary —
+    /// before it reaches root materialization.
+    #[error("invalid runas {value:?} in permission {id}: {reason}")]
+    InvalidRunas {
+        /// The permission id carrying the bad runas token.
+        id: String,
+        /// The rejected runas value.
+        value: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
     /// A `[[file]]` grant path is unfit to materialize into a root `setfacl`
     /// target. Census runs `setfacl -R --physical` on this path as root, so a
     /// non-absolute path, a `..` component (a traversal that could point the
@@ -1124,7 +1368,9 @@ pub enum CatalogError {
     /// must NOT render literally into a sudoers rule (a literal `{unit}` Cmnd is
     /// nonsense at best and a silent grant gap at worst), so resolution is
     /// rejected rather than emitting the unrendered template.
-    #[error("permission {permission}: template placeholder {{{placeholder}}} has no matching parameter")]
+    #[error(
+        "permission {permission}: template placeholder {{{placeholder}}} has no matching parameter"
+    )]
     MissingParam {
         /// The permission id whose template could not be filled.
         permission: String,
@@ -1238,6 +1484,7 @@ pub fn resolve_leaf(
     // union below), since file grants have no per-grant bare-vs-append distinction.
     let mut raw_files: Vec<(FileGrant, String)> = Vec::new();
     let mut risk: Option<Risk> = None;
+    let mut runas: Option<String> = None;
     let mut limits: Option<Limits> = None;
     let mut limits_layer: Option<String> = None;
     let mut found = false;
@@ -1267,6 +1514,9 @@ pub fn resolve_leaf(
         if let Some(r) = def.risk {
             risk = Some(r); // topmost setter wins
         }
+        if let Some(u) = def.runas {
+            runas = Some(u); // topmost setter wins, mirroring risk
+        }
         if let Some(l) = def.limits {
             limits = Some(l.into());
             limits_layer = Some(layer.clone());
@@ -1277,12 +1527,22 @@ pub fn resolve_leaf(
         return Err(CatalogError::UnknownPermission(id.to_owned()));
     }
 
+    // Stamp this leaf's resolved run-spec onto every one of ITS sudo commands, so
+    // the run-as account travels with each command as a per-primitive fact. When
+    // this leaf is later pulled into a bundle, the bundle union preserves these
+    // per-command run-specs — a member that de-rooted its command keeps that
+    // narrowing instead of being silently widened back to the bundle's `(ALL)`.
+    for cmd in &mut sudo {
+        cmd.runas = runas.clone();
+    }
+
     let file_grants = union_file_grants(raw_files, None);
 
     Ok((
         ResolvedPermission {
             id: id.to_owned(),
             risk,
+            runas,
             groups,
             sudo,
             file_grants,
@@ -1373,6 +1633,8 @@ fn apply_list_override(
     layer: &str,
     via: Option<&str>,
 ) {
+    // `runas` is set later (only on the sudo vec, after the leaf's run-spec is
+    // resolved topmost-wins); the groups vec keeps `None`.
     match ov {
         ListOverride::Replace(values) => {
             acc.clear();
@@ -1381,6 +1643,7 @@ fn apply_list_override(
                     value: v.clone(),
                     layer: layer.to_owned(),
                     via: via.map(str::to_owned),
+                    runas: None,
                 });
             }
         }
@@ -1390,6 +1653,7 @@ fn apply_list_override(
                     value: v.clone(),
                     layer: layer.to_owned(),
                     via: via.map(str::to_owned),
+                    runas: None,
                 });
             }
         }
@@ -1483,7 +1747,7 @@ fn resolve_inner(
     // being expanded means the include graph closed a loop. Report the path from
     // the first occurrence so the diagnostic shows the actual cycle.
     if let Some(start) = path.iter().position(|p| p == id) {
-        let mut cycle: Vec<String> = path[start..].to_vec();
+        let mut cycle: Vec<String> = path.iter().skip(start).cloned().collect();
         cycle.push(id.to_owned());
         return Err(CatalogError::Cycle(cycle));
     }
@@ -1523,6 +1787,14 @@ fn resolve_inner(
     let mut limits = own.limits;
     let mut limits_layer = own.limits_layer;
     let declared_risk = own.risk;
+    // The bundle's OWN run-spec. This applies only to the bundle's own sudo
+    // commands (already stamped onto `own.sudo` by resolve_leaf). Each member's
+    // commands keep the run-spec the member resolved to — carried per primitive
+    // through the union below — so a member that de-rooted its command is never
+    // silently widened back to the bundle's run-spec. The field on the resolved
+    // permission records the bundle's own run-spec for audit; the authoritative
+    // per-command run-spec lives on each `SourcedPrimitive.runas`.
+    let runas = own.runas;
 
     // Materialize include_categories against the catalog as read now: enumerate
     // every id of each category across all layers/namespaces and treat them as
@@ -1632,6 +1904,7 @@ fn resolve_inner(
         ResolvedPermission {
             id: id.to_owned(),
             risk,
+            runas,
             groups,
             sudo,
             file_grants,
@@ -1695,7 +1968,13 @@ fn union_member_primitives(
     via: &str,
 ) {
     for mut p in members {
-        if acc.iter().any(|e| e.value == p.value) {
+        // Dedup by the (value, runas) pair, not value alone. For groups `runas`
+        // is always `None` on both sides, so this is value-equality as before. For
+        // sudo it keeps the same command under two different run-specs as two
+        // distinct grants — collapsing them would drop a member's narrowing (e.g.
+        // a member granting `/opt/tool` as a service account would be discarded if
+        // the bundle already granted it as root), silently widening privilege.
+        if acc.iter().any(|e| e.value == p.value && e.runas == p.runas) {
             continue;
         }
         p.via = Some(via.to_owned());
@@ -1709,16 +1988,15 @@ fn union_member_primitives(
 // placeholders that a referencing role fills via `PermissionRef.params`. The
 // substitution rule, fixed and documented here so authors and the engine agree:
 //
-//   * Placeholder `{X}` is filled by the param keyed exactly `X` (literal name
-//     match — no singular/plural inference; if the placeholder is `{unit}` the
-//     param key must be `unit`, if `{units}` then `units`).
+//   * Placeholder `{X}` is filled by the param keyed exactly `X` (literal name match — no
+//     singular/plural inference; if the placeholder is `{unit}` the param key must be `unit`, if
+//     `{units}` then `units`).
 //   * A SCALAR param (string/int/bool/float) substitutes once.
-//   * A LIST param emits one rendered copy of the template per element, each
-//     element spliced into that placeholder. At most ONE list param may
-//     participate in a single permission expansion (see `MultipleListParams`) —
-//     the engine never invents a cartesian product.
-//   * A placeholder with no matching param is a hard error (`MissingParam`):
-//     an unfilled `{X}` must never reach a sudoers Cmnd literally.
+//   * A LIST param emits one rendered copy of the template per element, each element spliced into
+//     that placeholder. At most ONE list param may participate in a single permission expansion
+//     (see `MultipleListParams`) — the engine never invents a cartesian product.
+//   * A placeholder with no matching param is a hard error (`MissingParam`): an unfilled `{X}` must
+//     never reach a sudoers Cmnd literally.
 //   * A param with no matching placeholder is a `Warning::UnusedParam`.
 //
 // The dual `{unit}` / `{unit}.service` Cmnd forms a service-restart record needs
@@ -1759,18 +2037,19 @@ fn substitute_one(template: &str, name: &str, value: &str) -> String {
     template.replace(&format!("{{{name}}}"), value)
 }
 
-/// Render a scalar `toml::Value` to the string that goes into a Cmnd. Only the
+/// Render a scalar [`ParamValue`] to the string that goes into a Cmnd. Only the
 /// scalar kinds a role would sensibly pass as a parameter are accepted; arrays
-/// and tables are not scalars (a list is handled by the per-element path, a
-/// table has no string rendering). Returns `None` for non-scalars.
-fn scalar_param_string(v: &toml::Value) -> Option<String> {
+/// and the `Other` catch-all are not scalars (a list is handled by the
+/// per-element path, the rest have no string rendering). Returns `None` for
+/// non-scalars.
+fn scalar_param_string(v: &ParamValue) -> Option<String> {
     match v {
-        toml::Value::String(s) => Some(s.clone()),
-        toml::Value::Integer(i) => Some(i.to_string()),
-        toml::Value::Float(f) => Some(f.to_string()),
-        toml::Value::Boolean(b) => Some(b.to_string()),
-        // Datetime, Array, Table are not valid scalar substitutions.
-        _ => None,
+        ParamValue::String(s) => Some(s.clone()),
+        ParamValue::Integer(i) => Some(i.to_string()),
+        ParamValue::Float(f) => Some(f.to_string()),
+        ParamValue::Boolean(b) => Some(b.to_string()),
+        // Array and Other are not valid scalar substitutions.
+        ParamValue::Array(_) | ParamValue::Other => None,
     }
 }
 
@@ -1797,8 +2076,8 @@ fn param_value_defect(value: &str) -> Option<&'static str> {
     // Comma separates sudoers Cmnds; the rest are shell/sudoers metacharacters
     // that must not enter a Cmnd via an attacker-influenced param value.
     const FORBIDDEN: &[char] = &[
-        ',', ';', '&', '|', '<', '>', '(', ')', '$', '`', '"', '\'', '\\', '*', '?', '!', '=',
-        '#', '{', '}', '~',
+        ',', ';', '&', '|', '<', '>', '(', ')', '$', '`', '"', '\'', '\\', '*', '?', '!', '=', '#',
+        '{', '}', '~',
     ];
     if value.chars().any(|c| FORBIDDEN.contains(&c)) {
         // The offending char is visible in the rejected value the caller carries
@@ -1820,9 +2099,9 @@ fn param_value_defect(value: &str) -> Option<&'static str> {
 /// inner resolve, plus `UnusedParam` for any supplied param no placeholder used).
 pub fn resolve_with_params(
     id: &str,
-    params: &std::collections::BTreeMap<String, toml::Value>,
+    params: &std::collections::BTreeMap<String, ParamValue>,
     os: &OsTarget,
-    catalog: &dyn CatalogSource,
+    catalog: &impl CatalogSource,
     ctx: &ResolveCtx,
 ) -> Result<(ResolvedPermission, Vec<Warning>), CatalogError> {
     let (mut resolved, mut warnings) = resolve(id, os, catalog, ctx)?;
@@ -1832,8 +2111,13 @@ pub fn resolve_with_params(
     // Track which params actually fill a placeholder so unused ones can warn.
     let mut used_params: Vec<String> = Vec::new();
 
-    resolved.groups =
-        substitute_primitives(&resolved.id, resolved.groups, params, &mut used_params, false)?;
+    resolved.groups = substitute_primitives(
+        &resolved.id,
+        resolved.groups,
+        params,
+        &mut used_params,
+        false,
+    )?;
     resolved.sudo =
         substitute_primitives(&resolved.id, resolved.sudo, params, &mut used_params, true)?;
     resolved.file_grants =
@@ -1859,7 +2143,7 @@ pub fn resolve_with_params(
 fn substitute_primitives(
     permission: &str,
     prims: Vec<SourcedPrimitive>,
-    params: &std::collections::BTreeMap<String, toml::Value>,
+    params: &std::collections::BTreeMap<String, ParamValue>,
     used_params: &mut Vec<String>,
     is_sudo: bool,
 ) -> Result<Vec<SourcedPrimitive>, CatalogError> {
@@ -1868,9 +2152,10 @@ fn substitute_primitives(
         let rendered = render_template(permission, &prim.value, params, used_params)?;
         for value in rendered {
             // Every rendered string is a concrete primitive now. For sudo,
-            // re-validate against the SAME H1 rule applied at catalog parse so a
-            // substitution that produced a non-absolute or control-bearing Cmnd
-            // (despite the param-value gate) fails closed before root.
+            // re-validate against the SAME sudo-command gate applied at catalog
+            // parse so a substitution that produced a non-absolute or
+            // control-bearing Cmnd (despite the param-value gate) fails closed
+            // before root.
             if is_sudo {
                 if let Some(reason) = sudo_command_defect(&value) {
                     return Err(CatalogError::InvalidSudoCommand {
@@ -1884,6 +2169,10 @@ fn substitute_primitives(
                 value,
                 layer: prim.layer.clone(),
                 via: prim.via.clone(),
+                // Preserve the per-command run-spec across substitution: a
+                // templated sudo command keeps the run-as account of the
+                // permission that declared it (`runas` is not itself templated).
+                runas: prim.runas.clone(),
             });
         }
     }
@@ -1902,7 +2191,7 @@ fn substitute_primitives(
 fn substitute_file_grants(
     permission: &str,
     grants: Vec<ResolvedFileGrant>,
-    params: &std::collections::BTreeMap<String, toml::Value>,
+    params: &std::collections::BTreeMap<String, ParamValue>,
     used_params: &mut Vec<String>,
 ) -> Result<Vec<ResolvedFileGrant>, CatalogError> {
     let mut rendered: Vec<ResolvedFileGrant> = Vec::new();
@@ -1972,7 +2261,7 @@ fn substitute_file_grants(
 fn render_template(
     permission: &str,
     template: &str,
-    params: &std::collections::BTreeMap<String, toml::Value>,
+    params: &std::collections::BTreeMap<String, ParamValue>,
     used_params: &mut Vec<String>,
 ) -> Result<Vec<String>, CatalogError> {
     // Collect this template's placeholders (deduped, in order). A template with
@@ -2004,7 +2293,7 @@ fn render_template(
         }
 
         match value {
-            toml::Value::Array(items) => {
+            ParamValue::Array(items) => {
                 // Validate every element and collect them; reject a second list.
                 let mut elems: Vec<String> = Vec::new();
                 for item in items {
@@ -2071,8 +2360,9 @@ fn render_template(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     // --- helpers ---
 
@@ -2106,7 +2396,10 @@ nofile = 4096
         assert_eq!(def.risk, Some(Risk::EscalationCapable));
         assert_eq!(def.category.as_deref(), Some("network"));
         assert_eq!(def.groups, ListOverride::Replace(vec!["netdev".to_owned()]));
-        assert_eq!(def.sudo, ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]));
+        assert_eq!(
+            def.sudo,
+            ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()])
+        );
         assert_eq!(def.limits.unwrap().nofile, Some(4096));
         assert!(!def.replace);
     }
@@ -2158,23 +2451,31 @@ include_categories = ["network"]
     fn append_form_parses_distinct_from_replace() {
         let appended: PermissionDef =
             toml::from_str("id = \"a\"\nsudo = { append = [\"netplan\"] }\n").unwrap();
-        assert_eq!(appended.sudo, ListOverride::Append(vec!["netplan".to_owned()]));
-        let replaced: PermissionDef =
-            toml::from_str("id = \"a\"\nsudo = [\"netplan\"]\n").unwrap();
-        assert_eq!(replaced.sudo, ListOverride::Replace(vec!["netplan".to_owned()]));
+        assert_eq!(
+            appended.sudo,
+            ListOverride::Append(vec!["netplan".to_owned()])
+        );
+        let replaced: PermissionDef = toml::from_str("id = \"a\"\nsudo = [\"netplan\"]\n").unwrap();
+        assert_eq!(
+            replaced.sudo,
+            ListOverride::Replace(vec!["netplan".to_owned()])
+        );
     }
 
     #[test]
     fn append_form_rejects_unknown_key() {
         // A typo in the table form must not be silently dropped.
-        assert!(toml::from_str::<PermissionDef>("id = \"a\"\nsudo = { apend = [\"x\"] }\n").is_err());
+        assert!(
+            toml::from_str::<PermissionDef>("id = \"a\"\nsudo = { apend = [\"x\"] }\n").is_err()
+        );
     }
 
     // --- 1.2 OsTarget detection ---
 
     #[test]
     fn detects_debian_12() {
-        let f = write_os_release("ID=debian\nVERSION_ID=\"12\"\nPRETTY_NAME=\"Debian GNU/Linux 12\"\n");
+        let f =
+            write_os_release("ID=debian\nVERSION_ID=\"12\"\nPRETTY_NAME=\"Debian GNU/Linux 12\"\n");
         let os = OsTarget::detect_from(f.path()).unwrap();
         assert_eq!(os.family, "linux");
         assert_eq!(os.distro, "debian");
@@ -2250,6 +2551,7 @@ include_categories = ["network"]
             category: None,
             groups: ListOverride::default(),
             sudo: ListOverride::default(),
+            runas: None,
             limits: None,
             replace: false,
             includes: Vec::new(),
@@ -2391,19 +2693,31 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    limits: Some(CatalogLimits { nofile: Some(1024), nproc: None }),
+                    limits: Some(CatalogLimits {
+                        nofile: Some(1024),
+                        nproc: None,
+                    }),
                     ..def("net")
                 },
             )
             .with(
                 "linux-debian",
                 PermissionDef {
-                    limits: Some(CatalogLimits { nofile: Some(4096), nproc: Some(512) }),
+                    limits: Some(CatalogLimits {
+                        nofile: Some(4096),
+                        nproc: Some(512),
+                    }),
                     ..def("net")
                 },
             );
         let (r, _) = resolve_leaf("net", &debian12(), &cat).unwrap();
-        assert_eq!(r.limits, Some(Limits { nofile: Some(4096), nproc: Some(512) }));
+        assert_eq!(
+            r.limits,
+            Some(Limits {
+                nofile: Some(4096),
+                nproc: Some(512)
+            })
+        );
         assert_eq!(r.limits_layer.as_deref(), Some("linux-debian"));
     }
 
@@ -2450,20 +2764,28 @@ include_categories = ["network"]
         // Version layer dir exists but holds no record for this id: that is a
         // *present* layer, so no unknown-version warning — it simply adds nothing.
         let cat = FakeCatalog::new()
-            .with("linux", PermissionDef {
-                sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
-                ..def("net")
-            })
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                    ..def("net")
+                },
+            )
             .with_empty_layer("linux-debian-12");
         let (r, w) = resolve_leaf("net", &debian12(), &cat).unwrap();
         assert_eq!(values(&r.sudo), vec!["/usr/sbin/ip"]);
-        assert!(w.is_empty(), "present (if empty) version layer must not warn");
+        assert!(
+            w.is_empty(),
+            "present (if empty) version layer must not warn"
+        );
     }
 
     // --- 2.1 bundle resolution (includes) ---
 
     fn ctx() -> ResolveCtx {
-        ResolveCtx { catalog_version: Some("2026.06".to_owned()) }
+        ResolveCtx {
+            catalog_version: Some("2026.06".to_owned()),
+        }
     }
 
     #[test]
@@ -2525,12 +2847,71 @@ include_categories = ["network"]
         assert_eq!(sudo, vec!["/usr/bin/tcpdump", "/usr/sbin/ip"]);
         assert_eq!(values(&r.groups), vec!["netdev"]);
         // Provenance: own primitive has via=None; member primitives via=member id.
-        let own = r.sudo.iter().find(|p| p.value == "/usr/bin/tcpdump").unwrap();
+        let own = r
+            .sudo
+            .iter()
+            .find(|p| p.value == "/usr/bin/tcpdump")
+            .unwrap();
         assert_eq!(own.via, None);
         let from_diag = r.sudo.iter().find(|p| p.value == "/usr/sbin/ip").unwrap();
         assert_eq!(from_diag.via.as_deref(), Some("network-diag"));
         let from_admin = r.groups.iter().find(|p| p.value == "netdev").unwrap();
         assert_eq!(from_admin.via.as_deref(), Some("network-admin"));
+    }
+
+    #[test]
+    fn bundle_preserves_each_members_runas_per_command() {
+        // Fail-open regression guard. A member de-roots its own command
+        // (`runas = "bfs_solutions"`); the bundle pulls it in and ALSO carries its
+        // own command under its own run-spec (`runas = "ops"`). The member's
+        // command MUST keep its service account — never silently widen back to the
+        // bundle's run-spec or to root `(ALL)` — and the bundle's own command must
+        // carry the bundle's run-spec. runas is a per-primitive fact end-to-end.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/QToolplus".to_owned()]),
+                    runas: Some("bfs_solutions".to_owned()),
+                    ..def("db-tool")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // The bundle's own command, under the bundle's own run-spec.
+                    sudo: ListOverride::Replace(vec!["/usr/bin/own-tool".to_owned()]),
+                    runas: Some("ops".to_owned()),
+                    includes: vec!["db-tool".to_owned()],
+                    ..def("toolbox")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (r, _) = resolve("toolbox", &os, &cat, &ctx()).unwrap();
+
+        let member_cmd = r
+            .sudo
+            .iter()
+            .find(|p| p.value == "/opt/QToolplus")
+            .expect("member command present");
+        assert_eq!(
+            member_cmd.runas.as_deref(),
+            Some("bfs_solutions"),
+            "the member's de-rooted command must keep its own run-spec, not widen to the bundle's"
+        );
+        assert_eq!(member_cmd.via.as_deref(), Some("db-tool"));
+
+        let own_cmd = r
+            .sudo
+            .iter()
+            .find(|p| p.value == "/usr/bin/own-tool")
+            .expect("bundle's own command present");
+        assert_eq!(
+            own_cmd.runas.as_deref(),
+            Some("ops"),
+            "the bundle's own command must carry the bundle's run-spec"
+        );
+        assert_eq!(own_cmd.via, None);
     }
 
     #[test]
@@ -3066,7 +3447,7 @@ include_categories = ["network"]
 
         let cat = LiveCatalog::new(vec![root.path().to_path_buf()]);
         let err = cat.read_layer("linux").unwrap_err();
-        assert!(matches!(err, CatalogError::TomlParse { .. }));
+        assert!(matches!(err, CatalogError::MisfiledPolicy { .. }));
     }
 
     #[test]
@@ -3083,7 +3464,7 @@ include_categories = ["network"]
         let cat = LiveCatalog::new(vec![root.path().to_path_buf()]);
         assert!(matches!(
             cat.read_layer("linux").unwrap_err(),
-            CatalogError::TomlParse { .. }
+            CatalogError::MisfiledPolicy { .. }
         ));
     }
 
@@ -3180,7 +3561,10 @@ include_categories = ["network"]
         for body in ["ID=../secret\n", "ID=a/b\n", "ID=..\n", "ID=.\n", "ID=\n"] {
             let f = write_os_release(body);
             assert!(
-                matches!(OsTarget::detect_from(f.path()), Err(CatalogError::OsRelease { .. })),
+                matches!(
+                    OsTarget::detect_from(f.path()),
+                    Err(CatalogError::OsRelease { .. })
+                ),
                 "os-release {body:?} must be rejected"
             );
         }
@@ -3188,10 +3572,16 @@ include_categories = ["network"]
 
     #[test]
     fn os_release_rejects_traversal_version() {
-        for body in ["ID=debian\nVERSION_ID=../x\n", "ID=debian\nVERSION_ID=a/b\n"] {
+        for body in [
+            "ID=debian\nVERSION_ID=../x\n",
+            "ID=debian\nVERSION_ID=a/b\n",
+        ] {
             let f = write_os_release(body);
             assert!(
-                matches!(OsTarget::detect_from(f.path()), Err(CatalogError::OsRelease { .. })),
+                matches!(
+                    OsTarget::detect_from(f.path()),
+                    Err(CatalogError::OsRelease { .. })
+                ),
                 "os-release {body:?} must be rejected"
             );
         }
@@ -3224,11 +3614,17 @@ include_categories = ["network"]
         ));
         assert!(matches!(
             OsTarget::new("../x", "debian", None),
-            Err(CatalogError::InvalidName { kind: "os family", .. })
+            Err(CatalogError::InvalidName {
+                kind: "os family",
+                ..
+            })
         ));
         assert!(matches!(
             OsTarget::new("linux", "debian", Some("../x".to_owned())),
-            Err(CatalogError::InvalidName { kind: "version", .. })
+            Err(CatalogError::InvalidName {
+                kind: "version",
+                ..
+            })
         ));
         // Sane values still construct.
         assert!(OsTarget::new("linux", "debian", Some("12".to_owned())).is_ok());
@@ -3242,11 +3638,24 @@ include_categories = ["network"]
         assert!(is_safe_path_component("22.04"));
         assert!(is_safe_path_component("1.8"));
         assert!(is_safe_path_component("docker_v2-beta"));
-        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "Foo", "with space", "ünïcode"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "Foo",
+            "with space",
+            "ünïcode",
+        ] {
             assert!(!is_safe_path_component(bad), "{bad:?} must be unsafe");
             assert!(matches!(
                 validate_path_component("namespace", bad),
-                Err(CatalogError::InvalidName { kind: "namespace", .. })
+                Err(CatalogError::InvalidName {
+                    kind: "namespace",
+                    ..
+                })
             ));
         }
     }
@@ -3280,7 +3689,10 @@ include_categories = ["network"]
         // Crafted os-release pointing the distro at the sibling: rejected outright.
         let f = write_os_release("ID=../secret\nVERSION_ID=12\n");
         assert!(
-            matches!(OsTarget::detect_from(f.path()), Err(CatalogError::OsRelease { .. })),
+            matches!(
+                OsTarget::detect_from(f.path()),
+                Err(CatalogError::OsRelease { .. })
+            ),
             "ID=../secret must be rejected, not turned into a layer name"
         );
 
@@ -3319,19 +3731,34 @@ include_categories = ["network"]
     fn limits_subtable_valid_parses_and_resolves() {
         let parsed: PermissionDef =
             toml::from_str("id = \"a\"\n[limits]\nnofile = 1024\nnproc = 512\n").unwrap();
-        assert_eq!(parsed.limits, Some(CatalogLimits { nofile: Some(1024), nproc: Some(512) }));
+        assert_eq!(
+            parsed.limits,
+            Some(CatalogLimits {
+                nofile: Some(1024),
+                nproc: Some(512)
+            })
+        );
 
         // And it converts to rolestore::Limits across a resolve.
         let cat = FakeCatalog::new().with(
             "linux",
             PermissionDef {
-                limits: Some(CatalogLimits { nofile: Some(1024), nproc: Some(512) }),
+                limits: Some(CatalogLimits {
+                    nofile: Some(1024),
+                    nproc: Some(512),
+                }),
                 ..def("a")
             },
         );
         let os = OsTarget::new("linux", "debian", None).unwrap();
         let (r, _) = resolve_leaf("a", &os, &cat).unwrap();
-        assert_eq!(r.limits, Some(Limits { nofile: Some(1024), nproc: Some(512) }));
+        assert_eq!(
+            r.limits,
+            Some(Limits {
+                nofile: Some(1024),
+                nproc: Some(512)
+            })
+        );
     }
 
     // --- replace=true incompatible with .append on the same record ---
@@ -3370,6 +3797,106 @@ include_categories = ["network"]
             resolve_leaf("net", &os, &cat2).unwrap_err(),
             CatalogError::ContradictoryRecord { .. }
         ));
+    }
+
+    // --- runas token is validated at the read boundary ---
+
+    #[test]
+    fn valid_runas_is_accepted_and_resolves() {
+        // A plain service-account name and the machine-account `$` form are both
+        // accepted, and the resolved permission carries the run-as account.
+        for user in ["bfs_solutions", "_svc", "app-runner", "machine$"] {
+            let cat = FakeCatalog::new().with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some(user.to_owned()),
+                    ..def("svc")
+                },
+            );
+            let os = OsTarget::new("linux", "debian", None).unwrap();
+            let (r, _) = resolve_leaf("svc", &os, &cat).expect("valid runas resolves");
+            assert_eq!(r.runas.as_deref(), Some(user), "runas must propagate");
+        }
+    }
+
+    #[test]
+    fn invalid_runas_is_rejected_naming_the_id() {
+        // Each value is unfit for the sudoers run-spec `(<runas>)`: empty, a
+        // metacharacter that would split/close the run-spec, embedded whitespace,
+        // a `{param}` template (out of scope), and a control char. Every rejection
+        // must be `InvalidRunas` and name the offending permission id.
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        for bad in [
+            "",              // empty
+            "root, evil",    // comma + space: would split the Cmnd list
+            "bfs solutions", // embedded space
+            "a(b)",          // parens: open/close a nested run-spec
+            "{param}",       // templated runas is out of scope
+            "ro\tot",        // control char (tab)
+        ] {
+            let cat = FakeCatalog::new().with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some(bad.to_owned()),
+                    ..def("svc")
+                },
+            );
+            assert!(
+                matches!(
+                    resolve_leaf("svc", &os, &cat).unwrap_err(),
+                    CatalogError::InvalidRunas { ref id, .. } if id == "svc"
+                ),
+                "value {bad:?} must be rejected as InvalidRunas naming `svc`"
+            );
+        }
+    }
+
+    #[test]
+    fn runas_overrides_topmost_setter_wins_like_risk() {
+        // A base layer sets runas; a version layer that restates sudo without a
+        // runas leaves the base run-spec standing. A version layer that DOES set
+        // runas wins. Mirrors the `risk` override semantics.
+        let base_only = FakeCatalog::new()
+            .with(
+                "linux-debian",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some("base_acct".to_owned()),
+                    ..def("svc")
+                },
+            )
+            .with(
+                "linux-debian-12",
+                PermissionDef {
+                    // Restates sudo, no runas: base run-spec must stand.
+                    sudo: ListOverride::Append(vec!["/opt/extra".to_owned()]),
+                    ..def("svc")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", Some("12".to_owned())).unwrap();
+        let (r, _) = resolve_leaf("svc", &os, &base_only).unwrap();
+        assert_eq!(r.runas.as_deref(), Some("base_acct"));
+
+        let version_wins = FakeCatalog::new()
+            .with(
+                "linux-debian",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some("base_acct".to_owned()),
+                    ..def("svc")
+                },
+            )
+            .with(
+                "linux-debian-12",
+                PermissionDef {
+                    runas: Some("version_acct".to_owned()),
+                    ..def("svc")
+                },
+            );
+        let (r2, _) = resolve_leaf("svc", &os, &version_wins).unwrap();
+        assert_eq!(r2.runas.as_deref(), Some("version_acct"), "topmost wins");
     }
 
     // --- sudo command values are validated at the read boundary ---
@@ -3477,7 +4004,11 @@ include_categories = ["network"]
         let root = tempfile::tempdir().unwrap();
         let layer_dir = root.path().join("linux");
         std::fs::create_dir_all(&layer_dir).unwrap();
-        std::fs::write(layer_dir.join("net.toml"), "id = \"net\"\nsudo = [\"ip\"]\n").unwrap();
+        std::fs::write(
+            layer_dir.join("net.toml"),
+            "id = \"net\"\nsudo = [\"ip\"]\n",
+        )
+        .unwrap();
         let cat = LiveCatalog::new(vec![root.path().to_path_buf()]);
         assert!(matches!(
             cat.read_layer("linux").unwrap_err(),
@@ -3550,7 +4081,11 @@ include_categories = ["network"]
         let layer_dir = root.join("linux");
         std::fs::create_dir_all(&layer_dir).unwrap();
         // A legit in-tree file (positive control: still read).
-        std::fs::write(layer_dir.join("ok.toml"), "id = \"ok\"\nsudo = [\"/bin/true\"]\n").unwrap();
+        std::fs::write(
+            layer_dir.join("ok.toml"),
+            "id = \"ok\"\nsudo = [\"/bin/true\"]\n",
+        )
+        .unwrap();
         // A symlinked file pointing out of tree.
         std::os::unix::fs::symlink(outside.join("pwn.toml"), layer_dir.join("evil.toml")).unwrap();
         // A symlinked directory pointing out of tree.
@@ -3559,18 +4094,32 @@ include_categories = ["network"]
         let cat = LiveCatalog::new(vec![root]);
         let defs = cat.read_layer("linux").unwrap();
         let ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(ids, vec!["ok"], "only the in-tree file is read; symlinks skipped");
+        assert_eq!(
+            ids,
+            vec!["ok"],
+            "only the in-tree file is read; symlinks skipped"
+        );
     }
 
     // --- slice 3b: parametrized templating ---
 
-    /// Helper to build a `params` map from `(key, toml::Value)` pairs.
-    fn params(pairs: Vec<(&str, toml::Value)>) -> std::collections::BTreeMap<String, toml::Value> {
-        pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+    /// Helper to build a `params` map from `(key, toml::Value)` pairs, converting
+    /// each TOML value through the parse boundary into the census param domain
+    /// (mirrors what `PermissionRef` deserialization does).
+    fn params(pairs: Vec<(&str, toml::Value)>) -> std::collections::BTreeMap<String, ParamValue> {
+        pairs
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), ParamValue::from_toml(v)))
+            .collect()
     }
 
     fn arr(items: &[&str]) -> toml::Value {
-        toml::Value::Array(items.iter().map(|s| toml::Value::String((*s).to_owned())).collect())
+        toml::Value::Array(
+            items
+                .iter()
+                .map(|s| toml::Value::String((*s).to_owned()))
+                .collect(),
+        )
     }
 
     #[test]
@@ -3696,7 +4245,13 @@ include_categories = ["network"]
         let os = OsTarget::new("linux", "debian", None).unwrap();
         // A value injecting a comma (splits Cmnds), whitespace, a newline, or a
         // shell metachar must be rejected — both as a scalar and inside a list.
-        for bad in ["nginx,/bin/sh", "nginx /bin/sh", "nginx\nroot", "ng$x", "ng;x"] {
+        for bad in [
+            "nginx,/bin/sh",
+            "nginx /bin/sh",
+            "nginx\nroot",
+            "ng$x",
+            "ng;x",
+        ] {
             let scalar = params(vec![("unit", toml::Value::String(bad.to_owned()))]);
             assert!(
                 matches!(
@@ -3734,6 +4289,33 @@ include_categories = ["network"]
             resolve_with_params("svc", &p, &os, &cat, &ctx()).unwrap_err(),
             CatalogError::InvalidSudoCommand { ref id, .. } if id == "svc"
         ));
+    }
+
+    #[test]
+    fn dotdot_after_substitution_is_rejected() {
+        // A metachar-free param value that renders a `..`-bearing command —
+        // `/usr/bin/../../bin/bash` — passes the param-value gate (`/` and `.` are
+        // valid path chars) but sudo would normalize the `..` to a broader Cmnd.
+        // The post-substitution sudo gate must reject it.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/bin/{tool}".to_owned()]),
+                ..def("svc")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![(
+            "tool",
+            toml::Value::String("../../bin/bash".to_owned()),
+        )]);
+        assert!(
+            matches!(
+                resolve_with_params("svc", &p, &os, &cat, &ctx()).unwrap_err(),
+                CatalogError::InvalidSudoCommand { ref id, .. } if id == "svc"
+            ),
+            "a substituted `..` command must be rejected"
+        );
     }
 
     #[test]
@@ -3881,8 +4463,8 @@ access = "wo"
         let bad = file_def("a", vec![grant("etc/ssh", Access::Rw, true)]);
         // validate() runs at the read boundary; FakeCatalog.read_layer triggers it.
         let cat = cat.with("linux", bad);
-        let err = resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat)
-            .unwrap_err();
+        let err =
+            resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap_err();
         assert!(matches!(
             err,
             CatalogError::InvalidFilePath { ref id, reason, .. }
@@ -3896,8 +4478,8 @@ access = "wo"
             "linux",
             file_def("a", vec![grant("/etc/ssh/../shadow", Access::Ro, false)]),
         );
-        let err = resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat)
-            .unwrap_err();
+        let err =
+            resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap_err();
         assert!(matches!(
             err,
             CatalogError::InvalidFilePath { reason, .. } if reason.contains("..")
@@ -3910,8 +4492,8 @@ access = "wo"
             "linux",
             file_def("a", vec![grant("/etc/ss\nh", Access::Ro, false)]),
         );
-        let err = resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat)
-            .unwrap_err();
+        let err =
+            resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap_err();
         assert!(matches!(
             err,
             CatalogError::InvalidFilePath { reason, .. } if reason.contains("control")
@@ -3935,10 +4517,22 @@ access = "wo"
         // steering authors to widen to a directory).
         assert_eq!(grant("/etc/ssh", Access::Rw, false).shape(), Shape::File);
         // glob metachar → Pattern, regardless of recursive.
-        assert_eq!(grant("/var/log/*.log", Access::Ro, false).shape(), Shape::Pattern);
-        assert_eq!(grant("/var/log/*.log", Access::Ro, true).shape(), Shape::Pattern);
-        assert_eq!(grant("/etc/conf?", Access::Ro, false).shape(), Shape::Pattern);
-        assert_eq!(grant("/etc/[abc]", Access::Ro, false).shape(), Shape::Pattern);
+        assert_eq!(
+            grant("/var/log/*.log", Access::Ro, false).shape(),
+            Shape::Pattern
+        );
+        assert_eq!(
+            grant("/var/log/*.log", Access::Ro, true).shape(),
+            Shape::Pattern
+        );
+        assert_eq!(
+            grant("/etc/conf?", Access::Ro, false).shape(),
+            Shape::Pattern
+        );
+        assert_eq!(
+            grant("/etc/[abc]", Access::Ro, false).shape(),
+            Shape::Pattern
+        );
     }
 
     #[test]
@@ -3950,8 +4544,8 @@ access = "wo"
             "linux",
             file_def("a", vec![grant("/etc/ssh/", Access::Rw, false)]),
         );
-        let err = resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat)
-            .unwrap_err();
+        let err =
+            resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap_err();
         assert!(matches!(
             err,
             CatalogError::InvalidFilePath { ref id, reason, .. }
@@ -4018,7 +4612,11 @@ access = "wo"
                 file_def("ssh-admin", vec![grant("/etc/ssh", Access::Rw, true)]),
             );
         let (r, _) = resolve_leaf("ssh-admin", &debian12(), &cat).unwrap();
-        assert_eq!(r.file_grants.len(), 1, "same path must union, not duplicate");
+        assert_eq!(
+            r.file_grants.len(),
+            1,
+            "same path must union, not duplicate"
+        );
         let fg = &r.file_grants[0];
         assert_eq!(fg.access, Access::Rw, "access widens to max");
         assert!(fg.recursive, "recursive is OR");

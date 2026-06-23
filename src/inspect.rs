@@ -10,10 +10,11 @@
 //! [`FakeInspector`], production uses [`LiveInspector`] (which shells out to
 //! `getent` with argv arrays — read-only, no shell, no mutation).
 
-use crate::mutate::GECOS_MARKER_PREFIX;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
+
+use crate::mutate::GECOS_MARKER_PREFIX;
 
 /// Facts about one live account, as read from `getent passwd`/`getent group`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,21 @@ pub trait SystemInspector {
     /// `*`), `Some(false)` if unlocked, `None` if the account/shadow entry is
     /// absent or unreadable.
     fn password_locked(&self, name: &str) -> Option<bool>;
+
+    /// Read the WHOLE shadow database once, mapping each account name to its lock
+    /// state (`true` = locked, `false` = unlocked).
+    ///
+    /// `None` means shadow could not be read AT ALL — on a non-root run `getent
+    /// shadow` is unreadable, so we cannot evaluate ANY account's lock state. The
+    /// caller must treat that as "cannot evaluate" (a degraded read), distinct
+    /// from `Some(map)` where the database was read and an account simply absent
+    /// from the map has no shadow entry. Reading once avoids a per-account
+    /// `getent` spawn storm and a false anti-lockout warning on every non-root
+    /// run. A default impl returns `None` so test doubles that predate this method
+    /// keep compiling (and degrade safely).
+    fn shadow_locks(&self) -> Option<std::collections::BTreeMap<String, bool>> {
+        None
+    }
     /// True if `<home>/.ssh/authorized_keys` exists.
     fn has_authorized_keys(&self, name: &str, home: &Path) -> bool;
     /// Accounts whose GECOS field carries a Census role marker
@@ -120,33 +136,56 @@ impl LiveInspector {
         if let Some(k) = key {
             cmd.arg(k);
         }
-        let out = cmd.output().ok()?;
+        let out = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                // A getent spawn failure degrades the read (we report "not found"
+                // for the queried entity); log it so a misconfigured host is
+                // diagnosable rather than silently looking empty.
+                tracing::warn!(program = "getent", db, error = %e, "getent spawn failed");
+                return None;
+            }
+        };
         if !out.status.success() {
+            // Non-zero is the normal "no such entry" for a keyed lookup, so this
+            // is a low-severity degraded-read signal, not a warning.
+            tracing::debug!(program = "getent", db, status = ?out.status.code(), "getent non-zero exit");
             return None;
         }
-        String::from_utf8(out.stdout).ok()
+        match String::from_utf8(out.stdout) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(program = "getent", db, error = %e, "getent output not UTF-8");
+                None
+            }
+        }
     }
 
     /// Parse one `passwd` line (`name:passwd:uid:gid:gecos:home:shell`) into
     /// `(name, uid, home, shell)`. Returns `None` on a malformed line.
     fn parse_passwd_line(line: &str) -> Option<(String, u32, String, String)> {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 7 {
+        let [name, _passwd, uid, _gid, _gecos, home, shell, ..] = f.as_slice() else {
             return None;
-        }
-        let uid = f[2].parse::<u32>().ok()?;
-        Some((f[0].to_owned(), uid, f[5].to_owned(), f[6].to_owned()))
+        };
+        let uid = uid.parse::<u32>().ok()?;
+        Some((
+            (*name).to_owned(),
+            uid,
+            (*home).to_owned(),
+            (*shell).to_owned(),
+        ))
     }
 
     /// Parse one `group` line (`name:passwd:gid:members`) into `(name, gid)`.
     /// Returns `None` on a malformed line (short / non-numeric gid).
     fn parse_group_line(line: &str) -> Option<(String, u32)> {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 3 {
+        let [name, _passwd, gid, ..] = f.as_slice() else {
             return None;
-        }
-        let gid = f[2].parse::<u32>().ok()?;
-        Some((f[0].to_owned(), gid))
+        };
+        let gid = gid.parse::<u32>().ok()?;
+        Some(((*name).to_owned(), gid))
     }
 
     /// Supplementary groups for `name` from `getent group` output. A group line
@@ -159,12 +198,15 @@ impl LiveInspector {
         let mut groups = Vec::new();
         for line in text.lines() {
             let f: Vec<&str> = line.split(':').collect();
-            if f.len() < 4 {
+            let [group, _passwd, _gid, member_field, ..] = f.as_slice() else {
                 continue;
-            }
-            let members = f[3].split(',').map(str::trim).filter(|m| !m.is_empty());
-            if members.into_iter().any(|m| m == name) {
-                groups.push(f[0].to_owned());
+            };
+            let mut members = member_field
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty());
+            if members.any(|m| m == name) {
+                groups.push((*group).to_owned());
             }
         }
         groups
@@ -191,7 +233,11 @@ impl LiveInspector {
     /// `authorized_keys`. An unreadable/absent shadow entry (`None`) is treated
     /// conservatively as not usable, so a locked-or-unknown password with no keys
     /// never counts.
-    fn is_rescue_eligible(is_login_shell: bool, password_locked: Option<bool>, has_keys: bool) -> bool {
+    fn is_rescue_eligible(
+        is_login_shell: bool,
+        password_locked: Option<bool>,
+        has_keys: bool,
+    ) -> bool {
         is_login_shell && (password_locked == Some(false) || has_keys)
     }
 
@@ -206,9 +252,9 @@ impl LiveInspector {
     fn acl_has_user_entry(dump: &str, account: &str) -> bool {
         let named = format!("user:{account}:");
         let default_named = format!("default:user:{account}:");
-        dump.lines().map(str::trim).any(|line| {
-            line.starts_with(&named) || line.starts_with(&default_named)
-        })
+        dump.lines()
+            .map(str::trim)
+            .any(|line| line.starts_with(&named) || line.starts_with(&default_named))
     }
 }
 
@@ -250,10 +296,10 @@ impl SystemInspector for LiveInspector {
             return Vec::new();
         };
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 4 {
+        let [_group, _passwd, _gid, member_field, ..] = f.as_slice() else {
             return Vec::new();
-        }
-        f[3]
+        };
+        member_field
             .split(',')
             .map(str::trim)
             .filter(|m| !m.is_empty())
@@ -270,6 +316,37 @@ impl SystemInspector for LiveInspector {
         let f: Vec<&str> = line.split(':').collect();
         let hash = f.get(1)?;
         Some(hash.starts_with('!') || hash.starts_with('*'))
+    }
+
+    fn shadow_locks(&self) -> Option<std::collections::BTreeMap<String, bool>> {
+        // One keyless `getent shadow` read of the whole database. Unreadable
+        // (non-root, no shadow access) → None: the caller treats that as "cannot
+        // evaluate", never as "every account is unlocked/absent". Each line is
+        // `name:hash:…`; a leading `!`/`*` on the hash is a positive lock.
+        let Some(text) = Self::getent("shadow", None) else {
+            tracing::warn!(
+                program = "getent",
+                db = "shadow",
+                reason = "unreadable (likely non-root); password-lock state cannot be evaluated",
+                "shadow database read degraded"
+            );
+            return None;
+        };
+        let mut map = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split(':').collect();
+            let (Some(name), Some(hash)) = (f.first(), f.get(1)) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            map.insert(
+                (*name).to_owned(),
+                hash.starts_with('!') || hash.starts_with('*'),
+            );
+        }
+        Some(map)
     }
 
     fn has_authorized_keys(&self, _name: &str, home: &Path) -> bool {
@@ -296,12 +373,20 @@ impl SystemInspector for LiveInspector {
         let mut out = Vec::new();
         for line in text.lines() {
             let f: Vec<&str> = line.split(':').collect();
-            if f.len() < 7 {
+            // passwd is `name:passwd:uid:gid:gecos:home:shell`; GECOS is field 5.
+            let [name, _passwd, _uid, _gid, gecos, _home, _shell, ..] = f.as_slice() else {
                 continue;
-            }
-            // GECOS is field 5; the marker is a single token (no `:`/`=`).
-            if f[4].split([' ', ',']).any(|t| t.starts_with(GECOS_MARKER_PREFIX)) {
-                out.push(f[0].to_owned());
+            };
+            // The Census marker is a single whitespace-/comma-free token; `:`
+            // cannot appear in GECOS (it is the passwd field separator, so a `:`
+            // would have split the line into another field), which is why
+            // splitting on space, tab, and comma fully tokenizes the field for
+            // marker detection.
+            if gecos
+                .split([' ', '\t', ','])
+                .any(|t| t.starts_with(GECOS_MARKER_PREFIX))
+            {
+                out.push((*name).to_owned());
             }
         }
         out
@@ -329,6 +414,11 @@ impl SystemInspector for LiveInspector {
         let Some(text) = Self::getent("passwd", None) else {
             return Vec::new();
         };
+        // Read shadow ONCE for the whole pass instead of spawning `getent shadow`
+        // per account. `None` (degraded — non-root) leaves every per-account lock
+        // state unknown, so eligibility falls back to authorized_keys alone, which
+        // is the conservative behavior the rescue predicate already encodes.
+        let shadow = self.shadow_locks();
         let mut out = Vec::new();
         for line in text.lines() {
             let Some((name, _uid, home, shell)) = Self::parse_passwd_line(line) else {
@@ -341,9 +431,10 @@ impl SystemInspector for LiveInspector {
             // authenticate. The `authorized_keys` home comes from this account's
             // live passwd entry (field 6), not the registry.
             let home_path = Path::new(&home);
+            let locked = shadow.as_ref().and_then(|m| m.get(&name).copied());
             let eligible = Self::is_rescue_eligible(
                 Self::is_login_shell(&shell),
-                self.password_locked(&name),
+                locked,
                 self.has_authorized_keys(&name, home_path),
             );
             if eligible {
@@ -367,6 +458,11 @@ pub struct FakeInspector {
     pub group_members: std::collections::BTreeMap<String, Vec<String>>,
     /// Per-account password lock state (absent = `None`).
     pub locked: std::collections::BTreeMap<String, bool>,
+    /// When `true`, the shadow database cannot be read at all — `shadow_locks`
+    /// returns `None` (degraded), modeling a non-root run where `getent shadow` is
+    /// unreadable. Defaults to `false` (readable), so existing tests that populate
+    /// `locked` see a readable shadow derived from that map.
+    pub shadow_unreadable: bool,
     /// Accounts that have `authorized_keys`.
     pub authorized_keys: BTreeSet<String>,
     /// Accounts carrying a Census GECOS marker.
@@ -406,7 +502,17 @@ impl SystemInspector for FakeInspector {
     }
 
     fn password_locked(&self, name: &str) -> Option<bool> {
+        if self.shadow_unreadable {
+            return None;
+        }
         self.locked.get(name).copied()
+    }
+
+    fn shadow_locks(&self) -> Option<std::collections::BTreeMap<String, bool>> {
+        if self.shadow_unreadable {
+            return None;
+        }
+        Some(self.locked.clone())
     }
 
     fn has_authorized_keys(&self, name: &str, _home: &Path) -> bool {
@@ -475,11 +581,15 @@ mod tests {
     #[test]
     fn fake_group_round_trips() {
         let mut fake = FakeInspector::default();
-        fake.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        fake.groups
+            .insert("atm-operators".into(), GroupFacts { gid: 8010 });
         assert_eq!(fake.group("atm-operators"), Some(GroupFacts { gid: 8010 }));
         assert_eq!(fake.group("absent"), None);
         // reverse lookup by gid (pin-conflict detection).
-        assert_eq!(fake.group_name_by_gid(8010).as_deref(), Some("atm-operators"));
+        assert_eq!(
+            fake.group_name_by_gid(8010).as_deref(),
+            Some("atm-operators")
+        );
         assert_eq!(fake.group_name_by_gid(9999), None);
     }
 
@@ -547,11 +657,35 @@ default:user:alice:rwx
 ";
         assert!(LiveInspector::acl_has_user_entry(dump, "alice"));
         assert!(LiveInspector::acl_has_user_entry(dump, "alice")); // default form too
-        // A different account is not present.
+                                                                   // A different account is not present.
         assert!(!LiveInspector::acl_has_user_entry(dump, "bob"));
         // The owner entry (empty name) must not match an account named "".
         let owner_only = "user::rwx\ngroup::r-x\nother::r-x\n";
         assert!(!LiveInspector::acl_has_user_entry(owner_only, "alice"));
+    }
+
+    #[test]
+    fn fake_shadow_locks_batches_and_degrades() {
+        let mut fake = FakeInspector::default();
+        fake.locked.insert("oper".into(), true);
+        fake.locked.insert("svc".into(), false);
+        // Readable shadow → one batched map mirroring `locked`.
+        let map = fake.shadow_locks().expect("readable shadow yields a map");
+        assert_eq!(map.get("oper"), Some(&true));
+        assert_eq!(map.get("svc"), Some(&false));
+        assert_eq!(map.get("ghost"), None);
+
+        // Unreadable shadow (non-root) → None, and per-account reads also degrade.
+        fake.shadow_unreadable = true;
+        assert!(
+            fake.shadow_locks().is_none(),
+            "degraded shadow read returns None"
+        );
+        assert_eq!(
+            fake.password_locked("oper"),
+            None,
+            "per-account read degrades too"
+        );
     }
 
     #[test]

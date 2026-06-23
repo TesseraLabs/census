@@ -36,9 +36,10 @@
 //! Census never materializes partial or unreliable access in place of what was
 //! requested.
 
-use crate::catalog::{Access, ResolvedFileGrant, Shape};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::catalog::{Access, ResolvedFileGrant, Shape};
 
 /// An ACL principal: the role-account (`u:`) or the group (`g:`) a grant is
 /// materialized for. The access semantics are identical — the same `-R --physical`
@@ -94,6 +95,7 @@ pub struct Capabilities {
 
 /// Errors materializing, revoking, or snapshotting file access.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FileAccessError {
     /// No installed backend can enforce a grant of this shape. Carries a message
     /// suggesting how to proceed (widen a file grant to its directory, or install a
@@ -108,12 +110,13 @@ pub enum FileAccessError {
         reason: String,
     },
     /// A `setfacl`/`getfacl` invocation failed (non-zero exit or spawn error).
-    #[error("setfacl/getfacl failed for {path:?}: {reason}")]
+    #[error("setfacl/getfacl failed for {path:?}: {source}")]
     Setfacl {
         /// The path the command targeted.
         path: String,
-        /// Underlying reason (exit status + stderr, or spawn error).
-        reason: String,
+        /// The underlying command failure (spawn error or non-zero exit).
+        #[source]
+        source: CommandError,
     },
     /// An I/O error reading/writing a rollback snapshot file.
     #[error("file-access rollback I/O error at {path}: {reason}")]
@@ -122,6 +125,16 @@ pub enum FileAccessError {
         path: PathBuf,
         /// Underlying reason.
         reason: String,
+    },
+    /// The top-level grant path is a symlink. `setfacl -R --physical` refuses to
+    /// follow symlinks ENCOUNTERED DURING the in-tree walk, but it still resolves
+    /// a symlinked ROOT before walking — so a symlinked grant root would point the
+    /// recursive ACL mutation at an arbitrary target tree. Refused fail-closed
+    /// before any `setfacl` runs.
+    #[error("file grant path {path:?} is a symlink; refusing to apply ACLs through it")]
+    Symlink {
+        /// The symlinked grant path that was refused.
+        path: String,
     },
 }
 
@@ -229,27 +242,60 @@ pub fn revoke_args(principal: &Principal, grant: &ResolvedFileGrant) -> Vec<Vec<
 /// Build the `getfacl` argv vector that snapshots one path for rollback.
 /// `--absolute-names` keeps the paths in the dump absolute (so `setfacl --restore`
 /// targets the right files regardless of cwd); `-R` walks the tree. Pure.
-pub fn getfacl_args(path: &str) -> Vec<String> {
+pub fn getfacl_args(path: impl AsRef<str>) -> Vec<String> {
     vec![
         "--absolute-names".to_owned(),
         "-R".to_owned(),
-        path.to_owned(),
+        path.as_ref().to_owned(),
     ]
 }
 
 /// Build the `setfacl` argv vector that restores ACLs from a rollback dump file.
 /// Pure.
-pub fn restore_args(rollback_file: &Path) -> Vec<String> {
-    vec![format!("--restore={}", rollback_file.display())]
+pub fn restore_args(rollback_file: impl AsRef<Path>) -> Vec<String> {
+    vec![format!("--restore={}", rollback_file.as_ref().display())]
+}
+
+/// Why a [`CommandRunner`] invocation failed: the binary could not be spawned, or
+/// it ran but exited non-zero. Typed (not stringly) so a caller can distinguish a
+/// missing/denied binary (`Spawn`) from a tool that ran and rejected its input
+/// (`NonZero`) — the two demand different operator responses.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CommandError {
+    /// The binary could not be spawned (not found, permission denied, …).
+    #[error("spawn {binary} failed: {source}")]
+    Spawn {
+        /// The binary that could not be spawned.
+        binary: String,
+        /// The underlying spawn error (preserves `io::ErrorKind`).
+        #[source]
+        source: std::io::Error,
+    },
+    /// The binary ran but exited with a non-zero status.
+    #[error("{binary} exited {status}: {stderr}")]
+    NonZero {
+        /// The binary that exited non-zero.
+        binary: String,
+        /// The exit status, rendered (e.g. `exit status: 1`).
+        status: String,
+        /// The trimmed stderr the command produced.
+        stderr: String,
+    },
 }
 
 /// A command runner the [`AclBackend`] uses to execute `setfacl`/`getfacl`, so unit
 /// tests can record argv without shelling out while production runs the real
 /// binaries. `run` executes `<binary> <args...>` and returns stdout on success or
-/// an error string (exit status + stderr, or spawn failure).
+/// a typed [`CommandError`] (spawn failure, or non-zero exit with stderr).
 pub trait CommandRunner {
     /// Run `binary` with `args`; return captured stdout on success.
-    fn run(&mut self, binary: &str, args: &[String]) -> Result<Vec<u8>, String>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError::Spawn`] if the binary cannot be launched, or
+    /// [`CommandError::NonZero`] if it runs but exits with a non-zero status.
+    fn run(&mut self, binary: &str, args: &[String]) -> Result<Vec<u8>, CommandError>;
 }
 
 /// The production runner: spawns the real binary via [`std::process::Command`] with
@@ -259,19 +305,23 @@ pub trait CommandRunner {
 pub struct ProcessRunner;
 
 impl CommandRunner for ProcessRunner {
-    fn run(&mut self, binary: &str, args: &[String]) -> Result<Vec<u8>, String> {
-        let out = Command::new(binary)
-            .args(args)
-            .output()
-            .map_err(|e| format!("spawn {binary} failed: {e}"))?;
+    fn run(&mut self, binary: &str, args: &[String]) -> Result<Vec<u8>, CommandError> {
+        let out =
+            Command::new(binary)
+                .args(args)
+                .output()
+                .map_err(|source| CommandError::Spawn {
+                    binary: binary.to_owned(),
+                    source,
+                })?;
         if out.status.success() {
             Ok(out.stdout)
         } else {
-            Err(format!(
-                "{binary} exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
+            Err(CommandError::NonZero {
+                binary: binary.to_owned(),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            })
         }
     }
 }
@@ -291,6 +341,20 @@ pub struct AclBackend<R: CommandRunner> {
     rollback_dir: PathBuf,
     /// The rollback file written by the last `snapshot`, restored by `restore`.
     last_snapshot: Option<PathBuf>,
+}
+
+// The runner is an injected dependency with no public `Debug` requirement, so
+// the formatter reports the configuration that determines behaviour and elides
+// the runner rather than constraining `R: Debug`.
+impl<R: CommandRunner> std::fmt::Debug for AclBackend<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AclBackend")
+            .field("setfacl_bin", &self.setfacl_bin)
+            .field("getfacl_bin", &self.getfacl_bin)
+            .field("rollback_dir", &self.rollback_dir)
+            .field("last_snapshot", &self.last_snapshot)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<R: CommandRunner> AclBackend<R> {
@@ -358,14 +422,39 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
                     reason: "AclBackend enforces directory grants only".to_owned(),
                 });
             }
+            // Lstat the grant ROOT before any setfacl. `--physical` only protects
+            // the in-tree walk; a symlinked root is resolved before the walk, so a
+            // planted symlink at the grant path would redirect the recursive ACL
+            // mutation onto an arbitrary tree. We refuse a symlink root fail-closed.
+            // A path that does not exist (or is unreadable) is NOT a symlink finding
+            // — the setfacl call below surfaces that as its own error — so only a
+            // confirmed symlink is rejected here.
+            if std::fs::symlink_metadata(&grant.path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                tracing::warn!(
+                    path = %grant.path,
+                    principal = %principal.name(),
+                    "refusing to apply ACLs through a symlinked grant root"
+                );
+                return Err(FileAccessError::Symlink {
+                    path: grant.path.clone(),
+                });
+            }
             for args in setfacl_args(principal, grant) {
                 self.runner
                     .run(&self.setfacl_bin, &args)
-                    .map_err(|reason| FileAccessError::Setfacl {
+                    .map_err(|source| FileAccessError::Setfacl {
                         path: grant.path.clone(),
-                        reason,
+                        source,
                     })?;
             }
+            tracing::info!(
+                path = %grant.path,
+                principal = %principal.name(),
+                "materialized ACL grant"
+            );
         }
         Ok(())
     }
@@ -378,9 +467,9 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
         for args in revoke_args(principal, grant) {
             self.runner
                 .run(&self.setfacl_bin, &args)
-                .map_err(|reason| FileAccessError::Setfacl {
+                .map_err(|source| FileAccessError::Setfacl {
                     path: grant.path.clone(),
-                    reason,
+                    source,
                 })?;
         }
         Ok(())
@@ -396,9 +485,9 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
             let out = self
                 .runner
                 .run(&self.getfacl_bin, &getfacl_args(&path_str))
-                .map_err(|reason| FileAccessError::Setfacl {
+                .map_err(|source| FileAccessError::Setfacl {
                     path: path_str.clone(),
-                    reason,
+                    source,
                 })?;
             dump.extend_from_slice(&out);
         }
@@ -423,9 +512,9 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
         };
         self.runner
             .run(&self.setfacl_bin, &restore_args(&file))
-            .map_err(|reason| FileAccessError::Setfacl {
+            .map_err(|source| FileAccessError::Setfacl {
                 path: file.to_string_lossy().into_owned(),
-                reason,
+                source,
             })?;
         Ok(())
     }
@@ -579,7 +668,10 @@ impl FileAccessBackend for FakeBackend {
 
     fn snapshot(&mut self, paths: &[&Path]) -> Result<(), FileAccessError> {
         self.calls.push(FakeCall::Snapshot {
-            paths: paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            paths: paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
         });
         Ok(())
     }
@@ -618,7 +710,7 @@ mod tests {
     }
 
     impl CommandRunner for RecordingRunner {
-        fn run(&mut self, binary: &str, args: &[String]) -> Result<Vec<u8>, String> {
+        fn run(&mut self, binary: &str, args: &[String]) -> Result<Vec<u8>, CommandError> {
             self.calls.push((binary.to_owned(), args.to_vec()));
             Ok(self.stdout.clone())
         }
@@ -761,8 +853,11 @@ mod tests {
     fn acl_materialize_runs_both_setfacl_passes() {
         let mut b = acl_with(RecordingRunner::default());
         let g = grant("/etc/ssh", Access::Rw, true, Shape::Dir);
-        b.materialize(&Principal::User("alice".to_owned()), std::slice::from_ref(&g))
-            .unwrap();
+        b.materialize(
+            &Principal::User("alice".to_owned()),
+            std::slice::from_ref(&g),
+        )
+        .unwrap();
         assert_eq!(b.runner.calls.len(), 2);
         assert!(b.runner.calls.iter().all(|(bin, _)| bin == "setfacl"));
     }
@@ -771,8 +866,11 @@ mod tests {
     fn acl_materialize_group_writes_g_entries() {
         let mut b = acl_with(RecordingRunner::default());
         let g = grant("/srv/shared", Access::Rw, true, Shape::Dir);
-        b.materialize(&Principal::Group("wheel".to_owned()), std::slice::from_ref(&g))
-            .unwrap();
+        b.materialize(
+            &Principal::Group("wheel".to_owned()),
+            std::slice::from_ref(&g),
+        )
+        .unwrap();
         // Both setfacl passes carry the g:wheel entry (access + default), proving the
         // group principal flows through to the real argv the backend would run.
         assert_eq!(b.runner.calls.len(), 2);
@@ -787,13 +885,71 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn acl_refuses_symlinked_grant_root() {
+        // A symlink planted AT the grant path would let `setfacl -R` resolve the
+        // root and walk the link target, escaping the intended tree. The backend
+        // must lstat the root and refuse before running any command.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-tree");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("grant-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant(&link.to_string_lossy(), Access::Rw, true, Shape::Dir);
+        let err = b
+            .materialize(
+                &Principal::User("alice".to_owned()),
+                std::slice::from_ref(&g),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, FileAccessError::Symlink { .. }),
+            "symlinked grant root must be refused: {err:?}"
+        );
+        // Refused before running any setfacl.
+        assert!(
+            b.runner.calls.is_empty(),
+            "no command must run for a symlink root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_materialize_allows_real_directory_root() {
+        // The dual of the symlink rejection: a genuine (non-symlink) directory root
+        // passes the lstat guard and the setfacl passes run.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-tree");
+        std::fs::create_dir(&real).unwrap();
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant(&real.to_string_lossy(), Access::Rw, true, Shape::Dir);
+        b.materialize(
+            &Principal::User("alice".to_owned()),
+            std::slice::from_ref(&g),
+        )
+        .unwrap();
+        assert_eq!(
+            b.runner.calls.len(),
+            2,
+            "both setfacl passes run for a real dir root"
+        );
+    }
+
+    #[test]
     fn acl_refuses_non_dir_grant() {
         let mut b = acl_with(RecordingRunner::default());
         let g = grant("/etc/ssh/sshd_config", Access::Rw, false, Shape::File);
         let err = b
-            .materialize(&Principal::User("alice".to_owned()), std::slice::from_ref(&g))
+            .materialize(
+                &Principal::User("alice".to_owned()),
+                std::slice::from_ref(&g),
+            )
             .unwrap_err();
-        assert!(matches!(err, FileAccessError::Unsupported { ref shape, .. } if *shape == Shape::File));
+        assert!(
+            matches!(err, FileAccessError::Unsupported { ref shape, .. } if *shape == Shape::File)
+        );
         // It refused before running any command.
         assert!(b.runner.calls.is_empty());
     }
@@ -837,14 +993,21 @@ mod tests {
     fn acl_setfacl_failure_surfaces_error() {
         struct FailRunner;
         impl CommandRunner for FailRunner {
-            fn run(&mut self, _bin: &str, _args: &[String]) -> Result<Vec<u8>, String> {
-                Err("setfacl exited 1: No such file".to_owned())
+            fn run(&mut self, binary: &str, _args: &[String]) -> Result<Vec<u8>, CommandError> {
+                Err(CommandError::NonZero {
+                    binary: binary.to_owned(),
+                    status: "exit status: 1".to_owned(),
+                    stderr: "No such file".to_owned(),
+                })
             }
         }
         let mut b = AclBackend::new(FailRunner, "setfacl", "getfacl", std::env::temp_dir());
         let g = grant("/etc/ssh", Access::Rw, true, Shape::Dir);
         let err = b
-            .materialize(&Principal::User("alice".to_owned()), std::slice::from_ref(&g))
+            .materialize(
+                &Principal::User("alice".to_owned()),
+                std::slice::from_ref(&g),
+            )
             .unwrap_err();
         assert!(matches!(err, FileAccessError::Setfacl { ref path, .. } if path == "/etc/ssh"));
     }
@@ -862,8 +1025,11 @@ mod tests {
         };
         let mut f = FakeBackend::new("fake", caps);
         let g = grant("/etc/ssh", Access::Rw, true, Shape::Dir);
-        f.materialize(&Principal::User("alice".to_owned()), std::slice::from_ref(&g))
-            .unwrap();
+        f.materialize(
+            &Principal::User("alice".to_owned()),
+            std::slice::from_ref(&g),
+        )
+        .unwrap();
         f.revoke(&Principal::User("alice".to_owned()), &g).unwrap();
         f.snapshot(&[Path::new("/etc/ssh")]).unwrap();
         f.restore().unwrap();
@@ -907,7 +1073,12 @@ mod tests {
     fn route_file_grant_with_only_acl_is_unsupported() {
         let acl = FakeBackend::new("acl", acl_caps());
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl];
-        let grants = vec![grant("/etc/ssh/sshd_config", Access::Rw, false, Shape::File)];
+        let grants = vec![grant(
+            "/etc/ssh/sshd_config",
+            Access::Rw,
+            false,
+            Shape::File,
+        )];
         let err = route_grants(&grants, &backends).unwrap_err();
         match err {
             FileAccessError::Unsupported { shape, reason, .. } => {

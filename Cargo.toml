@@ -4,15 +4,33 @@ version = "0.1.0"
 edition = "2021"
 description = "Declarative provisioner of Unix access objects from a Tessera role-store"
 license = "AGPL-3.0-only"
+repository = "https://github.com/TesseraLabs/census"
+keywords = ["unix", "provisioning", "access-control", "sudoers", "tessera"]
+categories = ["command-line-utilities", "os::unix-apis"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 clap = { version = "4", features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 ed25519-dalek = "2"
 hex = "0.4"
+# Structured diagnostics / audit-event logging (M-LOG-STRUCTURED). The library
+# crates emit through this facade only; the subscriber is installed once in the
+# binary (`main.rs`). Logs go to stderr so stdout / `--json` output stays clean.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Optional: JSON-Schema generation is a CI/contract concern (the interface-
+# contract golden tests), not part of the default public API. Enabling the
+# `schema` feature pulls it in and turns on the `JsonSchema` derives. Additive
+# (M-FEATURES-ADDITIVE): off by default, never changes behavior when enabled.
+schemars = { version = "1", optional = true }
+
+[features]
+# Derive `schemars::JsonSchema` on the public config/state types and build their
+# golden JSON schemas. Off by default; the contract test job enables it.
+schema = ["dep:schemars"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -26,3 +44,69 @@ path = "src/main.rs"
 [lib]
 name = "census"
 path = "src/lib.rs"
+
+[profile.release]
+# Census is a small, security-sensitive CLI shipped as a single binary; trade
+# build time for a tighter, harder-to-perturb release artifact. `panic = "abort"`
+# is omitted deliberately: the test harness requires unwinding, and keeping the
+# release profile unwind-capable lets `cargo test --release` build. Process-exit
+# discipline (main returns ExitCode, no process::exit) makes abort low-value here.
+lto = true
+codegen-units = 1
+strip = true
+
+# Static-verification lint table (M-STATIC-VERIFICATION). Two tiers:
+#
+# DENY tier (gated to zero, a regression fails the build): the rust lint set, the
+# clippy `correctness`/`suspicious`/`perf`/`complexity`/`style`/`cargo` groups, and
+# the high-signal `restriction` opt-ins (production hazards: unwrap/expect/panic/
+# indexing in non-test code, float `==`, ignored map_err, ref-ptr clones, redundant
+# string/string clones). The group `deny`s carry priority -1 so the individual
+# opt-ins (and the `allow` below) win on conflict.
+#
+# WARN tier (advisory, not gated): `pedantic` and `nursery`. They surface
+# refactors but are not driven to zero — production builds must not fail on them.
+# The crate-root `#![cfg_attr(test, allow(...))]` (and a matching per-crate allow
+# in each integration test) exempts unwrap/expect/panic/indexing inside test code,
+# where a panic on a broken fixture is the intended failure mode.
+[lints.rust]
+ambiguous_negative_literals = "deny"
+missing_debug_implementations = "deny"
+redundant_imports = "deny"
+redundant_lifetimes = "deny"
+trivial_numeric_casts = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "deny"
+
+[lints.clippy]
+# DENY-tier groups (priority -1 so the opt-ins/allow below override on conflict).
+cargo = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+# WARN-tier groups (advisory; also priority -1, see opt-ins above them).
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# DENY-tier individual lints (override the groups they belong to).
+allow_attributes_without_reason = "deny"
+clone_on_ref_ptr = "deny"
+map_err_ignore = "deny"
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+unused_result_ok = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+float_cmp = "deny"
+# `literal_string_with_formatting_args` fires on doc/error text that legitimately
+# contains brace-like tokens; it is noise here, not a hazard.
+literal_string_with_formatting_args = "allow"
+# `multiple_crate_versions` is a transitive-dependency fact (two `getrandom`
+# majors pulled in by ed25519-dalek/rand vs. their deps), not something a leaf
+# crate can resolve without dependency surgery. Allow it explicitly so the rest
+# of the `cargo` group stays a hard gate.
+multiple_crate_versions = "allow"

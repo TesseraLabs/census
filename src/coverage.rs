@@ -220,7 +220,13 @@ pub struct ClassCoverage {
 }
 
 impl ClassCoverage {
-    /// Coverage percentage for this class (100.0 when there is nothing to cover).
+    /// Coverage percentage for this class.
+    ///
+    /// Zero-denominator convention: a class with `total == 0` (nothing to cover)
+    /// returns `100.0`, NOT `NaN`. "No objects to cover" is fully covered by
+    /// definition, and a sentinel of `100.0` keeps the metric well-ordered for the
+    /// `--min-coverage` gate (a `NaN` would make every comparison false and let the
+    /// gate silently pass). The same convention is applied in [`weighted_overall`].
     pub fn pct(&self) -> f64 {
         if self.total == 0 {
             100.0
@@ -258,6 +264,7 @@ pub struct CoverageReport {
 
 /// Errors computing coverage or enumerating the surface.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CoverageError {
     /// Resolving the catalog to build the covered set failed.
     #[error("catalog error while computing coverage: {0}")]
@@ -312,13 +319,17 @@ impl SurfaceScanner for FakeSurface {
 /// coverage: only the binary actually granted lands here, never what it can reach.
 struct CoveredSet {
     /// Canonical binary paths covered by some sudo command (argv-leading token of
-    /// an expanded sudo string, symlink-resolved on the surface side).
-    sudo_binaries: Vec<String>,
-    /// Group names covered by some expanded `groups` primitive.
-    groups: Vec<String>,
+    /// an expanded sudo string, symlink-resolved on the surface side). A
+    /// `HashSet` because membership is the only query (`object_covered`) and a
+    /// full-`/` scan tests thousands of objects against it — a linear `Vec` scan
+    /// would be O(objects × covered).
+    sudo_binaries: std::collections::HashSet<String>,
+    /// Group names covered by some expanded `groups` primitive. `HashSet` for
+    /// the same O(1)-membership reason as `sudo_binaries`.
+    groups: std::collections::HashSet<String>,
     /// Concrete unit names covered by a `service-restart` instance (both `<u>`
-    /// and `<u>.service` forms folded in).
-    units: Vec<String>,
+    /// and `<u>.service` forms folded in). `HashSet` for O(1) membership.
+    units: std::collections::HashSet<String>,
     /// Whether the catalog grants `service-admin` (covers ALL units).
     has_service_admin: bool,
     /// Whether the catalog grants `capability-admin` (covers all capfiles).
@@ -462,9 +473,9 @@ fn build_covered_set(
     roles: &[ResolvedRole],
     ctx: &CoverageCtx,
 ) -> Result<(CoveredSet, Vec<String>), CoverageError> {
-    let mut sudo_binaries: Vec<String> = Vec::new();
-    let mut groups: Vec<String> = Vec::new();
-    let mut units: Vec<String> = Vec::new();
+    let mut sudo_binaries: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut groups: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut units: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut has_service_admin = false;
     let mut has_capability_admin = false;
     let mut file_grants: Vec<ResolvedFileGrant> = Vec::new();
@@ -489,12 +500,11 @@ fn build_covered_set(
 
     // Resolve each *distinct* id once (an id may appear on several layers as the
     // override chain; resolve merges them). Dedup ids first so we don't re-resolve.
-    let mut seen_ids: Vec<String> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_layer, def) in &all {
-        if seen_ids.iter().any(|s| s == &def.id) {
-            continue;
+        if !seen_ids.insert(def.id.clone()) {
+            continue; // already resolved this id on an earlier layer
         }
-        seen_ids.push(def.id.clone());
 
         match catalog::resolve(&def.id, os, catalog, &resolve_ctx) {
             Ok((resolved, _warnings)) => {
@@ -511,15 +521,15 @@ fn build_covered_set(
                     if has_placeholder(&p.value) {
                         if !ctx.strict {
                             if let Some(prefix) = static_binary_prefix(&p.value) {
-                                push_unique(&mut sudo_binaries, prefix.to_owned());
+                                sudo_binaries.insert(prefix.to_owned());
                             }
                         }
                     } else if let Some(bin) = sudo_binary_token(&p.value) {
-                        push_unique(&mut sudo_binaries, bin.to_owned());
+                        sudo_binaries.insert(bin.to_owned());
                     }
                 }
                 for p in &resolved.groups {
-                    push_unique(&mut groups, p.value.clone());
+                    groups.insert(p.value.clone());
                 }
                 // File grants the catalog declares statically (no `{param}`):
                 // such a grant resolves to a concrete path even without a role
@@ -552,7 +562,7 @@ fn build_covered_set(
     for role in roles {
         for cmd in &role.sudo {
             if let Some(bin) = sudo_binary_token(cmd) {
-                push_unique(&mut sudo_binaries, bin.to_owned());
+                sudo_binaries.insert(bin.to_owned());
             }
             // A service-restart-style command names a unit as its last argument;
             // record both `<u>` and `<u>.service` forms so a unit object matches
@@ -562,7 +572,7 @@ fn build_covered_set(
             }
         }
         for g in &role.groups {
-            push_unique(&mut groups, g.clone());
+            groups.insert(g.clone());
         }
         // A role instance's file grants are already `{param}`-substituted to
         // concrete paths, so fold them in unconditionally — this is how a
@@ -579,7 +589,7 @@ fn build_covered_set(
     // already in `groups` from the loops above; this only ADDS binding-covered
     // ones, so existing coverage is untouched.)
     for g in &ctx.bound_grant_groups {
-        push_unique(&mut groups, g.clone());
+        groups.insert(g.clone());
     }
 
     Ok((
@@ -646,17 +656,10 @@ fn is_systemctl_verb(token: &str) -> bool {
 /// Record both `<unit>` and `<unit>.service` forms of a named unit. sudoers
 /// matches argv exactly, so a role may name either form; recording both lets a
 /// surface `Unit` object match whichever form the scanner reports.
-fn fold_unit_forms(unit: &str, units: &mut Vec<String>) {
+fn fold_unit_forms(unit: &str, units: &mut std::collections::HashSet<String>) {
     let base = unit.strip_suffix(".service").unwrap_or(unit);
-    push_unique(units, base.to_owned());
-    push_unique(units, format!("{base}.service"));
-}
-
-/// Push `value` only if not already present (order-preserving dedup).
-fn push_unique(acc: &mut Vec<String>, value: String) {
-    if !acc.iter().any(|v| v == &value) {
-        acc.push(value);
-    }
+    units.insert(base.to_owned());
+    units.insert(format!("{base}.service"));
 }
 
 /// Fold a covering file grant into the accumulator, keyed by path. A repeated
@@ -880,6 +883,11 @@ pub fn coverage_scoped(
 /// all counted grant objects (each object weighs equally, so a class with more
 /// objects contributes proportionally — "weighted" by object count, not a flat
 /// average of per-class percentages, which would over-weight a tiny class).
+///
+/// Zero-denominator convention (same as [`ClassCoverage::pct`]): a surface with no
+/// counted objects at all returns `100.0`, never `NaN` — an empty surface is fully
+/// covered by definition, and a finite sentinel keeps the `--min-coverage` gate
+/// comparison meaningful (a `NaN` would compare false against every threshold).
 fn weighted_overall(by_class: &[ClassCoverage]) -> f64 {
     let covered: usize = by_class.iter().map(|c| c.covered).sum();
     let total: usize = by_class.iter().map(|c| c.total).sum();
@@ -897,8 +905,8 @@ fn object_covered(object: &SurfaceObject, covered: &CoveredSet) -> bool {
         // token of some sudo command. The surface side is responsible for having
         // resolved symlinks to the real path; here it is a plain equality on the
         // canonical key.
-        SurfaceClass::SudoBin => covered.sudo_binaries.iter().any(|b| b == &object.key),
-        SurfaceClass::Group => covered.groups.iter().any(|g| g == &object.key),
+        SurfaceClass::SudoBin => covered.sudo_binaries.contains(&object.key),
+        SurfaceClass::Group => covered.groups.contains(&object.key),
         SurfaceClass::Unit => {
             // service-admin covers every unit; otherwise the named unit must be in
             // a service-restart instance's units (either form).
@@ -924,9 +932,7 @@ fn config_in_scope(path: &str, grants: &[ResolvedFileGrant]) -> bool {
     }
     // A path a grant actually targets is in scope even if it falls outside the
     // curated set — the catalog has explicitly taken an interest in it.
-    grants
-        .iter()
-        .any(|g| grant_covers_path(g, path).is_some())
+    grants.iter().any(|g| grant_covers_path(g, path).is_some())
 }
 
 /// Whether `path` is at or under one of the curated security-relevant prefixes.
@@ -979,14 +985,16 @@ fn config_grant_cover(path: &str, grants: &[ResolvedFileGrant]) -> Option<String
 /// Match rule (the documented config-coverage semantics):
 ///
 /// - an exact path equality always covers (any shape);
-/// - a `recursive` directory grant covers any path strictly under it, matched
-///   on a `/`-component boundary (so `/etc/ssh` recursive covers
-///   `/etc/ssh/sshd_config` but NOT `/etc/sshd_other`).
+/// - a `recursive` directory grant covers any path strictly under it, matched on a `/`-component
+///   boundary (so `/etc/ssh` recursive covers `/etc/ssh/sshd_config` but NOT `/etc/sshd_other`).
 ///
 /// A non-recursive grant covers only its exact path — it makes no claim on
 /// children. (Pattern grants are matched by exact path here; glob expansion is a
 /// capable-backend concern, not something the open coverage audit simulates.)
-fn grant_covers_path<'a>(grant: &'a ResolvedFileGrant, path: &str) -> Option<&'a ResolvedFileGrant> {
+fn grant_covers_path<'a>(
+    grant: &'a ResolvedFileGrant,
+    path: &str,
+) -> Option<&'a ResolvedFileGrant> {
     if grant.path == path {
         return Some(grant);
     }
@@ -1026,17 +1034,17 @@ fn grant_coverage_note(grant: &ResolvedFileGrant) -> String {
 /// installed would simply not reclassify here.
 fn backend_limited_config(path: &str) -> bool {
     let parent = parent_dir(path);
-    NON_GRANTABLE_PARENTS.iter().any(|p| *p == parent)
+    NON_GRANTABLE_PARENTS.contains(&parent)
 }
 
 /// Whether a unit name is covered by the named-unit set, accepting both `<u>` and
 /// `<u>.service` forms on either side.
-fn unit_covered(unit: &str, covered_units: &[String]) -> bool {
+fn unit_covered(unit: &str, covered_units: &std::collections::HashSet<String>) -> bool {
     let base = unit.strip_suffix(".service").unwrap_or(unit);
     let with_service = format!("{base}.service");
-    covered_units
-        .iter()
-        .any(|u| u == unit || u == base || u == &with_service)
+    covered_units.contains(unit)
+        || covered_units.contains(base)
+        || covered_units.contains(&with_service)
 }
 
 // --- intentionally-uncovered policy + suggestions ---------------------------
@@ -1267,16 +1275,14 @@ pub struct GrantMatch {
 ///
 /// Match rules (mirroring the forward coverage match exactly):
 ///
-/// - **sudo/command**: a permission matches when the argv-leading binary token of
-///   one of its sudo commands (the first whitespace-delimited token — args only
-///   narrow what the binary does, they do not change which binary is reachable)
-///   equals `arg`. `arg` is itself reduced to its leading token so passing a full
-///   command (`/usr/sbin/ip link`) matches the same as the bare binary.
-/// - **file**: a permission matches when one of its file grants covers `arg` —
-///   exact path equality (any shape) or `arg` strictly under a `recursive` Dir
-///   grant on a `/`-component boundary (the same [`grant_covers_path`] rule
-///   coverage uses, so a recursive `/etc/ssh` grant matches `/etc/ssh/sshd_config`
-///   but not `/etc/sshd_other`).
+/// - **sudo/command**: a permission matches when the argv-leading binary token of one of its sudo
+///   commands (the first whitespace-delimited token — args only narrow what the binary does, they
+///   do not change which binary is reachable) equals `arg`. `arg` is itself reduced to its leading
+///   token so passing a full command (`/usr/sbin/ip link`) matches the same as the bare binary.
+/// - **file**: a permission matches when one of its file grants covers `arg` — exact path equality
+///   (any shape) or `arg` strictly under a `recursive` Dir grant on a `/`-component boundary (the
+///   same [`grant_covers_path`] rule coverage uses, so a recursive `/etc/ssh` grant matches
+///   `/etc/ssh/sshd_config` but not `/etc/sshd_other`).
 ///
 /// One permission can yield several matches (multiple matching sudo commands or
 /// file grants). Results are in source order, sudo matches before file matches per
@@ -1418,25 +1424,46 @@ impl LiveSurface {
     /// "no admin binaries").
     fn scan_sudo_bins(&self) -> Result<Vec<SurfaceObject>, CoverageError> {
         let mut out: Vec<SurfaceObject> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut any_dir = false;
         for dir in &self.sudo_bin_dirs {
             let full = self.root.join(dir.strip_prefix("/").unwrap_or(dir));
             let entries = match std::fs::read_dir(&full) {
                 Ok(e) => e,
-                Err(_) => continue, // missing admin dir is fine; skip it
+                Err(e) => {
+                    // A missing admin dir is fine; skip it. Logged at debug so a
+                    // surprising skip is diagnosable without flooding a normal run.
+                    tracing::debug!(path = %full.display(), reason = %e, "skipping unreadable sudo-bin dir");
+                    continue;
+                }
             };
             any_dir = true;
             for entry in entries.flatten() {
                 let path = entry.path();
                 // Resolve symlinks to the real binary; on failure (dangling link,
                 // permission) fall back to the literal path rather than dropping it.
-                let canonical = std::fs::canonicalize(&path).unwrap_or(path.clone());
+                //
+                // FALSE-GAP CAVEAT: when canonicalization fails we key the object
+                // on its literal (un-resolved) path. The catalog grants the real
+                // binary's canonical path, so an object that could only be resolved
+                // to an alias may read as an uncovered orphan even though the
+                // underlying binary IS covered — an over-report in the safe (audit
+                // flags more, not fewer) direction.
+                let canonical = match std::fs::canonicalize(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(
+                            path = %path.display(),
+                            reason = %e,
+                            "canonicalize failed; keying object on literal path (may over-report)"
+                        );
+                        path.clone()
+                    }
+                };
                 let key = canonical.to_string_lossy().into_owned();
-                if seen.iter().any(|s| s == &key) {
-                    continue;
+                if !seen.insert(key.clone()) {
+                    continue; // already recorded this canonical binary
                 }
-                seen.push(key.clone());
                 let detail = mode_detail(&path);
                 out.push(SurfaceObject {
                     class: SurfaceClass::SudoBin,
@@ -1461,17 +1488,18 @@ impl LiveSurface {
     /// config enumeration degrades to "what is on disk" rather than erroring.
     fn scan_configs(&self) -> Vec<SurfaceObject> {
         let mut out: Vec<SurfaceObject> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Package conffiles: `dpkg-query -W -f='${Conffiles}\n'` lists, per package,
         // lines of `"<path> <md5>"`. We keep only paths under `/etc` (the security-
         // relevant surface) and ignore the checksum (we never read content).
-        if let Some(stdout) = run_capture("dpkg-query", &["-W", "-f=${Conffiles}\n"]) {
+        // dpkg-query must succeed cleanly: a truncated conffile listing parsed as
+        // complete would under-report the config surface.
+        if let Some(stdout) = run_capture("dpkg-query", &["-W", "-f=${Conffiles}\n"], false) {
             for path in parse_dpkg_conffiles(&stdout) {
-                if seen.iter().any(|s| s == &path) {
+                if !seen.insert(path.clone()) {
                     continue;
                 }
-                seen.push(path.clone());
                 out.push(SurfaceObject {
                     class: SurfaceClass::Config,
                     key: path,
@@ -1489,10 +1517,9 @@ impl LiveSurface {
             let full = self.root.join(d.strip_prefix('/').unwrap_or(d));
             if full.is_dir() {
                 let key = d.to_string();
-                if seen.iter().any(|s| s == &key) {
+                if !seen.insert(key.clone()) {
                     continue;
                 }
-                seen.push(key.clone());
                 out.push(SurfaceObject {
                     class: SurfaceClass::Config,
                     key,
@@ -1508,9 +1535,12 @@ impl LiveSurface {
     /// `systemctl` (a non-systemd host, a container without it) ⇒ no units, no
     /// error: a unit-less host simply has nothing in this class.
     fn scan_units(&self) -> Vec<SurfaceObject> {
+        // systemctl must succeed cleanly: a partial unit listing parsed as the
+        // whole would under-report the unit surface.
         let stdout = match run_capture(
             "systemctl",
             &["list-unit-files", "--no-legend", "--type=service"],
+            false,
         ) {
             Some(s) => s,
             None => return Vec::new(),
@@ -1551,7 +1581,9 @@ impl LiveSurface {
     /// ⇒ no capfiles, no error (the tool is optional on minimal systems).
     fn scan_capfiles(&self) -> Vec<SurfaceObject> {
         let root = self.root.to_string_lossy().into_owned();
-        let stdout = match run_capture("getcap", &["-r", &root]) {
+        // getcap must succeed cleanly: a partial capfile listing parsed as
+        // complete would under-report capability-bearing binaries.
+        let stdout = match run_capture("getcap", &["-r", &root], false) {
             Some(s) => s,
             None => return Vec::new(),
         };
@@ -1637,18 +1669,23 @@ impl LiveSurface {
         // `run_capture` would return None, and EVERY object would silently fall
         // back to Orphan — flooding the anomaly list. Chunking bounds each argv;
         // a chunk that still fails degrades only its own paths to Orphan.
-        let mut owners: Vec<(String, String)> = Vec::new();
+        let mut owners: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for chunk in paths.chunks(DPKG_SEARCH_CHUNK) {
             let mut args: Vec<&str> = vec!["-S"];
             args.extend(chunk.iter().map(String::as_str));
-            let stdout = match run_capture("dpkg", &args) {
+            // dpkg -S exits non-zero when SOME paths in the chunk are unowned yet
+            // still prints the owned ones — accept that partial stdout.
+            let stdout = match run_capture("dpkg", &args, true) {
                 Some(s) => s,
                 None => continue, // this chunk failed ⇒ its paths stay Orphan
             };
             merge_dpkg_owners(&mut owners, parse_dpkg_search(&stdout));
         }
+        // O(1) owner lookup per object instead of a linear scan of the owner list
+        // (a full-`/` scan has thousands of objects AND thousands of owners).
         for o in objects.iter_mut() {
-            if let Some(pkg) = owners.iter().find(|(p, _)| p == &o.key).map(|(_, pkg)| pkg) {
+            if let Some(pkg) = owners.get(&o.key) {
                 o.provenance = classify_owner(pkg);
             }
         }
@@ -1664,13 +1701,15 @@ const DPKG_SEARCH_CHUNK: usize = 256;
 /// Fold one chunk's parsed `dpkg -S` `(path, pkg)` pairs into the accumulating
 /// owner map. The first owner seen for a path wins (a path repeated across
 /// chunks — possible only if the caller batched a duplicate — keeps its initial
-/// owner). Pure so the chunk-merge is unit-testable without shelling out.
-fn merge_dpkg_owners(acc: &mut Vec<(String, String)>, chunk: Vec<(String, String)>) {
+/// owner). A `HashMap` with `entry().or_insert` gives that first-wins semantics
+/// in O(1) per pair rather than a linear membership scan. Pure so the chunk-merge
+/// is unit-testable without shelling out.
+fn merge_dpkg_owners(
+    acc: &mut std::collections::HashMap<String, String>,
+    chunk: Vec<(String, String)>,
+) {
     for (path, pkg) in chunk {
-        if acc.iter().any(|(p, _)| p == &path) {
-            continue;
-        }
-        acc.push((path, pkg));
+        acc.entry(path).or_insert(pkg);
     }
 }
 
@@ -1710,19 +1749,46 @@ fn mode_detail(path: &std::path::Path) -> String {
 }
 
 /// Run an external command read-only, capturing stdout as a `String`. Returns
-/// `None` if the binary is absent or exits non-zero (or its output is not UTF-8) —
-/// every caller treats `None` as graceful degradation, never a panic. ARGV-only:
-/// the program and args are passed directly to `Command`, never via a shell, so no
-/// argument can be interpreted as a shell metacharacter.
-fn run_capture(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program).args(args).output().ok()?;
-    // `dpkg -S` exits non-zero when SOME paths are not owned even though it prints
-    // the owned ones; accept stdout whenever it is non-empty, regardless of status.
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    if stdout.is_empty() && !output.status.success() {
-        return None;
+/// `None` if the binary is absent or its output is not UTF-8 — every caller treats
+/// `None` as graceful degradation, never a panic. ARGV-only: the program and args
+/// are passed directly to `Command`, never via a shell, so no argument can be
+/// interpreted as a shell metacharacter.
+///
+/// `accept_partial` controls how a NON-ZERO exit with non-empty stdout is treated:
+///
+///   * `true` — accept the partial stdout. ONLY `dpkg -S` needs this: it exits non-zero when SOME
+///     queried paths are unowned yet still prints the owned ones, and dropping that output would
+///     flood every path to `Orphan`.
+///   * `false` — require `status.success()`. For `systemctl` / `getcap` / `getfacl` / `dpkg-query`,
+///     a non-zero exit means the listing is incomplete or failed, and parsing truncated output as
+///     if it were complete would under-report the surface. A clean failure (return `None` →
+///     degrade) is safer than a half-read list mistaken for the whole.
+fn run_capture(program: &str, args: &[&str], accept_partial: bool) -> Option<String> {
+    let output = match std::process::Command::new(program).args(args).output() {
+        Ok(o) => o,
+        Err(e) => {
+            // A missing/unspawnable tool degrades the scan (the surface it would
+            // have reported is simply absent); log at debug so an incomplete audit
+            // is diagnosable.
+            tracing::debug!(program, reason = %e, "scan tool spawn failed; degrading");
+            return None;
+        }
+    };
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(program, reason = %e, "scan tool output not UTF-8; degrading");
+            return None;
+        }
+    };
+    if output.status.success() {
+        return Some(stdout);
     }
-    Some(stdout)
+    if accept_partial && !stdout.is_empty() {
+        return Some(stdout);
+    }
+    tracing::debug!(program, status = ?output.status.code(), "scan tool non-zero exit; degrading");
+    None
 }
 
 /// Classify a `dpkg -S` owner package name into a provenance. A recognizable
@@ -1889,6 +1955,7 @@ mod tests {
             category: None,
             groups: ListOverride::default(),
             sudo: ListOverride::default(),
+            runas: None,
             limits: None,
             replace: false,
             includes: Vec::new(),
@@ -1980,7 +2047,11 @@ mod tests {
     #[test]
     fn fake_surface_filters_by_class() {
         let s = FakeSurface::new()
-            .with(obj(SurfaceClass::SudoBin, "/usr/sbin/ip", Provenance::Vendor))
+            .with(obj(
+                SurfaceClass::SudoBin,
+                "/usr/sbin/ip",
+                Provenance::Vendor,
+            ))
             .with(obj(SurfaceClass::Group, "netdev", Provenance::Vendor));
         let only_bins = s.scan(&[SurfaceClass::SudoBin]).unwrap();
         assert_eq!(only_bins.len(), 1);
@@ -1993,7 +2064,11 @@ mod tests {
     fn sudo_bin_covered_by_expanded_sudo_string() {
         // Catalog grants sudo /usr/sbin/ip; the binary /usr/sbin/ip is covered.
         let cat = FakeCatalog::new().with("linux", sudo_def("network-admin", &["/usr/sbin/ip"]));
-        let surface = vec![obj(SurfaceClass::SudoBin, "/usr/sbin/ip", Provenance::Vendor)];
+        let surface = vec![obj(
+            SurfaceClass::SudoBin,
+            "/usr/sbin/ip",
+            Provenance::Vendor,
+        )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         assert!(find(&r, "/usr/sbin/ip").covered);
         assert_eq!(class_cov(&r, SurfaceClass::SudoBin).covered, 1);
@@ -2003,9 +2078,15 @@ mod tests {
     fn sudo_bin_covered_via_argv_boundary() {
         // A sudo string WITH arguments still covers the bare binary: the args only
         // narrow what it does, they do not change which binary is reachable.
-        let cat =
-            FakeCatalog::new().with("linux", sudo_def("power-control", &["/sbin/shutdown -r now"]));
-        let surface = vec![obj(SurfaceClass::SudoBin, "/sbin/shutdown", Provenance::Vendor)];
+        let cat = FakeCatalog::new().with(
+            "linux",
+            sudo_def("power-control", &["/sbin/shutdown -r now"]),
+        );
+        let surface = vec![obj(
+            SurfaceClass::SudoBin,
+            "/sbin/shutdown",
+            Provenance::Vendor,
+        )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         assert!(find(&r, "/sbin/shutdown").covered);
     }
@@ -2076,7 +2157,10 @@ mod tests {
             "linux",
             sudo_def("service-restart", &["/usr/bin/systemctl restart {unit}"]),
         );
-        let role = ResolvedRole::new(vec!["/usr/bin/systemctl restart atm-app".to_owned()], vec![]);
+        let role = ResolvedRole::new(
+            vec!["/usr/bin/systemctl restart atm-app".to_owned()],
+            vec![],
+        );
         let surface = vec![
             obj(SurfaceClass::Unit, "atm-app.service", Provenance::Vendor),
             obj(SurfaceClass::Unit, "other.service", Provenance::Vendor),
@@ -2094,10 +2178,8 @@ mod tests {
     #[test]
     fn service_admin_covers_all_units() {
         // service-admin present → every unit covered, no per-unit instance needed.
-        let cat = FakeCatalog::new().with(
-            "linux",
-            sudo_def("service-admin", &["/usr/bin/systemctl"]),
-        );
+        let cat =
+            FakeCatalog::new().with("linux", sudo_def("service-admin", &["/usr/bin/systemctl"]));
         let surface = vec![
             obj(SurfaceClass::Unit, "atm-app.service", Provenance::Vendor),
             obj(SurfaceClass::Unit, "sshd.service", Provenance::Vendor),
@@ -2129,7 +2211,11 @@ mod tests {
         // default; once a `[[role_group]]` binding attaches a grant to it (folded
         // in via `bound_grant_groups`), the same group object is covered.
         let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
-        let surface = vec![obj(SurfaceClass::Group, "atm-operators", Provenance::Vendor)];
+        let surface = vec![obj(
+            SurfaceClass::Group,
+            "atm-operators",
+            Provenance::Vendor,
+        )];
 
         // No binding → uncovered gap.
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
@@ -2148,16 +2234,19 @@ mod tests {
 
     #[test]
     fn capfile_covered_by_capability_admin_presence() {
-        let with = FakeCatalog::new().with(
-            "linux",
-            sudo_def("capability-admin", &["/usr/sbin/setcap"]),
-        );
-        let surface = vec![obj(SurfaceClass::CapFile, "/usr/bin/ping", Provenance::Vendor)];
+        let with =
+            FakeCatalog::new().with("linux", sudo_def("capability-admin", &["/usr/sbin/setcap"]));
+        let surface = vec![obj(
+            SurfaceClass::CapFile,
+            "/usr/bin/ping",
+            Provenance::Vendor,
+        )];
         let r = coverage(&surface, &with, &debian(), &[], &ctx()).unwrap();
         assert!(find(&r, "/usr/bin/ping").covered);
 
         // Without capability-admin, the same capfile is uncovered.
-        let without = FakeCatalog::new().with("linux", sudo_def("network-admin", &["/usr/sbin/ip"]));
+        let without =
+            FakeCatalog::new().with("linux", sudo_def("network-admin", &["/usr/sbin/ip"]));
         let r2 = coverage(&surface, &without, &debian(), &[], &ctx()).unwrap();
         assert!(!find(&r2, "/usr/bin/ping").covered);
     }
@@ -2167,7 +2256,11 @@ mod tests {
     #[test]
     fn setuid_reported_as_inventory_not_grant() {
         let cat = FakeCatalog::new().with("linux", sudo_def("network-admin", &["/usr/sbin/ip"]));
-        let surface = vec![obj(SurfaceClass::Setuid, "/usr/bin/mount", Provenance::Vendor)];
+        let surface = vec![obj(
+            SurfaceClass::Setuid,
+            "/usr/bin/mount",
+            Provenance::Vendor,
+        )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         // It is in the inventory, NOT in the per-object coverage tally and not an
         // anomaly (it is package-owned).
@@ -2232,11 +2325,7 @@ mod tests {
         )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         let p = find(&r, "/usr/bin/pdpl-user");
-        assert!(p
-            .intentional_exclusion
-            .as_deref()
-            .unwrap()
-            .contains("pdpl"));
+        assert!(p.intentional_exclusion.as_deref().unwrap().contains("pdpl"));
         // Not counted in the metric denominator.
         assert_eq!(class_cov(&r, SurfaceClass::SudoBin).total, 0);
     }
@@ -2262,7 +2351,11 @@ mod tests {
         let surface = vec![
             obj(SurfaceClass::SudoBin, "/usr/sbin/ip", Provenance::Vendor),
             obj(SurfaceClass::SudoBin, "/usr/bin/nmcli", Provenance::Vendor),
-            obj(SurfaceClass::SudoBin, "/usr/sbin/cryptsetup", Provenance::Vendor),
+            obj(
+                SurfaceClass::SudoBin,
+                "/usr/sbin/cryptsetup",
+                Provenance::Vendor,
+            ),
             obj(SurfaceClass::Group, "netdev", Provenance::Vendor),
         ];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
@@ -2291,7 +2384,11 @@ mod tests {
         // uncovered.
         let cat = FakeCatalog::new().with("linux", sudo_def("fw", &["/usr/sbin/iptables"]));
         let surface = vec![
-            obj(SurfaceClass::SudoBin, "/usr/sbin/iptables", Provenance::Vendor),
+            obj(
+                SurfaceClass::SudoBin,
+                "/usr/sbin/iptables",
+                Provenance::Vendor,
+            ),
             obj(
                 SurfaceClass::SudoBin,
                 "/usr/sbin/iptables-restore",
@@ -2352,7 +2449,9 @@ mod tests {
             "the cyclic id must be recorded as a warning"
         );
         assert!(
-            r.catalog_warnings.iter().any(|w| w.contains("bad") || w.contains("loop")),
+            r.catalog_warnings
+                .iter()
+                .any(|w| w.contains("bad") || w.contains("loop")),
             "warning must name the unresolvable id: {:?}",
             r.catalog_warnings
         );
@@ -2387,7 +2486,11 @@ mod tests {
         // can't cover it without granting all of /etc, so it is backend-limited,
         // NOT an uncovered gap, and it does not count toward the metric.
         let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
-        let surface = vec![obj(SurfaceClass::Config, "/etc/login.defs", Provenance::Vendor)];
+        let surface = vec![obj(
+            SurfaceClass::Config,
+            "/etc/login.defs",
+            Provenance::Vendor,
+        )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         let c = find(&r, "/etc/login.defs");
         assert!(!c.covered);
@@ -2445,7 +2548,11 @@ mod tests {
             "linux",
             file_def("logindefs", "/etc/login.defs", Access::Rw, false),
         );
-        let surface = vec![obj(SurfaceClass::Config, "/etc/login.defs", Provenance::Vendor)];
+        let surface = vec![obj(
+            SurfaceClass::Config,
+            "/etc/login.defs",
+            Provenance::Vendor,
+        )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         let c = find(&r, "/etc/login.defs");
         assert!(c.covered);
@@ -2462,7 +2569,11 @@ mod tests {
         let cat = FakeCatalog::new().with("linux", sudo_def("net", &["/usr/sbin/ip"]));
         let surface = vec![
             obj(SurfaceClass::Config, "/etc/login.defs", Provenance::Vendor),
-            obj(SurfaceClass::Config, "/etc/ssh/sshd_config", Provenance::Vendor),
+            obj(
+                SurfaceClass::Config,
+                "/etc/ssh/sshd_config",
+                Provenance::Vendor,
+            ),
         ];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         assert!(find(&r, "/etc/login.defs").backend_limited.is_some());
@@ -2481,7 +2592,8 @@ mod tests {
     fn config_under_recursive_dir_grant_is_covered_with_backend_note() {
         // Catalog gives a recursive rw Dir grant on /etc/ssh; the config object
         // /etc/ssh/sshd_config under it is covered, with an AclBackend (dir) note.
-        let cat = FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+        let cat =
+            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
         let surface = vec![obj(
             SurfaceClass::Config,
             "/etc/ssh/sshd_config",
@@ -2498,8 +2610,13 @@ mod tests {
     #[test]
     fn config_ro_vs_rw_distinguished_in_note() {
         // An ro recursive grant yields an `ro` note (not rw).
-        let cat = FakeCatalog::new().with("linux", file_def("ssh-read", "/etc/ssh", Access::Ro, true));
-        let surface = vec![obj(SurfaceClass::Config, "/etc/ssh/sshd_config", Provenance::Vendor)];
+        let cat =
+            FakeCatalog::new().with("linux", file_def("ssh-read", "/etc/ssh", Access::Ro, true));
+        let surface = vec![obj(
+            SurfaceClass::Config,
+            "/etc/ssh/sshd_config",
+            Provenance::Vendor,
+        )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         assert_eq!(
             find(&r, "/etc/ssh/sshd_config").coverage_note.as_deref(),
@@ -2518,7 +2635,11 @@ mod tests {
             file_def("sec-edit", "/etc/security", Access::Rw, true),
         );
         let surface = vec![
-            obj(SurfaceClass::Config, "/etc/security/limits.conf", Provenance::Vendor),
+            obj(
+                SurfaceClass::Config,
+                "/etc/security/limits.conf",
+                Provenance::Vendor,
+            ),
             obj(SurfaceClass::Config, "/etc/securetty", Provenance::Vendor),
         ];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
@@ -2539,7 +2660,11 @@ mod tests {
         );
         let surface = vec![
             obj(SurfaceClass::Config, "/etc/sudoers", Provenance::Vendor),
-            obj(SurfaceClass::Config, "/etc/sudoers.d/census", Provenance::Vendor),
+            obj(
+                SurfaceClass::Config,
+                "/etc/sudoers.d/census",
+                Provenance::Vendor,
+            ),
         ];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         let exact = find(&r, "/etc/sudoers");
@@ -2561,16 +2686,27 @@ mod tests {
             "linux",
             file_def("app-config-edit", "/etc/{app}", Access::Rw, true),
         );
-        let surface = vec![obj(SurfaceClass::Config, "/etc/nginx/nginx.conf", Provenance::Vendor)];
+        let surface = vec![obj(
+            SurfaceClass::Config,
+            "/etc/nginx/nginx.conf",
+            Provenance::Vendor,
+        )];
 
         // Without the role instance: templated grant is not concrete → uncovered.
         // (/etc/nginx is not in the curated set, so it is only in scope BECAUSE a
         // grant — once concrete — names it; without the instance it is dropped.)
         let r0 = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
-        assert!(r0.objects.iter().all(|o| o.object.key != "/etc/nginx/nginx.conf"));
+        assert!(r0
+            .objects
+            .iter()
+            .all(|o| o.object.key != "/etc/nginx/nginx.conf"));
 
         // With the role instance contributing a concrete /etc/nginx recursive grant.
-        let role = ResolvedRole::with_file_grants(vec![], vec![], vec![rfg("/etc/nginx", Access::Rw, true)]);
+        let role = ResolvedRole::with_file_grants(
+            vec![],
+            vec![],
+            vec![rfg("/etc/nginx", Access::Rw, true)],
+        );
         let r = coverage(&surface, &cat, &debian(), &[role], &ctx()).unwrap();
         let c = find(&r, "/etc/nginx/nginx.conf");
         assert!(c.covered);
@@ -2586,16 +2722,28 @@ mod tests {
         // grantable subdir (NOT in NON_GRANTABLE_PARENTS), so under
         // --include-low-priority it is a genuine gap — distinct from the
         // backend-limited reclassification a bare /etc file would get.
-        let cat = FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+        let cat =
+            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
         let surface = vec![
-            obj(SurfaceClass::Config, "/etc/ssh/sshd_config", Provenance::Vendor),
-            obj(SurfaceClass::Config, "/etc/app/app.conf", Provenance::Vendor),
+            obj(
+                SurfaceClass::Config,
+                "/etc/ssh/sshd_config",
+                Provenance::Vendor,
+            ),
+            obj(
+                SurfaceClass::Config,
+                "/etc/app/app.conf",
+                Provenance::Vendor,
+            ),
         ];
 
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         // Only the security-relevant object is counted (1/1), the low-priority dropped.
         assert_eq!(class_cov(&r, SurfaceClass::Config).total, 1);
-        assert!(r.objects.iter().all(|o| o.object.key != "/etc/app/app.conf"));
+        assert!(r
+            .objects
+            .iter()
+            .all(|o| o.object.key != "/etc/app/app.conf"));
 
         // With --include-low-priority, the low-priority file is counted (as an
         // uncovered gap), so the denominator grows and coverage drops.
@@ -2611,9 +2759,14 @@ mod tests {
         // A realistic mix: one security-relevant config + several inert conffiles.
         // The default config denominator counts only the security-relevant one,
         // demonstrating the narrowed, meaningful metric.
-        let cat = FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+        let cat =
+            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
         let surface = vec![
-            obj(SurfaceClass::Config, "/etc/ssh/sshd_config", Provenance::Vendor),
+            obj(
+                SurfaceClass::Config,
+                "/etc/ssh/sshd_config",
+                Provenance::Vendor,
+            ),
             obj(SurfaceClass::Config, "/etc/hostname", Provenance::Vendor),
             obj(SurfaceClass::Config, "/etc/hosts", Provenance::Vendor),
             obj(SurfaceClass::Config, "/etc/motd", Provenance::Vendor),
@@ -2728,7 +2881,10 @@ mod tests {
         let exact = which_grants("/etc/sudoers", &sources);
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].kind, GrantKind::File);
-        assert_eq!(exact[0].backend.as_deref(), Some("per-file-capable backend"));
+        assert_eq!(
+            exact[0].backend.as_deref(),
+            Some("per-file-capable backend")
+        );
         // A different path under it is not matched by the non-recursive grant.
         assert!(which_grants("/etc/sudoers.d/census", &sources).is_empty());
     }
@@ -2737,7 +2893,11 @@ mod tests {
     fn which_grants_finds_group_sudo_match() {
         // A group-bound sudo grant: which-grants on the command matches with
         // target=Group and the group name (every member inherits via %group).
-        let sources = vec![group_grant_src("netops", &["/usr/sbin/ip link set"], vec![])];
+        let sources = vec![group_grant_src(
+            "netops",
+            &["/usr/sbin/ip link set"],
+            vec![],
+        )];
         let matches = which_grants("/usr/sbin/ip", &sources);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].permission, "netops");
@@ -2774,7 +2934,10 @@ mod tests {
         ];
         let matches = which_grants("/usr/sbin/ip", &sources);
         assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].target, GrantTarget::Account("network-admin".to_owned()));
+        assert_eq!(
+            matches[0].target,
+            GrantTarget::Account("network-admin".to_owned())
+        );
         assert!(matches[0].target.group().is_none());
         assert_eq!(matches[1].target, GrantTarget::Group("netops".to_owned()));
     }
@@ -2852,10 +3015,16 @@ netdev:x:108:
 ";
         let got = parse_getcap(stdout);
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0], ("/usr/bin/ping".to_owned(), "cap_net_raw+ep".to_owned()));
+        assert_eq!(
+            got[0],
+            ("/usr/bin/ping".to_owned(), "cap_net_raw+ep".to_owned())
+        );
         assert_eq!(
             got[1],
-            ("/usr/bin/mtr-packet".to_owned(), "cap_net_raw+ep".to_owned())
+            (
+                "/usr/bin/mtr-packet".to_owned(),
+                "cap_net_raw+ep".to_owned()
+            )
         );
     }
 
@@ -2871,7 +3040,10 @@ dpkg-query: no path found matching pattern /opt/x
         assert_eq!(got.len(), 2);
         assert_eq!(
             got[0],
-            ("/etc/ssh/sshd_config".to_owned(), "openssh-server".to_owned())
+            (
+                "/etc/ssh/sshd_config".to_owned(),
+                "openssh-server".to_owned()
+            )
         );
         assert_eq!(got[1].0, "/usr/bin/[");
     }
@@ -2881,11 +3053,14 @@ dpkg-query: no path found matching pattern /opt/x
         // Simulates the chunked `dpkg -S` pass: several parsed chunk outputs are
         // merged into one owner map. A path is keyed once (first owner wins); a
         // chunk that failed simply contributes nothing.
-        let mut acc: Vec<(String, String)> = Vec::new();
+        let mut acc: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         merge_dpkg_owners(
             &mut acc,
             vec![
-                ("/etc/ssh/sshd_config".to_owned(), "openssh-server".to_owned()),
+                (
+                    "/etc/ssh/sshd_config".to_owned(),
+                    "openssh-server".to_owned(),
+                ),
                 ("/usr/bin/[".to_owned(), "coreutils".to_owned()),
             ],
         );
@@ -2902,16 +3077,16 @@ dpkg-query: no path found matching pattern /opt/x
 
         assert_eq!(acc.len(), 3);
         assert_eq!(
-            acc.iter().find(|(p, _)| p == "/etc/ssh/sshd_config").map(|(_, k)| k.as_str()),
+            acc.get("/etc/ssh/sshd_config").map(String::as_str),
             Some("openssh-server")
         );
         assert_eq!(
-            acc.iter().find(|(p, _)| p == "/usr/bin/[").map(|(_, k)| k.as_str()),
+            acc.get("/usr/bin/[").map(String::as_str),
             Some("coreutils"),
             "first owner for a path wins across chunks"
         );
         assert_eq!(
-            acc.iter().find(|(p, _)| p == "/usr/sbin/ip").map(|(_, k)| k.as_str()),
+            acc.get("/usr/sbin/ip").map(String::as_str),
             Some("iproute2")
         );
     }

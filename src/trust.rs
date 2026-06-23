@@ -4,12 +4,11 @@
 //! *trusted* declaration. Two trust modes (spec R7 / requirement
 //! "Доверие к декларации до мутаций"):
 //!
-//! - **managed**: a valid Ed25519 signature over the declaration bytes (the
-//!   `signature` line removed) verified against the pinned trust-anchor, plus an
-//!   anti-rollback check against the last successfully applied `version`.
-//! - **standalone**: explicit `--trust-fs` — the operator vouches for the
-//!   integrity of the (root-only) filesystem holding the declaration. This is a
-//!   conscious decision and is logged.
+//! - **managed**: a valid Ed25519 signature over the declaration bytes (the `signature` line
+//!   removed) verified against the pinned trust-anchor, plus an anti-rollback check against the
+//!   last successfully applied `version`.
+//! - **standalone**: explicit `--trust-fs` — the operator vouches for the integrity of the
+//!   (root-only) filesystem holding the declaration. This is a conscious decision and is logged.
 //!
 //! Any other case → not trusted → caller MUST refuse before any mutation.
 //!
@@ -18,9 +17,11 @@
 //! `signature` line removed byte-for-byte. The algorithm is swappable behind
 //! [`verify_ed25519`] (GOST is a future extension through the same point).
 
-use crate::declaration::Declaration;
-use ed25519_dalek::{Signature, VerifyingKey};
 use std::path::{Path, PathBuf};
+
+use ed25519_dalek::{Signature, VerifyingKey};
+
+use crate::declaration::Declaration;
 
 /// Production default for the pinned trust-anchor (Control public key).
 pub const DEFAULT_TRUST_ANCHOR: &str = "/etc/census/trust.pub";
@@ -107,6 +108,7 @@ impl TrustDecision {
 
 /// Errors from trust evaluation (fail-closed: every variant denies apply).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TrustError {
     /// The declaration carries no `signature` line (managed mode requires one).
     #[error("managed apply requires a signed declaration but no `signature` line is present")]
@@ -200,20 +202,15 @@ pub fn signed_payload(bytes: &[u8]) -> Result<Vec<u8>, TrustError> {
     })?;
     let mut out = Vec::with_capacity(bytes.len());
     let mut removed = false;
-    let mut idx = 0usize;
-    while idx < bytes.len() {
-        // Find the end of the current line (index just past the '\n', or EOF).
-        let line_end = match bytes[idx..].iter().position(|&b| b == b'\n') {
-            Some(rel) => idx + rel + 1, // include the '\n'
-            None => bytes.len(),
-        };
-        let line = &bytes[idx..line_end];
+    // `split_inclusive` keeps each line's trailing '\n' on the line, so dropping
+    // the signature line removes it whole (newline included) without manual index
+    // arithmetic — exactly the prior byte-for-byte behaviour.
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
         if !removed && is_signature_line(line) {
             removed = true; // drop this line entirely, including its '\n'
         } else {
             out.extend_from_slice(line);
         }
-        idx = line_end;
     }
     if removed {
         Ok(out)
@@ -253,10 +250,12 @@ pub fn read_trust_anchor(path: &Path) -> Result<VerifyingKey, TrustError> {
         path: path.to_path_buf(),
         reason: format!("invalid hex: {e}"),
     })?;
-    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| TrustError::BadKey {
-        path: path.to_path_buf(),
-        reason: format!("expected 32 bytes, got {}", bytes.len()),
-    })?;
+    let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+        return Err(TrustError::BadKey {
+            path: path.to_path_buf(),
+            reason: format!("expected 32 bytes, got {}", bytes.len()),
+        });
+    };
     VerifyingKey::from_bytes(&arr).map_err(|e| TrustError::BadKey {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -272,14 +271,20 @@ pub fn verify_ed25519(
 ) -> Result<(), TrustError> {
     let sig_bytes = hex::decode(sig_hex.trim())
         .map_err(|e| TrustError::BadSignatureHex(format!("invalid hex: {e}")))?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| TrustError::BadSignatureHex(format!("expected 64 bytes, got {}", sig_bytes.len())))?;
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+        return Err(TrustError::BadSignatureHex(format!(
+            "expected 64 bytes, got {}",
+            sig_bytes.len()
+        )));
+    };
     let sig = Signature::from_bytes(&sig_arr);
+    // Collapse any verification failure into one opaque error on purpose: the
+    // underlying `SignatureError` distinguishes failure modes (bad point, bad
+    // scalar, mismatch), and surfacing those would hand an attacker a per-check
+    // oracle. One indistinguishable "mismatch" is the whole point.
     pubkey
         .verify_strict(payload, &sig)
-        .map_err(|_| TrustError::SignatureMismatch)
+        .map_err(|_err| TrustError::SignatureMismatch)
 }
 
 /// Read the persisted anti-rollback floor from `<dir>/declaration.version`.
@@ -288,10 +293,13 @@ pub fn last_applied_version(dir: &Path) -> Result<Option<u32>, TrustError> {
     let path = dir.join(VERSION_FILE);
     match std::fs::read_to_string(&path) {
         Ok(s) => {
-            let v = s.trim().parse::<u32>().map_err(|e| TrustError::PersistUnreadable {
-                path: path.clone(),
-                reason: e.to_string(),
-            })?;
+            let v = s
+                .trim()
+                .parse::<u32>()
+                .map_err(|e| TrustError::PersistUnreadable {
+                    path: path.clone(),
+                    reason: e.to_string(),
+                })?;
             Ok(Some(v))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -316,7 +324,7 @@ pub fn persist_version(dir: &Path, version: u32) -> Result<(), TrustError> {
         reason: e.to_string(),
     })?;
     std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+        cleanup_temp(&tmp);
         TrustError::PersistWrite {
             path: path.clone(),
             reason: e.to_string(),
@@ -344,6 +352,18 @@ fn sync_parent_dir(path: &Path) -> Result<(), TrustError> {
     })
 }
 
+/// Best-effort removal of a leftover temp file. Never propagates: a failed
+/// cleanup must not mask the primary error that triggered it. A `NotFound` is the
+/// expected race (the rename consumed it) and is silent; any other failure is
+/// surfaced at warn so a leaked temp file is visible without changing control flow.
+fn cleanup_temp(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), error = %e, "failed to remove temp file");
+        }
+    }
+}
+
 /// Write `bytes` to `path`, creating it 0600 on Unix (root-only intent).
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -363,7 +383,10 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// An absent floor (`None`) accepts any version.
 fn check_rollback(version: u32, floor: Option<u32>) -> Result<(), TrustError> {
     match floor {
-        Some(f) if version < f => Err(TrustError::Rollback { got: version, floor: f }),
+        Some(f) if version < f => Err(TrustError::Rollback {
+            got: version,
+            floor: f,
+        }),
         _ => Ok(()),
     }
 }
@@ -373,8 +396,8 @@ fn check_rollback(version: u32, floor: Option<u32>) -> Result<(), TrustError> {
 ///
 /// Order (design Р4):
 /// 1. `--trust-fs` → `Trusted(Standalone)` + log (no signature, no anti-rollback).
-/// 2. managed: read trust-anchor → `signed_payload` → Ed25519 verify →
-///    anti-rollback (`decl.version` vs persisted floor) → `Trusted(Managed)`.
+/// 2. managed: read trust-anchor → `signed_payload` → Ed25519 verify → anti-rollback
+///    (`decl.version` vs persisted floor) → `Trusted(Managed)`.
 ///
 /// Persisting the new floor is a SEPARATE step done by the caller AFTER a
 /// successful apply (see [`persist_version`]).
@@ -384,6 +407,12 @@ pub fn verify_trust(
     opts: &TrustOptions,
 ) -> Result<TrustDecision, TrustError> {
     if opts.trust_fs {
+        // The escape hatch skips signature + anti-rollback entirely. That is a
+        // security-relevant downgrade, so it is always recorded at warn.
+        tracing::warn!(
+            version = decl.version,
+            "trust granted via --trust-fs escape hatch: signature and anti-rollback bypassed"
+        );
         return Ok(TrustDecision::Trusted {
             mode: TrustMode::Standalone,
             reason: format!(
@@ -407,8 +436,21 @@ pub fn verify_trust(
     let floor = last_applied_version(&opts.persist_dir)?;
     check_rollback(decl.version, floor)?;
 
+    // Record the successful managed-trust pass. `key_id` is the first 8 bytes of
+    // the PUBLIC verifying key, hex-encoded — a non-secret anchor fingerprint for
+    // correlating which trust anchor admitted a declaration. The private key and
+    // the signature itself are never logged.
+    tracing::info!(
+        mode = "managed",
+        version = decl.version,
+        key_id = %anchor_key_id(&pubkey),
+        "managed trust granted: signature verified, anti-rollback ok"
+    );
+
     Ok(TrustDecision::Trusted {
-        mode: TrustMode::Managed { version: decl.version },
+        mode: TrustMode::Managed {
+            version: decl.version,
+        },
         reason: format!(
             "managed trust granted: Ed25519 signature verified, anti-rollback ok, version {}",
             decl.version
@@ -416,19 +458,33 @@ pub fn verify_trust(
     })
 }
 
+/// A non-secret fingerprint of a trust anchor: hex of the first 8 bytes of the
+/// public verifying key. Used only for log correlation; never derived from or
+/// revealing any private key material.
+fn anchor_key_id(pubkey: &VerifyingKey) -> String {
+    let bytes = pubkey.to_bytes();
+    hex::encode(bytes.get(..8).unwrap_or(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    use super::*;
 
     // ---- canonicalization (task 1.3) ----
 
     #[test]
     fn signed_payload_removes_signature_line_byte_exact() {
-        let with_sig = b"version = 5\nrole_store = \"/x\"\nsignature = \"deadbeef\"\nshell = \"/bin/sh\"\n";
+        let with_sig =
+            b"version = 5\nrole_store = \"/x\"\nsignature = \"deadbeef\"\nshell = \"/bin/sh\"\n";
         let without = b"version = 5\nrole_store = \"/x\"\nshell = \"/bin/sh\"\n";
         let payload = signed_payload(with_sig).unwrap();
-        assert_eq!(payload, without.to_vec(), "signature line + its newline must be gone");
+        assert_eq!(
+            payload,
+            without.to_vec(),
+            "signature line + its newline must be gone"
+        );
     }
 
     #[test]
@@ -448,7 +504,10 @@ mod tests {
     #[test]
     fn signed_payload_missing_signature_is_error() {
         let no_sig = b"version = 5\nrole_store = \"/x\"\n";
-        assert!(matches!(signed_payload(no_sig), Err(TrustError::MissingSignature)));
+        assert!(matches!(
+            signed_payload(no_sig),
+            Err(TrustError::MissingSignature)
+        ));
     }
 
     #[test]
@@ -476,7 +535,7 @@ mod tests {
         assert_eq!(payload, b"signature = \"bb\"\n".to_vec());
     }
 
-    /// H1: the whitespace class must match Tessera's `str::trim_start()` (all
+    /// The whitespace class must match Tessera's `str::trim_start()` (all
     /// Unicode whitespace), not just ASCII space/tab. A `signature` line led by
     /// `\r`, by NBSP, or with form-feed/`\r` between `signature` and `=` is the
     /// signature line and must be removed — otherwise census would reject a line
@@ -508,7 +567,7 @@ mod tests {
         );
     }
 
-    // ---- M1: UTF-8 validation ----
+    // ---- UTF-8 validation ----
 
     #[test]
     fn signed_payload_invalid_utf8_is_error() {
@@ -520,7 +579,7 @@ mod tests {
         ));
     }
 
-    // ---- M2: size cap ----
+    // ---- size cap ----
 
     #[test]
     fn signed_payload_oversize_is_error() {
@@ -581,7 +640,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("trust.pub");
         std::fs::write(&p, "zznothex").unwrap();
-        assert!(matches!(read_trust_anchor(&p).unwrap_err(), TrustError::BadKey { .. }));
+        assert!(matches!(
+            read_trust_anchor(&p).unwrap_err(),
+            TrustError::BadKey { .. }
+        ));
     }
 
     #[test]
@@ -589,7 +651,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("trust.pub");
         std::fs::write(&p, hex::encode([1u8; 16])).unwrap(); // 16 bytes, not 32
-        assert!(matches!(read_trust_anchor(&p).unwrap_err(), TrustError::BadKey { .. }));
+        assert!(matches!(
+            read_trust_anchor(&p).unwrap_err(),
+            TrustError::BadKey { .. }
+        ));
     }
 
     #[test]
@@ -650,15 +715,19 @@ mod tests {
     #[test]
     fn persist_version_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(last_applied_version(tmp.path()).unwrap(), None, "absent → no floor");
+        assert_eq!(
+            last_applied_version(tmp.path()).unwrap(),
+            None,
+            "absent → no floor"
+        );
         persist_version(tmp.path(), 42).unwrap();
         assert_eq!(last_applied_version(tmp.path()).unwrap(), Some(42));
         persist_version(tmp.path(), 43).unwrap();
         assert_eq!(last_applied_version(tmp.path()).unwrap(), Some(43));
     }
 
-    /// L1: after adding the parent-directory fsync, persist must still
-    /// round-trip cleanly (write then read back the same value).
+    /// With the parent-directory fsync in place, persist must still round-trip
+    /// cleanly (write then read back the same value).
     #[test]
     fn persist_version_round_trips_with_parent_fsync() {
         let tmp = tempfile::tempdir().unwrap();
@@ -727,7 +796,10 @@ mod tests {
             "version = 7\nrole_store = \"/x\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
         )
         .unwrap();
-        let o = TrustOptions { trust_fs: true, ..Default::default() };
+        let o = TrustOptions {
+            trust_fs: true,
+            ..Default::default()
+        };
         let d = verify_trust(&decl, b"irrelevant", &o).unwrap();
         assert!(d.is_trusted());
         assert_eq!(d.mode(), Some(&TrustMode::Standalone));
@@ -740,7 +812,12 @@ mod tests {
         let sk = keypair();
         let anchor = anchor_file(tmp.path(), &sk);
         let (raw, decl) = signed_decl(&sk, 5);
-        let d = verify_trust(&decl, raw.as_bytes(), &opts(anchor, tmp.path().to_path_buf())).unwrap();
+        let d = verify_trust(
+            &decl,
+            raw.as_bytes(),
+            &opts(anchor, tmp.path().to_path_buf()),
+        )
+        .unwrap();
         assert!(d.is_trusted());
         assert_eq!(d.mode(), Some(&TrustMode::Managed { version: 5 }));
     }
@@ -754,7 +831,12 @@ mod tests {
             "version = 5\nrole_store = \"/x\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
         )
         .unwrap();
-        let err = verify_trust(&decl, b"version = 5\n", &opts(anchor, tmp.path().to_path_buf())).unwrap_err();
+        let err = verify_trust(
+            &decl,
+            b"version = 5\n",
+            &opts(anchor, tmp.path().to_path_buf()),
+        )
+        .unwrap_err();
         assert!(matches!(err, TrustError::MissingSignature));
     }
 
@@ -766,7 +848,12 @@ mod tests {
         let (raw, decl) = signed_decl(&sk, 5);
         // Tamper a byte in the payload portion (flip the role_store path).
         let tampered = raw.replace("/var/lib/tessera/roles", "/var/lib/tessera/rolez");
-        let err = verify_trust(&decl, tampered.as_bytes(), &opts(anchor, tmp.path().to_path_buf())).unwrap_err();
+        let err = verify_trust(
+            &decl,
+            tampered.as_bytes(),
+            &opts(anchor, tmp.path().to_path_buf()),
+        )
+        .unwrap_err();
         assert!(matches!(err, TrustError::SignatureMismatch));
     }
 
@@ -778,7 +865,12 @@ mod tests {
         let other = SigningKey::from_bytes(&[3u8; 32]);
         let anchor = anchor_file(tmp.path(), &other);
         let (raw, decl) = signed_decl(&sk, 5);
-        let err = verify_trust(&decl, raw.as_bytes(), &opts(anchor, tmp.path().to_path_buf())).unwrap_err();
+        let err = verify_trust(
+            &decl,
+            raw.as_bytes(),
+            &opts(anchor, tmp.path().to_path_buf()),
+        )
+        .unwrap_err();
         assert!(matches!(err, TrustError::SignatureMismatch));
     }
 
@@ -788,7 +880,12 @@ mod tests {
         let sk = keypair();
         let (raw, decl) = signed_decl(&sk, 5);
         let missing = tmp.path().join("absent.pub");
-        let err = verify_trust(&decl, raw.as_bytes(), &opts(missing, tmp.path().to_path_buf())).unwrap_err();
+        let err = verify_trust(
+            &decl,
+            raw.as_bytes(),
+            &opts(missing, tmp.path().to_path_buf()),
+        )
+        .unwrap_err();
         assert!(matches!(err, TrustError::AnchorUnreadable { .. }));
     }
 
@@ -800,7 +897,12 @@ mod tests {
         // Persist a floor of 9; a version-5 declaration must be rejected.
         persist_version(tmp.path(), 9).unwrap();
         let (raw, decl) = signed_decl(&sk, 5);
-        let err = verify_trust(&decl, raw.as_bytes(), &opts(anchor, tmp.path().to_path_buf())).unwrap_err();
+        let err = verify_trust(
+            &decl,
+            raw.as_bytes(),
+            &opts(anchor, tmp.path().to_path_buf()),
+        )
+        .unwrap_err();
         assert!(matches!(err, TrustError::Rollback { got: 5, floor: 9 }));
     }
 
@@ -811,7 +913,12 @@ mod tests {
         let anchor = anchor_file(tmp.path(), &sk);
         persist_version(tmp.path(), 5).unwrap();
         let (raw, decl) = signed_decl(&sk, 5);
-        let d = verify_trust(&decl, raw.as_bytes(), &opts(anchor, tmp.path().to_path_buf())).unwrap();
+        let d = verify_trust(
+            &decl,
+            raw.as_bytes(),
+            &opts(anchor, tmp.path().to_path_buf()),
+        )
+        .unwrap();
         assert!(d.is_trusted());
     }
 }

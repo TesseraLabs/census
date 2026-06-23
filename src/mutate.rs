@@ -8,18 +8,17 @@
 //!
 //! This module separates two concerns so the logic is unit-testable without
 //! root:
-//!   * pure **argv builders** (`build_create_argv`, `build_update_argv`,
-//!     `build_delete_argv`) returning `Vec<Vec<String>>` — one inner vec per
-//!     command to run, in order;
-//!   * the [`Provisioner`] trait + [`ShadowUtilsProvisioner`] that actually
-//!     executes them.
+//!   * pure **argv builders** (`build_create_argv`, `build_update_argv`, `build_delete_argv`)
+//!     returning `Vec<Vec<String>>` — one inner vec per command to run, in order;
+//!   * the [`Provisioner`] trait + [`ShadowUtilsProvisioner`] that actually executes them.
 //!
 //! The orchestrator ([`crate::apply`]) depends on the trait, so it can be driven
 //! by a fake in tests.
 
+use std::process::Command;
+
 use crate::model::{ResolvedAccount, ResolvedGroup};
 use crate::state::ManagedAccount;
-use std::process::Command;
 
 /// GECOS marker prefix written via `chfn`. Astra's `useradd -c` rejects `:`/`=`,
 /// so the marker is deliberately a single token containing neither character.
@@ -33,6 +32,7 @@ pub fn gecos_marker(role: &str) -> String {
 
 /// Errors raised while building or executing mutations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProvisionError {
     /// A managed account's UID would change — rejected (UID is fleet-stable §10).
     #[error("refusing to change UID of managed account {name:?}: {from} -> {to} (UID is stable; not overwritten)")]
@@ -120,7 +120,11 @@ pub fn build_create_argv(acct: &ResolvedAccount) -> Vec<Vec<String>> {
 
     // Lock the password (shadow field becomes '!...'): role accounts are
     // unreachable by password by construction (§8).
-    cmds.push(vec!["passwd".to_owned(), "-l".to_owned(), acct.name.clone()]);
+    cmds.push(vec![
+        "passwd".to_owned(),
+        "-l".to_owned(),
+        acct.name.clone(),
+    ]);
 
     cmds
 }
@@ -180,11 +184,7 @@ pub fn build_update_argv(
 /// Build the argv to **delete** a managed account: `userdel -r <name>` (removes
 /// the home tree). Gating against lockout / live sessions happens upstream.
 pub fn build_delete_argv(name: &str) -> Vec<Vec<String>> {
-    vec![vec![
-        "userdel".to_owned(),
-        "-r".to_owned(),
-        name.to_owned(),
-    ]]
+    vec![vec!["userdel".to_owned(), "-r".to_owned(), name.to_owned()]]
 }
 
 /// Build the argv to **create** a group: `groupadd [-g <gid>] <name>`. The
@@ -245,14 +245,22 @@ pub trait Provisioner {
     /// Reconcile an existing managed account toward `acct`. `changes` are the
     /// human-readable diffs (for logging); the authoritative current record is
     /// carried by the implementation if needed.
-    fn update(&mut self, acct: &ResolvedAccount, changes: &[String])
-        -> Result<(), ProvisionError>;
+    fn update(&mut self, acct: &ResolvedAccount, changes: &[String]) -> Result<(), ProvisionError>;
     /// Delete a managed account by name.
     fn delete(&mut self, name: &str) -> Result<(), ProvisionError>;
     /// Create a group via `groupadd` (pinning the GID when `gid` is `Some`).
     /// Runs in the group-create phase, BEFORE account creation, so membership
     /// (`useradd -G`) finds the group.
     fn create_group(&mut self, name: &str, gid: Option<u32>) -> Result<(), ProvisionError>;
+    /// Read back the GID the OS assigned to a group this provisioner just created
+    /// (an unpinned `groupadd` lets the OS pick the GID). Returns `None` if the
+    /// group cannot be resolved. Read through the SAME seam that created the group
+    /// so the registry records the GID the OS actually assigned, not whatever a
+    /// pre-mutation snapshot happened to hold. A default impl returns `None` so
+    /// test doubles that predate this method keep compiling.
+    fn group_gid(&self, _name: &str) -> Option<u32> {
+        None
+    }
     /// Delete a Census-owned group via `groupdel`. Runs in the group-delete
     /// phase, AFTER account deletion, so the group has no members.
     fn delete_group(&mut self, name: &str) -> Result<(), ProvisionError>;
@@ -271,17 +279,17 @@ pub trait Provisioner {
     /// exist (a group that dropped its last sudo grant must lose its file).
     fn apply_group_sudoers(&mut self, group: &ResolvedGroup) -> Result<(), ProvisionError>;
     /// Remove the `census-grp-<group>` sudoers fragment Census owns for a group
-    /// (idempotent: absent fragment is success). Named distinctly from
-    /// [`crate::sudoers::remove_group_sudoers`] so the trait method and the free
-    /// function do not collide at call sites.
-    fn remove_group_sudoers_for(&mut self, group: &str) -> Result<(), ProvisionError>;
+    /// (idempotent: absent fragment is success). The free
+    /// [`crate::sudoers::remove_group_sudoers`] does the on-disk removal; this
+    /// trait method is the provisioner seam over it (no name collision — one is a
+    /// method call, the other a path-qualified free function).
+    fn remove_group_sudoers(&mut self, group: &str) -> Result<(), ProvisionError>;
     /// Add `member` to `group` via `gpasswd -a` (surgical: only this member is
     /// touched, the group's other members are left intact).
     fn add_group_member(&mut self, group: &str, member: &str) -> Result<(), ProvisionError>;
     /// Remove `member` from `group` via `gpasswd -d` (surgical: only this member
     /// is removed; the group's pre-existing/foreign members stay).
-    fn remove_group_member(&mut self, group: &str, member: &str)
-        -> Result<(), ProvisionError>;
+    fn remove_group_member(&mut self, group: &str, member: &str) -> Result<(), ProvisionError>;
     /// Register a sudoers fragment path in the pre-mutation backup set, so a
     /// later-phase failure rolls the fragment back too (spec R2). Called by the
     /// orchestrator for every touched fragment BEFORE [`Provisioner::snapshot`].
@@ -339,13 +347,14 @@ impl<'a> ShadowUtilsProvisioner<'a> {
             cmd: cmd.to_vec(),
             reason: "empty argv".to_owned(),
         })?;
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|e| ProvisionError::Spawn {
-                cmd: cmd.to_vec(),
-                reason: e.to_string(),
-            })?;
+        let output =
+            Command::new(program)
+                .args(args)
+                .output()
+                .map_err(|e| ProvisionError::Spawn {
+                    cmd: cmd.to_vec(),
+                    reason: e.to_string(),
+                })?;
         if output.status.success() {
             Ok(())
         } else {
@@ -375,12 +384,12 @@ impl Provisioner for ShadowUtilsProvisioner<'_> {
         acct: &ResolvedAccount,
         _changes: &[String],
     ) -> Result<(), ProvisionError> {
-        let current = self
-            .managed
-            .get(&acct.name)
-            .ok_or_else(|| ProvisionError::MissingManagedRecord {
-                name: acct.name.clone(),
-            })?;
+        let current =
+            self.managed
+                .get(&acct.name)
+                .ok_or_else(|| ProvisionError::MissingManagedRecord {
+                    name: acct.name.clone(),
+                })?;
         let cmds = build_update_argv(acct, current)?;
         Self::run_all(&cmds)
     }
@@ -391,6 +400,25 @@ impl Provisioner for ShadowUtilsProvisioner<'_> {
 
     fn create_group(&mut self, name: &str, gid: Option<u32>) -> Result<(), ProvisionError> {
         Self::run_all(&build_create_group_argv(name, gid))
+    }
+
+    fn group_gid(&self, name: &str) -> Option<u32> {
+        // `getent group <name>` → `name:passwd:gid:members`; field 3 is the GID.
+        // Read-only, argv array (no shell). Any failure (no getent, absent group,
+        // non-numeric gid) yields None — the caller falls back to a sentinel and
+        // doctor flags the divergence on the next run.
+        let out = Command::new("getent")
+            .arg("group")
+            .arg(name)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(out.stdout).ok()?;
+        let line = text.lines().next()?;
+        let fields: Vec<&str> = line.split(':').collect();
+        fields.get(2)?.parse::<u32>().ok()
     }
 
     fn delete_group(&mut self, name: &str) -> Result<(), ProvisionError> {
@@ -428,7 +456,7 @@ impl Provisioner for ShadowUtilsProvisioner<'_> {
         Ok(())
     }
 
-    fn remove_group_sudoers_for(&mut self, group: &str) -> Result<(), ProvisionError> {
+    fn remove_group_sudoers(&mut self, group: &str) -> Result<(), ProvisionError> {
         crate::sudoers::remove_group_sudoers(&self.sudoers_dir, group)?;
         Ok(())
     }
@@ -460,9 +488,10 @@ impl Provisioner for ShadowUtilsProvisioner<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::rolestore::Limits;
-    use std::path::PathBuf;
 
     fn acct(name: &str, uid: u32, shell: &str, groups: &[&str]) -> ResolvedAccount {
         ResolvedAccount {
@@ -506,12 +535,18 @@ mod tests {
         assert!(useradd.contains(&"-d".to_owned()));
         assert!(useradd.contains(&"-s".to_owned()));
         assert!(useradd.contains(&"/bin/bash".to_owned()));
-        assert!(!useradd.contains(&"-c".to_owned()), "must NOT pass -c (Astra GECOS quirk)");
+        assert!(
+            !useradd.contains(&"-c".to_owned()),
+            "must NOT pass -c (Astra GECOS quirk)"
+        );
         assert!(useradd.contains(&"-G".to_owned()));
         assert!(useradd.contains(&"wheel,docker".to_owned()));
         // last command locks the password.
         let last = cmds.last().unwrap();
-        assert_eq!(last, &vec!["passwd".to_owned(), "-l".to_owned(), "oper".to_owned()]);
+        assert_eq!(
+            last,
+            &vec!["passwd".to_owned(), "-l".to_owned(), "oper".to_owned()]
+        );
     }
 
     #[test]
@@ -546,7 +581,10 @@ mod tests {
     #[test]
     fn create_sets_gecos_marker_via_chfn() {
         let cmds = build_create_argv(&acct("oper", 9010, "/bin/bash", &[]));
-        let chfn = cmds.iter().find(|c| c[0] == "chfn").expect("chfn marker call");
+        let chfn = cmds
+            .iter()
+            .find(|c| c[0] == "chfn")
+            .expect("chfn marker call");
         assert!(chfn.contains(&gecos_marker("oper")));
         // and the marker token itself carries no ':' or '='.
         let marker = &chfn[2];
@@ -558,7 +596,14 @@ mod tests {
         let target = acct("oper", 9999, "/bin/bash", &[]);
         let current = managed("oper", 9010, "/bin/bash", &[]);
         let err = build_update_argv(&target, &current).unwrap_err();
-        assert!(matches!(err, ProvisionError::UidChange { from: 9010, to: 9999, .. }));
+        assert!(matches!(
+            err,
+            ProvisionError::UidChange {
+                from: 9010,
+                to: 9999,
+                ..
+            }
+        ));
     }
 
     #[test]

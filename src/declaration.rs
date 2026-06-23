@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 /// Defaults applied to role accounts that omit a field.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// Inclusive [min, max] UID band for role accounts. Must be within the
@@ -22,6 +23,7 @@ pub struct Defaults {
 /// A declared group: an optional GID pin for stability across the fleet
 /// (audit/NFS). `gid = None` lets the OS assign the GID at creation time.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GroupSpec {
     /// POSIX group name (the key used to reference / create the group).
@@ -47,6 +49,7 @@ pub struct GroupSpec {
 
 /// One role account: the projection of a role into a Unix account.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RoleAccount {
     /// Role id; key into the role-store (`<role_store>/<role>.toml`).
@@ -88,6 +91,7 @@ impl RoleAccount {
 /// bind to the same group). `group` MUST name a `[[group]]` declared in the
 /// same declaration; `role` is a role-store role id.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RoleGroup {
     /// Role id whose grants are bound to the group.
@@ -98,6 +102,7 @@ pub struct RoleGroup {
 
 /// A parsed, schema-valid declaration.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Declaration {
     /// Monotonic version; anti-rollback uses it (verification is a later slice).
@@ -128,6 +133,7 @@ pub struct Declaration {
 
 /// Errors from parsing or validating a declaration.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DeclarationError {
     /// TOML parse / type / unknown-field error.
     #[error("declaration TOML is invalid: {0}")]
@@ -140,10 +146,19 @@ pub enum DeclarationError {
     UidRangeInverted(u32, u32),
     /// A role account UID falls outside `defaults.uid_range`.
     #[error("role {role:?} uid {uid} is outside uid_range [{min}, {max}]")]
-    UidOutOfRange { role: String, uid: u32, min: u32, max: u32 },
+    UidOutOfRange {
+        role: String,
+        uid: u32,
+        min: u32,
+        max: u32,
+    },
     /// Two role accounts share a UID.
     #[error("uid {uid} is used by both {first:?} and {second:?}")]
-    UidCollision { uid: u32, first: String, second: String },
+    UidCollision {
+        uid: u32,
+        first: String,
+        second: String,
+    },
     /// Two role accounts share a role id.
     #[error("role {0:?} is declared more than once")]
     DuplicateRole(String),
@@ -196,7 +211,9 @@ pub enum DeclarationError {
     UserNameInvalid { value: String },
     /// A `[[group]]` declares `adopt = true` together with a pinned `gid`.
     /// Census does not renumber an existing group, so the two are incompatible.
-    #[error("group {group:?} declares adopt together with a pinned gid (adoption never renumbers)")]
+    #[error(
+        "group {group:?} declares adopt together with a pinned gid (adoption never renumbers)"
+    )]
     GroupAdoptWithGid { group: String },
     /// A `[[group]].members` entry is not a valid POSIX user name.
     #[error(
@@ -226,15 +243,16 @@ pub enum DeclarationError {
 /// and leading digits) so created group names stay predictable across the fleet.
 fn is_valid_group_name(name: &str) -> bool {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > 32 {
+    if bytes.len() > 32 {
         return false;
     }
-    let first = bytes[0];
-    if !(first.is_ascii_lowercase() || first == b'_') {
+    let Some((first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || *first == b'_') {
         return false;
     }
-    bytes[1..]
-        .iter()
+    rest.iter()
         .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
@@ -251,14 +269,16 @@ fn is_valid_user_name(name: &str) -> bool {
 /// First char is `a-z`; remaining chars are `a-z`/`0-9`/`-`; total length 1..=16.
 fn is_valid_role_id(id: &str) -> bool {
     let bytes = id.as_bytes();
-    if bytes.is_empty() || bytes.len() > 16 {
+    if bytes.len() > 16 {
         return false;
     }
-    if !bytes[0].is_ascii_lowercase() {
+    let Some((first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
         return false;
     }
-    bytes[1..]
-        .iter()
+    rest.iter()
         .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
@@ -710,7 +730,10 @@ uid = 9020
             "{SAMPLE}\n[[group]]\nname = \"atm-operators\"\ngid = 8010\n[[group]]\nname = \"wheel\"\n"
         );
         let d = Declaration::parse(&doc).unwrap();
-        let res = vec![resolved("oper", &["wheel", "docker"]), resolved("serv", &["wheel"])];
+        let res = vec![
+            resolved("oper", &["wheel", "docker"]),
+            resolved("serv", &["wheel"]),
+        ];
         let req = required_groups(&d, &res).unwrap();
         // union of role groups {wheel, docker} ∪ declared {atm-operators, wheel}
         assert_eq!(req.len(), 3);
@@ -759,7 +782,11 @@ uid = 9020
             "{SAMPLE}\n[[role_account]]\nrole = \"infra-admin\"\nuser = \"alice\"\nadopt = true\n"
         );
         let d = Declaration::parse(&doc).unwrap();
-        let adopted = d.role_accounts.iter().find(|a| a.role == "infra-admin").unwrap();
+        let adopted = d
+            .role_accounts
+            .iter()
+            .find(|a| a.role == "infra-admin")
+            .unwrap();
         assert_eq!(adopted.user.as_deref(), Some("alice"));
         assert_eq!(adopted.uid, None);
         assert!(adopted.is_adopted());
@@ -790,9 +817,7 @@ uid = 9020
 
     #[test]
     fn user_without_adopt_rejected() {
-        let doc = format!(
-            "{SAMPLE}\n[[role_account]]\nrole = \"infra-admin\"\nuser = \"alice\"\n"
-        );
+        let doc = format!("{SAMPLE}\n[[role_account]]\nrole = \"infra-admin\"\nuser = \"alice\"\n");
         assert!(matches!(
             Declaration::parse(&doc).unwrap_err(),
             DeclarationError::AccountAdoptInconsistent { .. }
@@ -873,9 +898,8 @@ uid = 9020
         // The sample declares Created accounts `oper` and `serv`; a Created
         // account's OS login equals its role id, so `oper` is a managed OS user
         // and is allowed in an adopted group.
-        let doc = format!(
-            "{SAMPLE}\n[[group]]\nname = \"wheel\"\nadopt = true\nmembers = [\"oper\"]\n"
-        );
+        let doc =
+            format!("{SAMPLE}\n[[group]]\nname = \"wheel\"\nadopt = true\nmembers = [\"oper\"]\n");
         assert!(Declaration::parse(&doc).is_ok());
     }
 

@@ -1,0 +1,9 @@
+# PCI DSS — cross-reference of Census access-governance permissions against the standard's requirements.
+# Only requirement numbers (facts) and paraphrased titles; the PCI SSC requirement text
+# (copyright) is not reproduced. Scope: req 7 (access restriction), partly 8/10 —
+# auth/logging marked owned=false (outside the Census domain).
+id        = "pci-dss"
+version   = "4.0"
+title     = "PCI DSS"
+dimension = "flat"
+provides  = ["crossref", "controls"]

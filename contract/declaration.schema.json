@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Declaration",
+  "description": "A parsed, schema-valid declaration.",
+  "type": "object",
+  "properties": {
+    "defaults": {
+      "description": "Defaults block.",
+      "$ref": "#/$defs/Defaults"
+    },
+    "group": {
+      "description": "Declared groups with optional GID pins (TOML `[[group]]`). The required\nset unions these names with every role's `payload.groups`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/GroupSpec"
+      }
+    },
+    "role_account": {
+      "description": "Role accounts (TOML `[[role_account]]`).",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RoleAccount"
+      }
+    },
+    "role_group": {
+      "description": "Role→group grant bindings (TOML `[[role_group]]`). Each binds a role's\npermissions to a declared group.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RoleGroup"
+      }
+    },
+    "role_store": {
+      "description": "Path to the role-store directory (source of role composition).",
+      "type": "string"
+    },
+    "signature": {
+      "description": "Detached Ed25519 signature over the declaration bytes minus this line\n(hex of 64 bytes). Present in managed mode; absent under `--trust-fs`.\nThe field exists so the strict (`deny_unknown_fields`) parser accepts a\n`signature = \"...\"` line — verification operates on RAW bytes via\n`trust::signed_payload`, not on this parsed value.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "version": {
+      "description": "Monotonic version; anti-rollback uses it (verification is a later slice).",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "role_store",
+    "defaults"
+  ],
+  "$defs": {
+    "Defaults": {
+      "description": "Defaults applied to role accounts that omit a field.",
+      "type": "object",
+      "properties": {
+        "home_base": {
+          "description": "Base directory for role-account homes.",
+          "type": "string"
+        },
+        "shell": {
+          "description": "Default login shell when a role account omits `shell`.",
+          "type": "string"
+        },
+        "uid_range": {
+          "description": "Inclusive [min, max] UID band for role accounts. Must be within the\nOS `UID_MAX` (validated against login.defs in a later slice).",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "maxItems": 2,
+          "minItems": 2
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "uid_range",
+        "shell",
+        "home_base"
+      ]
+    },
+    "GroupSpec": {
+      "description": "A declared group: an optional GID pin for stability across the fleet\n(audit/NFS). `gid = None` lets the OS assign the GID at creation time.",
+      "type": "object",
+      "properties": {
+        "adopt": {
+          "description": "Adoption flag. When `true` the group is taken under management as an\nexisting OS group (Adopted provenance): Census never creates or deletes\nit and never touches its pre-existing members — it only adds/removes its\nown grants and its own added members, releasing to baseline. A pinned\n`gid` is incompatible with adoption (Census does not renumber an existing\ngroup), so `adopt = true` together with `gid` is rejected.",
+          "type": "boolean",
+          "default": false
+        },
+        "gid": {
+          "description": "Optional pinned GID. When present, `groupadd -g <gid>`; on conflict\n(GID already belongs to a different group) apply refuses, never renumbers.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 0
+        },
+        "members": {
+          "description": "Members Census manages on this group. For an Adopted group these MUST be\nCensus-managed OS users — Census must not drag a third party into a group\nit did not create; for a Created group any valid user name is allowed.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "description": "POSIX group name (the key used to reference / create the group).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "RoleAccount": {
+      "description": "One role account: the projection of a role into a Unix account.",
+      "type": "object",
+      "properties": {
+        "adopt": {
+          "description": "Adoption flag. `true` marks the account Adopted and requires `user`\n(and forbids `uid`). `false` (default) is a Created account keyed by `uid`.",
+          "type": "boolean",
+          "default": false
+        },
+        "home": {
+          "description": "Home directory; falls back to `<home_base>/<role>` if absent.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "role": {
+          "description": "Role id; key into the role-store (`<role_store>/<role>.toml`).",
+          "type": "string"
+        },
+        "shell": {
+          "description": "Login shell; falls back to `Defaults::shell` if absent.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "uid": {
+          "description": "Explicit, fleet-stable UID (spec §10). Present for a Created account\n(Census creates the Unix user at this UID). Absent for an Adopted account\n(which instead names an existing user via `user`): Census never assigns a\nUID to a user it did not create.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 0
+        },
+        "user": {
+          "description": "Existing OS user name to adopt. Mutually exclusive with `uid`; requires\n`adopt = true`. When set, the account is Adopted: Census binds the role's\ngrants to this pre-existing user without ever running `useradd`/`userdel`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role"
+      ]
+    },
+    "RoleGroup": {
+      "description": "A grant binding: attach a role's resolved permissions to a Unix group, so\nevery member of the group inherits them (many-to-one — several roles may\nbind to the same group). `group` MUST name a `[[group]]` declared in the\nsame declaration; `role` is a role-store role id.",
+      "type": "object",
+      "properties": {
+        "group": {
+          "description": "Target group name; MUST match a declared `[[group]]`.",
+          "type": "string"
+        },
+        "role": {
+          "description": "Role id whose grants are bound to the group.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "group"
+      ]
+    }
+  }
+}

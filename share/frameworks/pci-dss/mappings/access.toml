@@ -1,0 +1,36 @@
+# Mapping of Census catalog permissions → PCI DSS 4.0 control-ids, with link polarity.
+# Key = permission id. satisfies — the capability addresses the control; risk — the capability
+# undermines the control; related — neutrally touches the area (outside the Census domain).
+# Domain boundaries are set via owned in controls.toml.
+
+# account/role management; conflicts with the role-account model — rarely granted.
+# 7.2.4 (periodic review of permissions) is NOT mapped: it is a process/Control feature, not a
+# permission grant — it remains an honest gap in coverage.
+[user-admin]
+satisfies = ["7.2.1", "7.2.5"]
+
+# sudo policy = enforcement of least privilege
+[sudo-config]
+satisfies = ["7.2.2", "7.3.1"]
+
+# remote access control
+[ssh-admin]
+satisfies = ["7.3.2"]
+
+# role-restricted read access to audit data
+[log-read]
+satisfies = ["7.2.6"]
+
+# auth config; identification/passwords/MFA = Tessera (8.2.1 owned=false): neutrally touches.
+[pam-config]
+related = ["8.2.1"]
+
+# grant of the audit capability; logging policy is outside the domain (10.2.1 owned=false):
+# neutrally touches, does not satisfy.
+[audit-config]
+related = ["10.2.1"]
+
+# log rotation/cleanup THREATENS the integrity of audit logs (10.5.1):
+# the capability undermines the control rather than satisfying it.
+[log-admin]
+risk = ["10.5.1"]

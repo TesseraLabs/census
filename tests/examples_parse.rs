@@ -1,0 +1,182 @@
+//! The shipped example + packaged TOML files must parse through the REAL
+//! parsers, not just validate against the golden schemas.
+//!
+//! `taplo check` (configured in `taplo.toml`) validates these files against the
+//! generated JSON schemas, but taplo is an external CLI that may not be present
+//! in every CI/dev environment — and a schema is only an approximation of what
+//! the Rust parser accepts (path validation, the `replace`/`append` invariant,
+//! namespace/location matching, the role-slice `[payload]` nesting, …). These
+//! tests run each shipped file through the exact parser the binary uses, so a
+//! file that drifts out of the format fails `cargo test` even with no taplo.
+//!
+//! Covered:
+//!   - `examples/declaration.toml`     → `Declaration::parse`
+//!   - `examples/roles/*.toml`         → `rolestore::read_composition` (the real role-slice parser,
+//!     `[payload]`)
+//!   - `share/permissions/<layer>/**`  → `LiveCatalog::read_layer` (parse + `validate` +
+//!     namespace/location check)
+
+// Integration tests are a separate crate, so the crate-root test exemption in
+// lib.rs does not reach them. In a test a panic on a broken fixture is the
+// intended failure mode, so the production-hazard restriction lints are allowed
+// here, mirroring lib.rs's `cfg_attr(test, ...)`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a panic on a broken fixture is the intended failure mode in tests"
+)]
+
+use std::path::{Path, PathBuf};
+
+use census::catalog::{CatalogSource, LiveCatalog};
+use census::declaration::Declaration;
+use census::rolestore::read_composition;
+
+/// The census crate root (`CARGO_MANIFEST_DIR`), so the tests find the shipped
+/// files regardless of the working directory the runner uses.
+fn repo(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+#[test]
+fn example_declaration_parses_through_real_parser() {
+    let path = repo("examples/declaration.toml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    Declaration::parse(&text).unwrap_or_else(|e| {
+        panic!(
+            "shipped {} no longer parses as a Declaration: {e}",
+            path.display()
+        )
+    });
+}
+
+#[test]
+fn example_role_slices_parse_through_real_parser() {
+    let store = repo("examples/roles");
+    let mut count = 0usize;
+    for entry in
+        std::fs::read_dir(&store).unwrap_or_else(|e| panic!("cannot read {}: {e}", store.display()))
+    {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let role = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("role slice has a file stem");
+        // `read_composition` is the exact path the binary uses: it parses the
+        // tolerant `Slice` shape and extracts the `[payload]` subset, including
+        // the `PermissionRef` one-of (bare id string vs `{id, ...params}`).
+        read_composition(&store, role).unwrap_or_else(|e| {
+            panic!(
+                "shipped role slice {} no longer parses: {e}",
+                path.display()
+            )
+        });
+        count += 1;
+    }
+    assert!(
+        count > 0,
+        "expected at least one example role slice under {}",
+        store.display()
+    );
+}
+
+#[test]
+fn packaged_catalog_layers_parse_through_real_parser() {
+    let perms = repo("share/permissions");
+    // The catalog parser keys off OS-target layer directories (`linux`,
+    // `linux-debian-12`, …). `l10n` is a sibling localization tree, NOT a
+    // permission layer, so it is deliberately excluded — feeding it to the
+    // permission parser would (correctly) fail, since its files are not
+    // PermissionDefs. `read_layer` runs the real per-file parse + `validate` +
+    // namespace/location check for every `*.toml` in the layer.
+    let catalog = LiveCatalog::new(vec![perms.clone()]);
+    let mut layers = 0usize;
+    let mut records = 0usize;
+    for entry in
+        std::fs::read_dir(&perms).unwrap_or_else(|e| panic!("cannot read {}: {e}", perms.display()))
+    {
+        let path = entry.unwrap().path();
+        if !path.is_dir() {
+            continue;
+        }
+        let layer = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if layer == "l10n" {
+            continue;
+        }
+        let defs = catalog
+            .read_layer(layer)
+            .unwrap_or_else(|e| panic!("packaged catalog layer {layer:?} no longer parses: {e}"));
+        records += defs.len();
+        layers += 1;
+    }
+    assert!(
+        layers > 0,
+        "expected at least one packaged catalog layer under {}",
+        perms.display()
+    );
+    assert!(
+        records > 0,
+        "expected at least one packaged permission record"
+    );
+}
+
+#[test]
+fn packaged_frameworks_have_a_title_for_every_control() {
+    use census::framework::{controls_missing_title, load_frameworks};
+    use census::l10n::{L10nSource, LiveL10n, DEFAULT_LOCALE};
+
+    // The shipped frameworks (cis-controls, pci-dss) must keep their structural
+    // controls.toml and their independently-edited l10n title tree in lockstep: a
+    // control with no title in ANY locale would render as the bare control id in
+    // reports. This guards against that drift on the packaged data — the same
+    // check `census framework lint` runs as a `control-missing-title` finding,
+    // here asserted to produce NOTHING on the real tree (no false positive on
+    // shipped data, and a real regression if a future edit drops a title).
+    let frameworks_root = repo("share/frameworks");
+    // A flat OS target is enough: the shipped frameworks' control SETS do not vary
+    // by layer (only os-layered *mappings* would), so any valid target loads every
+    // controls.toml.
+    let os = census::catalog::OsTarget::new("linux", "debian", Some("12".to_owned()))
+        .expect("valid os target");
+    let loaded = load_frameworks(std::slice::from_ref(&frameworks_root), &os)
+        .unwrap_or_else(|e| panic!("packaged frameworks no longer load: {e}"));
+
+    assert!(
+        !loaded.controls.is_empty(),
+        "expected at least one packaged framework with a controls.toml under {}",
+        frameworks_root.display()
+    );
+
+    for (fw, defs) in &loaded.controls {
+        if defs.is_empty() {
+            continue;
+        }
+        let dir = loaded
+            .framework_dirs
+            .get(fw)
+            .unwrap_or_else(|| panic!("loaded framework {fw} has no recorded directory"));
+        let l10n = LiveL10n::new(vec![dir.clone()]);
+        let mut locales: Vec<String> = vec![DEFAULT_LOCALE.to_owned()];
+        for loc in l10n.available_locales() {
+            if !locales.iter().any(|l| l == &loc) {
+                locales.push(loc);
+            }
+        }
+        let locale_refs: Vec<&str> = locales.iter().map(String::as_str).collect();
+        let ids: Vec<&str> = defs.keys().map(String::as_str).collect();
+        let missing = controls_missing_title(&ids, &l10n, &locale_refs);
+        assert!(
+            missing.is_empty(),
+            "packaged framework {fw} has control(s) with no title in any locale {locales:?}: {missing:?}"
+        );
+    }
+}
