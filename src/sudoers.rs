@@ -296,25 +296,45 @@ fn set_mode_0440(_path: &Path) -> Result<(), SudoersError> {
 ///
 /// When both are empty → `None` (no fragment file).
 pub fn build_sudoers_content(acct: &ResolvedAccount) -> Option<String> {
-    if !acct.sudo_commands.is_empty() {
-        let run_spec = render_runspec(&acct.sudo_commands);
+    build_account_sudoers_from_parts(&acct.name, &acct.sudo_commands, acct.sudo_role.as_deref())
+}
+
+/// Render an account's `census-<name>` fragment from the exact fields the
+/// fragment depends on — the login name, the concrete sudo commands, and the raw
+/// `sudo_role` escape hatch — rather than a whole [`ResolvedAccount`].
+///
+/// This is the single rendering path [`build_sudoers_content`] delegates to. It
+/// is factored out so a CALLER that only has the persisted managed record (which
+/// carries `name`/`sudo_commands`/`sudo_role` but not the identity fields a
+/// resolved account has) can render the SAME fragment the resolved target would
+/// produce — letting `plan --diff` compute a fragment diff (current managed →
+/// target) without fabricating a dummy `ResolvedAccount`. The rendered bytes are
+/// identical to the resolved path: same renderer, same escaping, same NOPASSWD
+/// rationale, so the diff reflects exactly what apply would write.
+pub fn build_account_sudoers_from_parts(
+    name: &str,
+    sudo_commands: &[crate::model::SudoCommand],
+    sudo_role: Option<&str>,
+) -> Option<String> {
+    if !sudo_commands.is_empty() {
+        let run_spec = render_runspec(sudo_commands);
         return Some(format!(
             "# Managed by Census — role {role}. Do not edit by hand.\n\
              # Concrete commands expanded from the role's permissions.\n\
              # NOPASSWD: role accounts have locked passwords (no password to prompt).\n\
              {user} ALL={run_spec}\n",
-            role = acct.name,
-            user = acct.name,
+            role = name,
+            user = name,
         ));
     }
 
-    let sudo_role = acct.sudo_role.as_ref()?;
+    let sudo_role = sudo_role?;
     Some(format!(
         "# Managed by Census — role {role}. Do not edit by hand.\n\
          # Command set is the site-provisioned Cmnd_Alias {alias}.\n\
          {user} ALL=(ALL) {alias}\n",
-        role = acct.name,
-        user = acct.name,
+        role = name,
+        user = name,
         alias = sudo_role_alias(sudo_role),
     ))
 }
@@ -340,10 +360,24 @@ pub fn build_sudoers_content(acct: &ResolvedAccount) -> Option<String> {
 /// `sudo_role`. Each command is run through [`escape_sudoers_command`] so a
 /// metacharacter can neither split the list nor act as a runas/negation directive.
 pub fn build_group_sudoers_content(group: &ResolvedGroup) -> Option<String> {
-    if group.sudo_commands.is_empty() {
+    build_group_sudoers_from_parts(&group.name, &group.sudo_commands)
+}
+
+/// Render a group's `census-grp-<group>` `%group` fragment from just the group
+/// name and its concrete sudo commands. The single rendering path
+/// [`build_group_sudoers_content`] delegates to, factored out for the same reason
+/// as [`build_account_sudoers_from_parts`]: `plan --diff` can render the fragment
+/// from the persisted managed group record (current) and the resolved group
+/// (target) through one renderer, so the diff shows exactly what apply would
+/// write, runas and all.
+pub fn build_group_sudoers_from_parts(
+    name: &str,
+    sudo_commands: &[crate::model::SudoCommand],
+) -> Option<String> {
+    if sudo_commands.is_empty() {
         return None;
     }
-    let run_spec = render_runspec(&group.sudo_commands);
+    let run_spec = render_runspec(sudo_commands);
     Some(format!(
         "# Managed by Census — group {group}. Do not edit by hand.\n\
          # Concrete commands expanded from the bound roles' permissions.\n\
@@ -351,7 +385,7 @@ pub fn build_group_sudoers_content(group: &ResolvedGroup) -> Option<String> {
          # including LDAP nested-group members resolved behind the group name.\n\
          # NOPASSWD: a managed group sudo grant is not an interactive re-auth point.\n\
          %{group} ALL={run_spec}\n",
-        group = group.name,
+        group = name,
     ))
 }
 

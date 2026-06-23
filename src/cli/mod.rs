@@ -19,6 +19,7 @@ mod compile;
 mod coverage;
 mod framework;
 mod lint;
+mod plandiff;
 mod render;
 
 #[cfg(test)]
@@ -152,11 +153,21 @@ pub fn render_plan(p: &plan::Plan) -> String {
 /// Run `census plan`: parse declaration, resolve against role-store (expanding
 /// permissions against the catalog), diff vs managed registry, print the plan.
 /// Returns a non-zero exit on any error.
+///
+/// With `diff` set (`--diff`), the terse account-level summary is replaced by an
+/// artifact preview: for each mutation, a unified diff of the sudoers fragment
+/// Census would write (current managed → resolved target — so the run-as,
+/// `(bfs_solutions)` vs `(ALL)`, is visible), the target file path, and the
+/// file-access ACL grant delta. The preview is pure — it renders the artifacts
+/// from managed state and the resolved target, reading no filesystem and needing
+/// no root (disk-vs-managed drift is `doctor`'s job). The operator can therefore
+/// see WHAT and HOW a privileged `apply` would change before running it.
 pub fn run_plan(
     declaration: &Path,
     managed: &Path,
     catalog_roots: Vec<PathBuf>,
     os_target: Option<&str>,
+    diff: bool,
 ) -> ExitCode {
     let text = match std::fs::read_to_string(declaration) {
         Ok(t) => t,
@@ -231,6 +242,52 @@ pub fn run_plan(
             return ExitCode::FAILURE;
         }
     }
+
+    if diff {
+        // Artifact preview. The `%group` sudoers/ACL fragments come from the
+        // declaration-driven group resolution (which carries each group's grants),
+        // not the membership-driven existence path already on `p`. Resolve the
+        // groups and their grant-bearing actions so the diff can render the
+        // `census-grp-<group>` fragments; a resolve failure here aborts before any
+        // apply (fail-closed), consistent with the rest of plan.
+        let (resolved_groups, group_actions) = match model::resolve_groups(
+            &decl,
+            &CompileInputs {
+                catalog: &catalog,
+                os: &os,
+                ctx: &ctx,
+            },
+        ) {
+            Ok((groups, warnings)) => {
+                for w in &warnings {
+                    eprintln!("census: warning: {w}");
+                }
+                let actions = plan::diff_resolved_groups(&groups, &state.managed_groups());
+                (groups, actions)
+            }
+            Err(e) => {
+                eprintln!("census: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // Render the artifact diff over the declaration-driven group actions (the
+        // grant-bearing ones); the account actions stay as computed above.
+        let diff_plan = plan::Plan {
+            actions: p.actions.clone(),
+            group_actions,
+        };
+        print!(
+            "{}",
+            plandiff::render_plan_diff(
+                &diff_plan,
+                &state.managed_accounts(),
+                &state.managed_groups(),
+                &resolved_groups,
+            )
+        );
+        return ExitCode::SUCCESS;
+    }
+
     print!("{}", render_plan(&p));
     ExitCode::SUCCESS
 }

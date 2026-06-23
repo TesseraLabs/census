@@ -334,6 +334,16 @@ fn sourced(value: &str, layer: &str, via: Option<&str>) -> SourcedPrimitive {
     }
 }
 
+/// A sourced sudo primitive narrowed to a service account (run-spec set).
+fn sourced_runas(value: &str, layer: &str, runas: &str) -> SourcedPrimitive {
+    SourcedPrimitive {
+        value: value.to_owned(),
+        layer: layer.to_owned(),
+        via: None,
+        runas: Some(runas.to_owned()),
+    }
+}
+
 fn compiled_perm(
     id: &str,
     risk: Option<Risk>,
@@ -469,6 +479,92 @@ fn render_compile_json_is_well_formed_shape() {
     assert!(json.contains("\"via\":null"), "{json}");
     assert!(json.contains("\"nofile\":1024"), "{json}");
     assert!(json.contains("\"nproc\":null"), "{json}");
+}
+
+// ---- runas in compile output (operator visibility) ----
+
+#[test]
+fn render_compile_human_shows_runas_on_service_account_command() {
+    // A command narrowed to a service account must show `(runas <acct>)` next to
+    // it so the operator can see it does not run as root.
+    let compiled = CompiledRole {
+        role: "oper".to_owned(),
+        permissions: vec![compiled_perm(
+            "svc-tool",
+            None,
+            vec![],
+            vec![sourced_runas("/opt/QToolplus", "linux", "bfs_solutions")],
+        )],
+        raw_groups: vec![],
+        raw_sudo_role: None,
+        raw_limits: Limits::default(),
+    };
+    let text = render_compile_human(&compiled);
+    assert!(
+        text.contains("/opt/QToolplus (runas bfs_solutions) [perm svc-tool @ linux]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn render_compile_human_omits_runas_for_root_command() {
+    // The default (root) run-spec stays clean — no `(runas ...)` clutter.
+    let compiled = CompiledRole {
+        role: "oper".to_owned(),
+        permissions: vec![compiled_perm(
+            "net-admin",
+            None,
+            vec![],
+            vec![sourced("/usr/sbin/ip", "linux", None)],
+        )],
+        raw_groups: vec![],
+        raw_sudo_role: None,
+        raw_limits: Limits::default(),
+    };
+    let text = render_compile_human(&compiled);
+    assert!(
+        text.contains("/usr/sbin/ip [perm net-admin @ linux]"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("runas"),
+        "root command must not mention runas: {text}"
+    );
+}
+
+#[test]
+fn render_compile_json_emits_runas_field_on_sudo_entries() {
+    // The sudo entry carries a `"runas"` field: the service account when narrowed,
+    // `null` for a root command. Groups never gain the field.
+    let compiled = CompiledRole {
+        role: "oper".to_owned(),
+        permissions: vec![compiled_perm(
+            "svc-tool",
+            None,
+            vec![sourced("netdev", "linux", None)],
+            vec![
+                sourced_runas("/opt/QToolplus", "linux", "bfs_solutions"),
+                sourced("/usr/sbin/ip", "linux", None),
+            ],
+        )],
+        raw_groups: vec![],
+        raw_sudo_role: None,
+        raw_limits: Limits::default(),
+    };
+    let json = render_compile_json(&compiled);
+    assert!(
+        json.contains(r#""value":"/opt/QToolplus","permission":"svc-tool","layer":"linux","via":null,"runas":"bfs_solutions""#),
+        "narrowed command must carry its runas: {json}"
+    );
+    assert!(
+        json.contains(r#""value":"/usr/sbin/ip","permission":"svc-tool","layer":"linux","via":null,"runas":null"#),
+        "root command must carry runas:null: {json}"
+    );
+    // The groups array entry must NOT gain a runas key.
+    assert!(
+        json.contains(r#""value":"netdev","permission":"svc-tool","layer":"linux","via":null}"#),
+        "groups entry must stay runas-free: {json}"
+    );
 }
 
 // ---- file-grant rendering (slice 5) ----

@@ -51,11 +51,13 @@ fn main() -> std::process::ExitCode {
             managed,
             catalog_dir,
             os_target,
+            diff,
         } => census::cli::run_plan(
             &declaration,
             &managed,
             catalog_roots_with_overrides(catalog_dir),
             os_target.as_deref(),
+            diff,
         ),
         Command::Apply {
             declaration,

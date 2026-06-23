@@ -156,6 +156,14 @@ pub struct FlatPrimitive {
     pub layer: Option<String>,
     /// For a bundle member, the member id that declared it (from `via`).
     pub via: Option<String>,
+    /// For a **sudo** primitive: the account the command runs *as*, or `None` for
+    /// the default `(ALL)` (root) run-spec. Carried so the operator can see — in
+    /// `compile`/`show` — that a command runs as a service account rather than
+    /// root BEFORE it is ever applied. A wrong run-spec silently hands out a root
+    /// shell where only "be this service account for one command" was intended,
+    /// so the run-as is part of what must be previewable. Always `None` for a
+    /// group primitive (a membership has no run-spec).
+    pub runas: Option<String>,
 }
 
 impl FlatPrimitive {
@@ -165,6 +173,7 @@ impl FlatPrimitive {
             permission: None,
             layer: None,
             via: None,
+            runas: None,
         }
     }
 
@@ -177,6 +186,20 @@ impl FlatPrimitive {
             permission: Some(permission.to_owned()),
             layer: Some(p.layer.clone()),
             via: p.via.clone(),
+            // The run-as travels with the primitive (a sudo command keeps the
+            // run-spec of the permission that declared it through a bundle union);
+            // for a group primitive this is always `None`.
+            runas: p.runas.clone(),
+        }
+    }
+
+    /// The run-as suffix for the human sudo view: ` (runas <acct>)` when the
+    /// command is narrowed to a service account, empty for the default root
+    /// run-spec. Kept off the common (root) case so the output stays uncluttered.
+    fn runas_suffix(&self) -> String {
+        match &self.runas {
+            Some(acct) => format!(" (runas {acct})"),
+            None => String::new(),
         }
     }
 
@@ -299,7 +322,15 @@ pub fn render_compile_human(compiled: &CompiledRole) -> String {
         }
     } else {
         for s in &sudo {
-            out.push_str(&format!("  {}{}\n", s.value, s.provenance()));
+            // Run-as before provenance: the operator reads what privilege the
+            // command grants (e.g. runs as `bfs_solutions`, not root) next to the
+            // command, then where it came from.
+            out.push_str(&format!(
+                "  {}{}{}\n",
+                s.value,
+                s.runas_suffix(),
+                s.provenance()
+            ));
         }
     }
 
@@ -352,7 +383,7 @@ pub fn render_compile_json(compiled: &CompiledRole) -> String {
     out.push_str("],");
 
     out.push_str("\"sudo\":[");
-    out.push_str(&flat_primitives_json(&compiled.flat_sudo()));
+    out.push_str(&flat_sudo_json(&compiled.flat_sudo()));
     out.push_str("],");
 
     out.push_str("\"file_grants\":[");
@@ -378,7 +409,8 @@ pub fn render_compile_json(compiled: &CompiledRole) -> String {
     out
 }
 
-/// Render a list of flat primitives as JSON objects.
+/// Render a list of flat primitives as JSON objects (groups: no run-spec). The
+/// sudo array uses [`flat_sudo_json`] instead, which adds a `"runas"` field.
 fn flat_primitives_json(prims: &[FlatPrimitive]) -> String {
     prims
         .iter()
@@ -395,6 +427,41 @@ fn flat_primitives_json(prims: &[FlatPrimitive]) -> String {
                     .map(json_str)
                     .unwrap_or_else(|| "null".to_owned()),
                 p.via
+                    .as_deref()
+                    .map(json_str)
+                    .unwrap_or_else(|| "null".to_owned()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Render the sudo array as JSON objects, identical to [`flat_primitives_json`]
+/// plus a `"runas"` field naming the service account a command runs as (`null`
+/// for the default root run-spec). The run-as is on the sudo entry only — a
+/// machine consumer must be able to tell a command that grants a service-account
+/// shell from one that grants root without re-deriving it from the sudoers file,
+/// and `null` keeps the common (root) case unambiguous rather than absent.
+fn flat_sudo_json(prims: &[FlatPrimitive]) -> String {
+    prims
+        .iter()
+        .map(|p| {
+            format!(
+                "{{\"value\":{},\"permission\":{},\"layer\":{},\"via\":{},\"runas\":{}}}",
+                json_str(&p.value),
+                p.permission
+                    .as_deref()
+                    .map(json_str)
+                    .unwrap_or_else(|| "null".to_owned()),
+                p.layer
+                    .as_deref()
+                    .map(json_str)
+                    .unwrap_or_else(|| "null".to_owned()),
+                p.via
+                    .as_deref()
+                    .map(json_str)
+                    .unwrap_or_else(|| "null".to_owned()),
+                p.runas
                     .as_deref()
                     .map(json_str)
                     .unwrap_or_else(|| "null".to_owned()),
@@ -888,9 +955,17 @@ pub fn render_show_tree(compiled: &CompiledRole, lang: &str, l10n: &dyn L10nSour
             ));
         }
         for s in &r.sudo {
+            // Surface the run-as next to the command (e.g. `(runas bfs_solutions)`)
+            // so the show tree previews that a command grants a service-account
+            // shell, not root; omitted for the default root run-spec.
+            let runas = match &s.runas {
+                Some(acct) => format!(" (runas {acct})"),
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "    sudo {}{}\n",
+                "    sudo {}{}{}\n",
                 s.value,
+                runas,
                 via_suffix(&r.id, &s.via)
             ));
         }

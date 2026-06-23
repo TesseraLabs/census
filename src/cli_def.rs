@@ -42,6 +42,12 @@ pub enum Command {
         /// `linux-debian-12`); autodetected from /etc/os-release if absent.
         #[arg(long)]
         os_target: Option<String>,
+        /// Show the concrete artifacts each change would write as a unified diff:
+        /// the sudoers fragment (run-as included), its target file path, and the
+        /// file-access ACL grant delta — current managed state vs the resolved
+        /// target. Read-only; no filesystem read, no root.
+        #[arg(long)]
+        diff: bool,
     },
     /// Apply the plan: materialize accounts via shadow-utils (requires root).
     Apply {

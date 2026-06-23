@@ -569,6 +569,15 @@
           "num_args": null
         },
         {
+          "id": "diff",
+          "long": "diff",
+          "takes_value": false,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
           "id": "managed",
           "long": "managed",
           "takes_value": true,
