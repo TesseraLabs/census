@@ -471,6 +471,15 @@
               "num_args": null
             },
             {
+              "id": "lang",
+              "long": "lang",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
               "id": "os_target",
               "long": "os-target",
               "takes_value": true,
@@ -509,6 +518,15 @@
               "long": null,
               "takes_value": true,
               "required": true,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "lang",
+              "long": "lang",
+              "takes_value": true,
+              "required": false,
               "default": null,
               "repeatable": false,
               "num_args": null

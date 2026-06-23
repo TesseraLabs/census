@@ -15,8 +15,21 @@ use std::process::ExitCode;
 use crate::catalog::CatalogSource;
 use crate::cli::detect_os_target;
 use crate::cli::render::json_str;
-use crate::framework::{self, LoadedFrameworks};
+use crate::framework::{self, resolve_control_title, LoadedFrameworks};
+use crate::l10n;
 use crate::LiveCatalog;
+
+/// Resolve the display locale for a framework report from an explicit `--lang`
+/// plus the environment, mirroring `census show --lang`/`compile`'s selection:
+/// explicit `--lang` → `LC_MESSAGES` → `LANG` → `en`. The real environment is
+/// read here (the pure [`l10n::lang_from_env`] picker stays testable); control
+/// titles then resolve through the framework l10n tree with the standard
+/// `locale → en → id` fallback.
+fn display_locale(lang: Option<&str>) -> String {
+    let lc_messages = std::env::var("LC_MESSAGES").ok();
+    let env_lang = std::env::var("LANG").ok();
+    l10n::lang_from_env(lang, lc_messages.as_deref(), env_lang.as_deref())
+}
 
 /// Load the framework tree for a `framework` subcommand: resolve the OS target
 /// (for os-layered frameworks) and call `load_frameworks`. Emits forward-compat
@@ -252,6 +265,7 @@ pub fn run_framework_show(
     fw: &str,
     framework_roots: Vec<PathBuf>,
     os_target: Option<String>,
+    lang: Option<String>,
     json: bool,
 ) -> ExitCode {
     let loaded = match load_frameworks_for_cli(&framework_roots, os_target) {
@@ -262,10 +276,11 @@ pub fn run_framework_show(
         eprintln!("census: framework {fw} not installed");
         return ExitCode::FAILURE;
     }
+    let locale = display_locale(lang.as_deref());
     if json {
-        print!("{}", render_framework_show_json(fw, &loaded));
+        print!("{}", render_framework_show_json(fw, &loaded, &locale));
     } else {
-        print!("{}", render_framework_show_human(fw, &loaded));
+        print!("{}", render_framework_show_human(fw, &loaded, &locale));
     }
     ExitCode::SUCCESS
 }
@@ -307,8 +322,12 @@ fn owned_coverage_stats(loaded: &LoadedFrameworks, fw: &str) -> OwnedCoverageSta
 
 /// Render `framework show` (human form): the version stamp, every control
 /// definition (id, owned flag, optional domain, title), and the owned-coverage
-/// statistics line. Pure / unit-testable.
-pub fn render_framework_show_human(fw: &str, loaded: &LoadedFrameworks) -> String {
+/// statistics line. Control titles are resolved from the framework l10n tree for
+/// `locale` (fallback `locale → en → id`), since the structural [`ControlDef`]
+/// carries no title. Pure / unit-testable.
+///
+/// [`ControlDef`]: framework::ControlDef
+pub fn render_framework_show_human(fw: &str, loaded: &LoadedFrameworks, locale: &str) -> String {
     let mut out = String::new();
     // Caller guarantees the framework is loaded; fall back gracefully regardless.
     let version = loaded
@@ -333,10 +352,8 @@ pub fn render_framework_show_human(fw: &str, loaded: &LoadedFrameworks) -> Strin
                 } else {
                     "uncovered"
                 };
-                out.push_str(&format!(
-                    "  {id} [{owned}] [{cov}]{domain} — {}\n",
-                    def.title
-                ));
+                let title = resolve_control_title(loaded, fw, id, locale);
+                out.push_str(&format!("  {id} [{owned}] [{cov}]{domain} — {title}\n"));
             }
         }
         _ => out.push_str("  (no control definitions)\n"),
@@ -351,8 +368,9 @@ pub fn render_framework_show_human(fw: &str, loaded: &LoadedFrameworks) -> Strin
 
 /// Render `framework show` as JSON (hand-rolled). Includes the id+version stamp,
 /// a `controls` array (id/title/owned/domain/covered) and a `coverage` object
-/// with owned totals. Pure / unit-testable.
-pub fn render_framework_show_json(fw: &str, loaded: &LoadedFrameworks) -> String {
+/// with owned totals. The `title` is resolved from the framework l10n tree for
+/// `locale` (fallback `locale → en → id`). Pure / unit-testable.
+pub fn render_framework_show_json(fw: &str, loaded: &LoadedFrameworks, locale: &str) -> String {
     let version = loaded
         .frameworks
         .get(fw)
@@ -369,10 +387,11 @@ pub fn render_framework_show_json(fw: &str, loaded: &LoadedFrameworks) -> String
         .map(|defs| {
             defs.iter()
                 .map(|(id, def)| {
+                    let title = resolve_control_title(loaded, fw, id, locale);
                     format!(
                         "{{\"id\":{},\"title\":{},\"owned\":{},\"domain\":{},\"covered\":{}}}",
                         json_str(id),
-                        json_str(&def.title),
+                        json_str(&title),
                         def.owned,
                         def.domain
                             .as_deref()
@@ -571,6 +590,7 @@ pub fn run_framework_risk(
     fw: &str,
     framework_roots: Vec<PathBuf>,
     os_target: Option<String>,
+    lang: Option<String>,
     json: bool,
 ) -> ExitCode {
     let loaded = match load_frameworks_for_cli(&framework_roots, os_target) {
@@ -582,21 +602,27 @@ pub fn run_framework_risk(
         return ExitCode::FAILURE;
     }
     let risk = compute_framework_risk(&loaded, fw);
+    let locale = display_locale(lang.as_deref());
     if json {
         print!("{}", render_framework_risk_json(fw, &loaded, &risk));
     } else {
-        print!("{}", render_framework_risk_human(fw, &loaded, &risk));
+        print!(
+            "{}",
+            render_framework_risk_human(fw, &loaded, &risk, &locale)
+        );
     }
     ExitCode::SUCCESS
 }
 
 /// Render `framework risk` (human form): the version stamp, then each control
-/// under threat with its title (when defined), an out-of-domain marker when the
+/// under threat with its title (resolved from the framework l10n tree for
+/// `locale`, fallback `locale → en → id`), an out-of-domain marker when the
 /// control is `owned = false`, and the threatening permissions. Pure.
 pub fn render_framework_risk_human(
     fw: &str,
     loaded: &LoadedFrameworks,
     risk: &FrameworkRisk,
+    locale: &str,
 ) -> String {
     let version = loaded
         .frameworks
@@ -617,7 +643,13 @@ pub fn render_framework_risk_human(
             Some(d) if !d.owned => " [out-of-domain]",
             _ => "",
         };
-        let title = def.map(|d| format!(" — {}", d.title)).unwrap_or_default();
+        // Title from the framework l10n tree, but only for a defined control (an
+        // undefined control has no declared scope to name — keep the bare id).
+        let title = if def.is_some() {
+            format!(" — {}", resolve_control_title(loaded, fw, ctrl, locale))
+        } else {
+            String::new()
+        };
         out.push_str(&format!("  ⚠ {ctrl}{domain}{title}\n"));
         out.push_str(&format!("    threatened by: {}\n", perms.join(", ")));
     }

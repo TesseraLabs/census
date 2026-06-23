@@ -204,11 +204,13 @@ fn main() -> std::process::ExitCode {
                 fw,
                 framework_dir,
                 os_target,
+                lang,
                 format,
             } => census::cli::run_framework_show(
                 &fw,
                 framework_roots_with_overrides(framework_dir),
                 os_target,
+                lang,
                 format.as_deref() == Some("json"),
             ),
             FrameworkSub::Coverage {
@@ -226,11 +228,13 @@ fn main() -> std::process::ExitCode {
                 fw,
                 framework_dir,
                 os_target,
+                lang,
                 format,
             } => census::cli::run_framework_risk(
                 &fw,
                 framework_roots_with_overrides(framework_dir),
                 os_target,
+                lang,
                 format.as_deref() == Some("json"),
             ),
             FrameworkSub::Lint {

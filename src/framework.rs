@@ -3,7 +3,12 @@
 //!
 //! A *framework* (e.g. `pci-dss`) ships a small tree under a framework root:
 //! a `framework.toml` manifest, a `mappings/` tree (`permission-id → [control-id]`),
-//! and an optional `controls.toml` describing each control. Census loads these
+//! an optional structural `controls.toml` (`control-id → { owned, domain? }`), and
+//! an l10n tree (`l10n/<locale>/controls.toml`) carrying the control *titles*.
+//! Control titles live in l10n — never inline in `controls.toml` — so the
+//! structural compliance file stays free of human-readable (and copyrighted) text
+//! and a translator contributes wording without touching compliance structure,
+//! exactly as permission text lives in the catalog's l10n tree. Census loads these
 //! into two indices — forward (`permission → framework → PolarControls`) and a
 //! polarity-keyed reverse (`polarity → framework → control → permissions`) — so a
 //! reviewer can ask "which controls does this grant satisfy" and "which grants
@@ -227,19 +232,28 @@ fn merge_mappings(
     }
 }
 
-/// A control definition from a framework's `controls.toml`, parsed strictly.
+/// A control definition from a framework's `controls.toml` — purely
+/// **structural**, parsed strictly.
 ///
-/// `controls.toml` is a TOML table of `control-id → { title, owned, domain? }`.
+/// `controls.toml` is a TOML table of `control-id → { owned, domain? }`. It
+/// carries **no human-readable text**: the control's title lives in the
+/// framework's l10n tree (`<fw>/l10n/<locale>/controls.toml`, keyed by control
+/// id), exactly as permission text lives in the catalog's l10n tree. Keeping the
+/// structural compliance facts (which controls exist, who owns them, how they
+/// group) separate from their wording means a community translator contributes a
+/// title — or a new language — by touching only a language file, never the
+/// compliance structure a reviewer signs off on; and the structural file stays
+/// free of copyrighted source wording.
+///
 /// `owned` is **required** (no serde default): whether the *organisation* owns
 /// this control (vs. it being inherited from a provider) is a material compliance
 /// fact a reviewer must state explicitly, so an omitted `owned` is a parse error,
-/// not a silent `false`. `deny_unknown_fields` guards against field typos.
+/// not a silent `false`. `deny_unknown_fields` guards against field typos —
+/// including a stray `title`, which now belongs in the l10n tree, not here.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ControlDef {
-    /// Human-readable control title.
-    pub title: String,
     /// Whether the organisation owns this control (required — see type docs).
     pub owned: bool,
     /// Optional grouping domain (e.g. "Access Control"). Absent → `None`.
@@ -252,6 +266,37 @@ pub struct ControlDef {
 /// iteration is deterministic (stable report output, reproducible tests).
 pub fn parse_controls(text: &str) -> Result<BTreeMap<String, ControlDef>, toml::de::Error> {
     toml::from_str::<BTreeMap<String, ControlDef>>(text)
+}
+
+/// Resolve a control's display title for `locale`, with the same fallback chain
+/// the permission catalog uses for its text: `locale → en → the bare id`.
+///
+/// The structural [`ControlDef`] carries no title — titles live in the framework's
+/// l10n tree (`<fw_dir>/l10n/<locale>/controls.toml`, keyed by control id). This
+/// reuses the catalog's l10n machinery verbatim: a [`crate::l10n::LiveL10n`]
+/// rooted at the framework's own directory reads `<fw_dir>/l10n/<locale>/*.toml`
+/// exactly as the catalog reads `<root>/l10n/<locale>/*.toml`, and
+/// [`crate::l10n::resolve_text`] applies the `locale → en → id` fallback. An
+/// unresolved id therefore degrades to the bare control-id string, so a report
+/// always has a label even with no translation installed.
+///
+/// `fw` must be a loaded framework (its directory was captured in
+/// [`LoadedFrameworks::framework_dirs`]); an unknown `fw` yields the bare `id`.
+pub fn resolve_control_title(
+    loaded: &LoadedFrameworks,
+    fw: &str,
+    id: &str,
+    locale: &str,
+) -> String {
+    match loaded.framework_dirs.get(fw) {
+        Some(dir) => {
+            let l10n = crate::l10n::LiveL10n::new(vec![dir.clone()]);
+            crate::l10n::resolve_text(&l10n, locale, id).title
+        }
+        // No directory recorded (framework not loaded) → the id is the only honest
+        // label, matching the l10n fallback's last resort.
+        None => id.to_owned(),
+    }
 }
 
 /// Hard errors loading the framework cross-reference tree.
@@ -350,6 +395,12 @@ pub struct LoadedFrameworks {
     pub reverse: BTreeMap<Polarity, BTreeMap<String, BTreeMap<String, Vec<String>>>>,
     /// Control definitions per framework: `framework-id → control-id → ControlDef`.
     pub controls: BTreeMap<String, BTreeMap<String, ControlDef>>,
+    /// The on-disk directory each loaded framework was read from
+    /// (`framework-id → <root>/<fw>`). Retained so the report layer can resolve
+    /// control titles from the framework's own l10n tree
+    /// (`<dir>/l10n/<locale>/controls.toml`) via the catalog's l10n machinery —
+    /// the structural [`ControlDef`] no longer carries a title.
+    pub framework_dirs: BTreeMap<String, PathBuf>,
     /// Raw per-contribution mappings with provenance (pre-union; see
     /// [`LoadedMapping`]).
     pub mappings: Vec<LoadedMapping>,
@@ -868,6 +919,10 @@ fn load_one_framework(
         out.controls.insert(fw_id.clone(), defs);
     }
 
+    // Record the framework's directory so the report layer can resolve control
+    // titles from `<fw_dir>/l10n/<locale>/controls.toml` (the structural ControlDef
+    // carries no title).
+    out.framework_dirs.insert(fw_id.clone(), fw_dir.to_owned());
     out.frameworks.insert(fw_id, manifest);
     Ok(())
 }
@@ -933,7 +988,6 @@ mod tests {
 
     fn ctl() -> ControlDef {
         ControlDef {
-            title: "t".into(),
             owned: true,
             domain: None,
         }
@@ -1069,26 +1123,24 @@ bogus = "nope"
     fn parse_controls_missing_owned_is_error() {
         // `owned` is required (no serde default): omitting it is a material
         // compliance fact left unstated → parse error.
-        let err = parse_controls("[\"1.1\"]\ntitle = \"Install a firewall\"\n");
+        let err = parse_controls("[\"1.1\"]\ndomain = \"Network Security\"\n");
         assert!(err.is_err(), "missing `owned` must be a parse error");
     }
 
     #[test]
     fn parse_controls_valid_with_owned_and_optional_domain() {
+        // `controls.toml` is structural only: owned + optional domain, no title.
         let defs = parse_controls(
             r#"
 ["1.1"]
-title = "Install a firewall"
 owned = true
 domain = "Network Security"
 
 ["1.2"]
-title = "Inherited control"
 owned = false
 "#,
         )
         .unwrap();
-        assert_eq!(defs["1.1"].title, "Install a firewall");
         assert!(defs["1.1"].owned);
         assert_eq!(defs["1.1"].domain.as_deref(), Some("Network Security"));
         assert!(!defs["1.2"].owned);
@@ -1096,8 +1148,17 @@ owned = false
     }
 
     #[test]
+    fn parse_controls_title_is_rejected_as_unknown_field() {
+        // A title in the structural file is the exact mistake the l10n split
+        // forbids: titles belong in `l10n/<locale>/controls.toml`, not here.
+        // `deny_unknown_fields` makes a stray `title` a hard parse error.
+        let err = parse_controls("[\"1.1\"]\nowned = true\ntitle = \"Install a firewall\"\n");
+        assert!(err.is_err(), "a `title` in controls.toml must be rejected");
+    }
+
+    #[test]
     fn parse_controls_unknown_field_rejected() {
-        let err = parse_controls("[\"1.1\"]\ntitle = \"X\"\nowned = true\nbogus = 1\n");
+        let err = parse_controls("[\"1.1\"]\nowned = true\nbogus = 1\n");
         assert!(err.is_err(), "unknown control field must be rejected");
     }
 
@@ -1134,16 +1195,12 @@ provides = ["crossref", "controls"]
             "pci-dss/controls.toml",
             r#"
 ["1.1"]
-title = "Firewall config"
 owned = true
 ["1.2"]
-title = "Default deny"
 owned = true
 ["2.1"]
-title = "No vendor defaults"
 owned = false
 ["10.1"]
-title = "Audit logging"
 owned = true
 "#,
         );
@@ -1478,11 +1535,7 @@ provides = ["crossref", "controls"]
             "pci-dss/mappings/a.toml",
             "[ghost-perm]\nsatisfies = [\"1.1\"]\n",
         );
-        write_file(
-            root,
-            "pci-dss/controls.toml",
-            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
-        );
+        write_file(root, "pci-dss/controls.toml", "[\"1.1\"]\nowned = true\n");
 
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::new();
@@ -1537,11 +1590,7 @@ provides = ["crossref"]
             "fw-b/mappings/b.toml",
             "[perm-b]\nsatisfies = [\"1.1\"]\n",
         );
-        write_file(
-            root,
-            "fw-b/controls.toml",
-            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
-        );
+        write_file(root, "fw-b/controls.toml", "[\"1.1\"]\nowned = true\n");
         write_file(
             root,
             "fw-c/framework.toml",
@@ -1558,11 +1607,7 @@ provides = ["controls"]
             "fw-c/mappings/c.toml",
             "[perm-c]\nsatisfies = [\"1.1\"]\n",
         );
-        write_file(
-            root,
-            "fw-c/controls.toml",
-            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
-        );
+        write_file(root, "fw-c/controls.toml", "[\"1.1\"]\nowned = true\n");
 
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::from([
@@ -1609,11 +1654,7 @@ provides = ["crossref", "controls"]
             "pci-dss/mappings/a.toml",
             "[network-admin]\nsatisfies = [\"9.9\", \"1.1\"]\n",
         );
-        write_file(
-            root,
-            "pci-dss/controls.toml",
-            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
-        );
+        write_file(root, "pci-dss/controls.toml", "[\"1.1\"]\nowned = true\n");
 
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::from(["network-admin".to_owned()]);
@@ -1695,11 +1736,7 @@ provides = ["crossref", "controls"]
             "pci-dss/mappings/a.toml",
             "[network-admin]\nsatisfies = [\"1.1\"]\n",
         );
-        write_file(
-            root,
-            "pci-dss/controls.toml",
-            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
-        );
+        write_file(root, "pci-dss/controls.toml", "[\"1.1\"]\nowned = true\n");
 
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::from(["network-admin".to_owned()]);
@@ -1721,11 +1758,7 @@ provides = ["crossref", "controls"]
             "pci-dss/mappings/a.toml",
             "[bad-perm]\nsatisfies = [\"C.1\"]\nrisk = [\"C.1\"]\n",
         );
-        write_file(
-            root,
-            "pci-dss/controls.toml",
-            "[\"C.1\"]\ntitle = \"Control\"\nowned = true\n",
-        );
+        write_file(root, "pci-dss/controls.toml", "[\"C.1\"]\nowned = true\n");
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::from(["bad-perm".to_owned()]);
         let findings = lint_loaded(&loaded, &known_permission_ids);
@@ -1767,6 +1800,83 @@ provides = ["crossref", "controls"]
             orphaned.iter().any(|f| f.message.contains("related-only")),
             "{:?}",
             orphaned
+        );
+    }
+
+    // --- SLICE: control-title l10n resolution ---
+
+    /// Materialize a flat `pci-dss` framework whose `controls.toml` is structural
+    /// (no title) and whose control titles live in the framework l10n tree under
+    /// `l10n/{ru,en}/controls.toml`. Returns the loaded set over a flat OS target.
+    fn fw_with_control_l10n(root: &Path) {
+        write_file(
+            root,
+            "pci-dss/framework.toml",
+            "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI DSS\"\ndimension = \"flat\"\nprovides = [\"crossref\", \"controls\"]\n",
+        );
+        write_file(
+            root,
+            "pci-dss/mappings/a.toml",
+            "[network-admin]\nsatisfies = [\"7.2.2\"]\n",
+        );
+        // Structural only: owned, no title.
+        write_file(
+            root,
+            "pci-dss/controls.toml",
+            "[\"7.2.2\"]\nowned = true\n[\"7.2.4\"]\nowned = true\n",
+        );
+        // Titles live in the framework l10n tree, keyed by control id. ru has a
+        // title for 7.2.2 only; en has 7.2.2; neither defines 7.2.4.
+        write_file(
+            root,
+            "pci-dss/l10n/ru/controls.toml",
+            "[\"7.2.2\"]\ntitle = \"Наименьшие привилегии\"\n",
+        );
+        write_file(
+            root,
+            "pci-dss/l10n/en/controls.toml",
+            "[\"7.2.2\"]\ntitle = \"Least privilege\"\n",
+        );
+    }
+
+    #[test]
+    fn control_title_resolves_from_requested_locale() {
+        let tmp = tempfile::tempdir().unwrap();
+        fw_with_control_l10n(tmp.path());
+        let loaded = load_frameworks(&[tmp.path().to_path_buf()], &flat_os()).unwrap();
+        // ru is present → the Russian title wins.
+        assert_eq!(
+            resolve_control_title(&loaded, "pci-dss", "7.2.2", "ru"),
+            "Наименьшие привилегии"
+        );
+    }
+
+    #[test]
+    fn control_title_falls_back_to_en_when_locale_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fw_with_control_l10n(tmp.path());
+        let loaded = load_frameworks(&[tmp.path().to_path_buf()], &flat_os()).unwrap();
+        // zh has no l10n dir → fall back to en (mirrors the catalog's chain).
+        assert_eq!(
+            resolve_control_title(&loaded, "pci-dss", "7.2.2", "zh"),
+            "Least privilege"
+        );
+    }
+
+    #[test]
+    fn control_title_falls_back_to_bare_id_when_untranslated() {
+        let tmp = tempfile::tempdir().unwrap();
+        fw_with_control_l10n(tmp.path());
+        let loaded = load_frameworks(&[tmp.path().to_path_buf()], &flat_os()).unwrap();
+        // 7.2.4 has no l10n entry in any locale → the bare control id is the label.
+        assert_eq!(
+            resolve_control_title(&loaded, "pci-dss", "7.2.4", "ru"),
+            "7.2.4"
+        );
+        // An unknown framework also degrades to the bare id (no directory recorded).
+        assert_eq!(
+            resolve_control_title(&loaded, "no-such-fw", "7.2.2", "ru"),
+            "7.2.2"
         );
     }
 }

@@ -1720,8 +1720,10 @@ fn load_fw_tree(
 
 /// A `pci-dss` flat framework: maps `net-admin → 1.1, 1.2` and `log-read →
 /// 10.1`; `legacy` (not mapped by any role permission here) exists too. The
-/// `controls.toml` flags `1.1`/`1.2`/`10.1`/`9.9` owned and `2.1` inherited;
-/// `9.9` is owned-but-uncovered (the gap).
+/// structural `controls.toml` flags `1.1`/`1.2`/`10.1`/`9.9` owned and `2.1`
+/// inherited; `9.9` is owned-but-uncovered (the gap). Control *titles* live in
+/// the framework l10n tree (`l10n/{en,ru}/controls.toml`), never inline in the
+/// structural file — so the title a report shows is resolved through l10n.
 fn pci_dss_tree(dir: &Path) -> LoadedFrameworks {
     load_fw_tree(
             dir,
@@ -1733,14 +1735,24 @@ fn pci_dss_tree(dir: &Path) -> LoadedFrameworks {
                 ("pci-dss/mappings/a.toml", "[net-admin]\nsatisfies = [\"1.1\", \"1.2\"]\n"),
                 ("pci-dss/mappings/b.toml", "[log-read]\nsatisfies = [\"10.1\"]\n"),
             ],
-            &[(
-                "pci-dss/controls.toml",
-                "[\"1.1\"]\ntitle = \"Firewall\"\nowned = true\ndomain = \"Network\"\n\
-                 [\"1.2\"]\ntitle = \"Default deny\"\nowned = true\n\
-                 [\"2.1\"]\ntitle = \"No vendor defaults\"\nowned = false\n\
-                 [\"10.1\"]\ntitle = \"Audit logging\"\nowned = true\n\
-                 [\"9.9\"]\ntitle = \"Uncovered owned\"\nowned = true\n",
-            )],
+            &[
+                (
+                    "pci-dss/controls.toml",
+                    "[\"1.1\"]\nowned = true\ndomain = \"Network\"\n\
+                     [\"1.2\"]\nowned = true\n\
+                     [\"2.1\"]\nowned = false\n\
+                     [\"10.1\"]\nowned = true\n\
+                     [\"9.9\"]\nowned = true\n",
+                ),
+                (
+                    "pci-dss/l10n/en/controls.toml",
+                    "[\"1.1\"]\ntitle = \"Firewall\"\n\
+                     [\"1.2\"]\ntitle = \"Default deny\"\n\
+                     [\"2.1\"]\ntitle = \"No vendor defaults\"\n\
+                     [\"10.1\"]\ntitle = \"Audit logging\"\n\
+                     [\"9.9\"]\ntitle = \"Uncovered owned\"\n",
+                ),
+            ],
         )
 }
 
@@ -1911,17 +1923,61 @@ fn framework_coverage_json_has_stamp_and_arrays() {
 fn framework_show_human_lists_controls_and_owned_stats() {
     let tmp = tempfile::tempdir().unwrap();
     let loaded = pci_dss_tree(tmp.path());
-    let out = render_framework_show_human("pci-dss", &loaded);
+    let out = render_framework_show_human("pci-dss", &loaded, "en");
     assert!(out.contains("framework pci-dss (4.0)"), "{out}");
     // Owned/covered annotations per control.
     assert!(out.contains("1.1 [owned] [covered]"), "{out}");
     assert!(out.contains("2.1 [inherited]"), "{out}");
     assert!(out.contains("9.9 [owned] [uncovered]"), "{out}");
+    // Title resolved from the en l10n tree (the structural controls.toml has none).
+    assert!(out.contains("— Firewall"), "{out}");
     // Owned coverage: 4 owned (1.1,1.2,10.1,9.9), 3 covered, 1 uncovered.
     assert!(
         out.contains("3/4 owned controls covered (1 uncovered)"),
         "{out}"
     );
+}
+
+#[test]
+fn framework_show_resolves_titles_per_locale_with_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Structural controls.toml (no titles); ru titles one control, en the other.
+    // 9.9 is untranslated in any locale → must fall back to the bare id.
+    let loaded = load_fw_tree(
+        tmp.path(),
+        &[(
+            "pci-dss/framework.toml",
+            "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI DSS\"\ndimension = \"flat\"\nprovides = [\"crossref\", \"controls\"]\n",
+        )],
+        &[("pci-dss/mappings/a.toml", "[net-admin]\nsatisfies = [\"1.1\"]\n")],
+        &[
+            (
+                "pci-dss/controls.toml",
+                "[\"1.1\"]\nowned = true\n[\"9.9\"]\nowned = true\n",
+            ),
+            (
+                "pci-dss/l10n/ru/controls.toml",
+                "[\"1.1\"]\ntitle = \"Межсетевой экран\"\n",
+            ),
+            (
+                "pci-dss/l10n/en/controls.toml",
+                "[\"1.1\"]\ntitle = \"Firewall\"\n",
+            ),
+        ],
+    );
+
+    // ru requested → Russian title for 1.1; 9.9 untranslated → bare id.
+    let ru = render_framework_show_human("pci-dss", &loaded, "ru");
+    assert!(ru.contains("— Межсетевой экран"), "{ru}");
+    assert!(ru.contains("9.9 [owned] [uncovered] — 9.9"), "{ru}");
+
+    // zh requested but absent → en fallback for 1.1.
+    let zh = render_framework_show_human("pci-dss", &loaded, "zh");
+    assert!(zh.contains("— Firewall"), "{zh}");
+
+    // JSON honors the locale too (ru title for 1.1).
+    let json = render_framework_show_json("pci-dss", &loaded, "ru");
+    assert!(json.contains("\"title\":\"Межсетевой экран\""), "{json}");
 }
 
 #[test]
@@ -2078,15 +2134,20 @@ fn framework_risk_lists_controls_and_threats() {
                 "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI\"\ndimension = \"flat\"\nprovides = [\"crossref\", \"controls\"]\n",
             )],
             &[("pci-dss/mappings/a.toml", "[log-admin]\nrisk = [\"10.5.1\"]\n")],
-            &[("pci-dss/controls.toml", "[\"10.5.1\"]\ntitle = \"Log integrity\"\nowned = false\n")],
+            &[
+                ("pci-dss/controls.toml", "[\"10.5.1\"]\nowned = false\n"),
+                ("pci-dss/l10n/en/controls.toml", "[\"10.5.1\"]\ntitle = \"Log integrity\"\n"),
+            ],
         );
     let risk = compute_framework_risk(&loaded, "pci-dss");
     assert!(risk
         .controls
         .contains(&("10.5.1".to_owned(), vec!["log-admin".to_owned()])));
-    let human = render_framework_risk_human("pci-dss", &loaded, &risk);
+    let human = render_framework_risk_human("pci-dss", &loaded, &risk, "en");
     assert!(human.contains("⚠ 10.5.1"), "{human}");
     assert!(human.contains("[out-of-domain]"), "{human}");
+    // Title resolved from the en l10n tree.
+    assert!(human.contains("— Log integrity"), "{human}");
     assert!(human.contains("threatened by: log-admin"), "{human}");
     let json = render_framework_risk_json("pci-dss", &loaded, &risk);
     assert!(json.contains("\"id\":\"10.5.1\""), "{json}");
@@ -2104,7 +2165,7 @@ fn framework_coverage_ignores_risk_and_related() {
                 "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI\"\ndimension = \"flat\"\nprovides = [\"crossref\", \"controls\"]\n",
             )],
             &[("pci-dss/mappings/a.toml", "[log-admin]\nrisk = [\"7.2.2\"]\n")],
-            &[("pci-dss/controls.toml", "[\"7.2.2\"]\ntitle = \"Least privilege\"\nowned = true\n")],
+            &[("pci-dss/controls.toml", "[\"7.2.2\"]\nowned = true\n")],
         );
     let cov = compute_framework_coverage(&loaded, "pci-dss");
     assert!(!cov.covered.contains(&"7.2.2".to_owned()));
@@ -2116,6 +2177,12 @@ fn run_framework_risk_missing_framework_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let _ = pci_dss_tree(tmp.path());
     let root = tmp.path().join("frameworks");
-    let code = run_framework_risk("nope", vec![root], Some("linux-debian".to_owned()), true);
+    let code = run_framework_risk(
+        "nope",
+        vec![root],
+        Some("linux-debian".to_owned()),
+        None,
+        true,
+    );
     assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
 }

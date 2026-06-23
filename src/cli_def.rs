@@ -185,6 +185,10 @@ pub enum FrameworkSub {
         /// absent (used to resolve os-layered frameworks).
         #[arg(long)]
         os_target: Option<String>,
+        /// Display language for control titles (e.g. `ru`); falls back to
+        /// LC_MESSAGES, LANG, then en, then the bare control id.
+        #[arg(long)]
+        lang: Option<String>,
         /// Output format: `human` (default) or `json`.
         #[arg(long)]
         format: Option<String>,
@@ -215,6 +219,10 @@ pub enum FrameworkSub {
         /// absent (used to resolve os-layered frameworks).
         #[arg(long)]
         os_target: Option<String>,
+        /// Display language for control titles (e.g. `ru`); falls back to
+        /// LC_MESSAGES, LANG, then en, then the bare control id.
+        #[arg(long)]
+        lang: Option<String>,
         /// Output format: `human` (default) or `json`.
         #[arg(long)]
         format: Option<String>,

@@ -1,0 +1,16 @@
+# English titles for CIS Control 6 Safeguards, surfaced by census framework reports.
+# Titles are paraphrased in our own words — the normative CIS Controls text
+# (© Center for Internet Security) is copyrighted and is NOT reproduced here.
+# Keys are Safeguard numbers (strings, since a dot is a TOML separator), matching controls.toml.
+
+["6.1"]
+title = "An access-granting process is established"
+
+["6.2"]
+title = "An access-revocation process is established"
+
+["6.7"]
+title = "Access management is centralized via a directory service / SSO"
+
+["6.8"]
+title = "Role-based access control (RBAC)"
