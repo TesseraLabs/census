@@ -82,14 +82,20 @@ pub struct ManagedAccount {
     /// is visible to the plan diff (otherwise a revoked fragment leaks).
     #[serde(default)]
     pub sudo_role: Option<String>,
-    /// Recorded concrete sudo commands (permission-expanded). Persisted so that
-    /// granting or revoking a permission which changes the sudo command set is
-    /// visible to the plan diff — the same privilege-revocation correctness that
-    /// `sudo_role` gets, but for the concrete-command path (otherwise a stale
-    /// NOPASSWD rule would leak after a permission is dropped). `#[serde(default)]`
-    /// so a registry written before this field existed still reads (empty set).
+    /// Recorded concrete sudo commands (permission-expanded), each paired with
+    /// the account it runs as. Persisted so that granting, revoking, or
+    /// *re-targeting* (root → service account) a permission which changes the
+    /// sudo command set is visible to the plan diff — the same
+    /// privilege-revocation correctness that `sudo_role` gets, but for the
+    /// concrete-command path (otherwise a stale NOPASSWD rule, or a stale
+    /// run-spec, would leak after a permission changes). Each entry serializes as
+    /// a bare string for a root command (`"/usr/sbin/ip"`) and as a `{ command,
+    /// runas }` table only when narrowed, so a registry written before `runas`
+    /// existed — and every all-root account — keeps its on-disk form unchanged.
+    /// `#[serde(default)]` so a registry written before this field existed still
+    /// reads (empty set).
     #[serde(default)]
-    pub sudo_commands: Vec<String>,
+    pub sudo_commands: Vec<crate::model::SudoCommand>,
     /// Recorded file-access grants (permission-expanded). Persisted so granting
     /// or revoking a permission that changes the file-grant set is visible to
     /// the plan diff and so the backend knows which ACL entries to revoke when a
@@ -143,10 +149,12 @@ pub struct ManagedGroup {
     #[serde(default)]
     pub members_added: Vec<String>,
     /// Concrete sudo commands bound to the group (for diff / revocation — same
-    /// authority the account record carries). `#[serde(default)]` so an old
-    /// registry reads as empty.
+    /// authority the account record carries), each paired with the account it
+    /// runs as. Serializes a root command as a bare string and a narrowed one as
+    /// a `{ command, runas }` table, keeping an all-root group's on-disk form
+    /// unchanged. `#[serde(default)]` so an old registry reads as empty.
     #[serde(default)]
-    pub sudo_commands: Vec<String>,
+    pub sudo_commands: Vec<crate::model::SudoCommand>,
     /// File-access grants on the group (`g:group` ACL) — for diff and the
     /// authority of revocation. `#[serde(default)]` so an old registry reads as
     /// empty.
@@ -341,7 +349,69 @@ from_version = 3
         .unwrap();
         let st = RegistryState::load(&path).unwrap();
         let oper = &st.managed_accounts()["oper"];
-        assert_eq!(oper.sudo_commands, vec!["/usr/sbin/ip", "/usr/bin/nmcli"]);
+        assert_eq!(
+            oper.sudo_commands,
+            vec![
+                crate::model::SudoCommand::root("/usr/sbin/ip"),
+                crate::model::SudoCommand::root("/usr/bin/nmcli"),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_sudo_command_serializes_as_a_bare_string_keeping_registry_back_compat() {
+        // A root command (runas: None) must serialize as a bare TOML string, so a
+        // registry of all-root accounts keeps its historical `sudo_commands =
+        // ["..."]` shape — the on-disk format does not change until a command is
+        // actually narrowed.
+        let acct = ManagedAccount {
+            name: "oper".to_owned(),
+            uid: 9010,
+            shell: "/bin/bash".to_owned(),
+            groups: vec![],
+            sudo_role: None,
+            sudo_commands: vec![crate::model::SudoCommand::root("/usr/sbin/ip")],
+            file_grants: vec![],
+            provenance: crate::model::Provenance::Created,
+            from_version: 1,
+        };
+        let toml = toml::to_string(&acct).unwrap();
+        assert!(
+            toml.contains(r#"sudo_commands = ["/usr/sbin/ip"]"#),
+            "root command must serialize as a bare string array: {toml}"
+        );
+    }
+
+    #[test]
+    fn narrowed_sudo_command_round_trips_through_the_table_form() {
+        // A narrowed command (runas: Some) serializes as a `{ command, runas }`
+        // table and reads back identically — the run-as account survives the
+        // registry round-trip so the diff can detect a stale run-spec.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[account]]
+name = "oper"
+uid = 9010
+shell = "/bin/bash"
+from_version = 3
+
+[[account.sudo_commands]]
+command = "/opt/QToolplus"
+runas = "bfs_solutions"
+"#,
+        )
+        .unwrap();
+        let st = RegistryState::load(&path).unwrap();
+        assert_eq!(
+            st.managed_accounts()["oper"].sudo_commands,
+            vec![crate::model::SudoCommand::as_user(
+                "/opt/QToolplus",
+                "bfs_solutions"
+            )]
+        );
     }
 
     #[test]
@@ -525,7 +595,7 @@ bogus = "nope"
             gid: Some(10),
             provenance: Provenance::Adopted,
             members_added: vec!["netops".to_owned()],
-            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            sudo_commands: vec![crate::model::SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![ManagedFileGrant {
                 path: "/etc/net".to_owned(),
                 access: crate::catalog::Access::Rw,

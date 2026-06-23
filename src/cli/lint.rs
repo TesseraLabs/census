@@ -242,7 +242,15 @@ pub(crate) fn group_grant_risk_findings(groups: &[model::ResolvedGroup]) -> Vec<
 
         // `%group` sudo that edits a root-equivalent path: every member can use
         // it to reach root, so it is an escalation surface for the whole group.
-        for cmd in &g.sudo_commands {
+        //
+        // The command's run-as account is deliberately ignored here: a
+        // root-equivalent command narrowed to a service account is still worth
+        // flagging — that account may itself be privileged, and "edits a
+        // root-equivalent path" is an escalation surface regardless of which
+        // identity runs it. Ignoring `runas` only ever over-warns (the safe
+        // direction), never under-warns.
+        for sudo_cmd in &g.sudo_commands {
+            let cmd = &sudo_cmd.command;
             if sudo_command_edits_root_equivalent(cmd) {
                 out.push(LintFinding {
                     code: "group-sudo-escalation",

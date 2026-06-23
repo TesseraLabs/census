@@ -730,7 +730,10 @@ mod tests {
             gid: Some(gid),
             provenance: crate::model::Provenance::Adopted,
             members_added: members_added.iter().map(|m| m.to_string()).collect(),
-            sudo_commands: sudo_commands.iter().map(|c| c.to_string()).collect(),
+            sudo_commands: sudo_commands
+                .iter()
+                .map(|c| crate::model::SudoCommand::root(*c))
+                .collect(),
             file_grants: Vec::new(),
             adopt_baseline: Some(crate::state::GroupBaseline {
                 gid: Some(gid),

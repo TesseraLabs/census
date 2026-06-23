@@ -371,6 +371,19 @@ pub struct PermissionDef {
     /// Sudo commands this permission grants.
     #[serde(default)]
     pub sudo: ListOverride,
+    /// The Unix account this permission's `sudo` commands run *as*, or `None`
+    /// for the default `(ALL)` (root) run-spec.
+    ///
+    /// A service utility must often be launched under a non-root service account
+    /// (`sudo -u bfs_solutions ./QToolplus`), never as root. Setting `runas` to
+    /// that account narrows the grant: every command this permission contributes
+    /// renders under `(<runas>)` instead of `(ALL)`, so the privilege handed out
+    /// is "be that service account for these commands", not a root-equivalent.
+    /// Overrides across layers exactly like `risk`: the topmost layer that sets
+    /// `runas` wins; a higher layer that restates `sudo` without `runas` leaves
+    /// the lower layer's run-spec standing. Validated at the read boundary.
+    #[serde(default)]
+    pub runas: Option<String>,
     /// Resource limits this permission sets. A higher layer that sets `limits`
     /// replaces wholesale (limits are a small fixed struct, not a list). Uses the
     /// strict [`CatalogLimits`] so an unknown key (notably `mac_mask`) under
@@ -441,6 +454,21 @@ impl PermissionDef {
                 return Err(CatalogError::InvalidSudoCommand {
                     id: self.id.clone(),
                     value: value.clone(),
+                    reason,
+                });
+            }
+        }
+        // A `runas` token is spliced into the sudoers run-spec `(<runas>)` as
+        // root. Validate it here so a value carrying a sudoers metacharacter (a
+        // `)` that closes the run-spec early, a `,` that splits the Cmnd list, a
+        // `!` negation) — or one that is not a portable Unix username at all —
+        // fails closed at parse, naming the id, rather than reaching the renderer
+        // and relying solely on its metacharacter neutralization.
+        if let Some(runas) = &self.runas {
+            if let Some(reason) = runas_defect(runas) {
+                return Err(CatalogError::InvalidRunas {
+                    id: self.id.clone(),
+                    value: runas.clone(),
                     reason,
                 });
             }
@@ -523,6 +551,71 @@ fn sudo_command_static_defect(value: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The maximum length Census accepts for a `runas` username. POSIX leaves the
+/// limit to the system (`LOGIN_NAME_MAX` is commonly 32, including the NUL), and
+/// `useradd` rejects longer names on Linux; 32 is the safe portable ceiling, and
+/// rejecting longer values at parse keeps a pathological token out of the
+/// sudoers run-spec.
+const RUNAS_MAX_LEN: usize = 32;
+
+/// Validate a `runas` token destined for the sudoers run-spec `(<runas>)`, run as
+/// root. Returns the rejection reason, or `None` if the value is a fit Unix
+/// username.
+///
+/// The token is spliced verbatim into `(<runas>)`, so a sudoers metacharacter
+/// would change the rule's meaning rather than name an account: `)` closes the
+/// run-spec early, `(` opens a nested one, `,` splits the Cmnd list, `!` negates,
+/// `:`/`=`/`\` are rule punctuation, and whitespace splits the field. A control
+/// char (notably a newline) would inject a second directive. Beyond "no
+/// metacharacters", the value must be a real portable Unix username — a POSIX
+/// portable name (`[a-z_][a-z0-9_-]*`) with an optional trailing `$` (the form
+/// `useradd` accepts for machine accounts) — so a structurally-wrong token that
+/// happens to carry no metacharacter (a leading digit, an uppercase letter, an
+/// embedded `{param}` we deliberately do not template here) is still rejected.
+fn runas_defect(value: &str) -> Option<&'static str> {
+    if value.is_empty() {
+        return Some("is empty");
+    }
+    if value.len() > RUNAS_MAX_LEN {
+        return Some("exceeds the maximum username length (32)");
+    }
+    if value.chars().any(char::is_control) {
+        return Some("contains a control character");
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Some("contains whitespace");
+    }
+    // Templated run-as is out of scope: a `{param}` runas would need its own
+    // substitution + re-validation path. Reject the template metacharacters
+    // explicitly so the failure names the real reason rather than the generic
+    // "not a portable username" below.
+    if value.contains('{') || value.contains('}') {
+        return Some("must not be templated ({...} is not supported for runas)");
+    }
+    if value
+        .chars()
+        .any(|c| matches!(c, ',' | ':' | '=' | '\\' | '(' | ')' | '!'))
+    {
+        return Some("contains a sudoers metacharacter ( , : = \\ ( ) ! )");
+    }
+    // POSIX portable username: first char a lowercase letter or underscore, the
+    // rest lowercase letters / digits / underscore / hyphen, with an optional
+    // single trailing `$` (machine-account form).
+    let core = value.strip_suffix('$').unwrap_or(value);
+    if core.is_empty() {
+        return Some("must be a Unix username, not a bare `$`");
+    }
+    let mut chars = core.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return Some("must start with a lowercase letter or underscore");
+    }
+    if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+        return Some("must be a portable Unix username (lowercase letters, digits, `_`, `-`)");
+    }
+    None
 }
 
 /// Validate a file-grant path destined for `setfacl`/`getfacl` as root. Returns
@@ -1046,6 +1139,19 @@ pub struct SourcedPrimitive {
     /// Audit needs to show not just which layer a sudo command came from, but
     /// which permission inside an aggregate pulled it in.
     pub via: Option<String>,
+    /// For a **sudo** primitive: the account this command runs as, or `None` for
+    /// the default `(ALL)` (root) run-spec. Tracked per primitive — not per
+    /// resolved permission — so a command keeps the run-spec of the permission
+    /// that actually declared it as it flows through a bundle union. A bundle
+    /// that pulls in a member which de-rooted its own command (`runas =
+    /// Some("svc")`) MUST NOT silently widen it back to root: the member's
+    /// command carries its own `runas` here, and the bundle's own `runas` applies
+    /// only to the bundle's own commands.
+    ///
+    /// Always `None` for a **groups** primitive (a group membership has no
+    /// run-spec); this type is shared by both the groups and sudo vectors, and
+    /// only the sudo path ever sets the field.
+    pub runas: Option<String>,
 }
 
 /// A file-access grant after resolve: its path, access, recursion, derived
@@ -1090,6 +1196,15 @@ pub struct ResolvedPermission {
     pub id: String,
     /// Risk class, if any layer set one (topmost setter wins).
     pub risk: Option<Risk>,
+    /// The account this permission's sudo commands run as, or `None` for the
+    /// default `(ALL)` (root) run-spec. Resolved topmost-setter-wins, exactly
+    /// like `risk`: the highest layer that sets `runas` wins; a higher layer that
+    /// restates `sudo` without `runas` leaves the lower layer's run-spec
+    /// standing. For a bundle, this is the bundle's OWN `runas` — a single
+    /// resolved permission carries one run-spec, applied to every sudo command it
+    /// contributes, so a bundle narrows all its members' commands to one account
+    /// rather than per-member run-specs.
+    pub runas: Option<String>,
     /// Group memberships, each tagged with its source layer.
     pub groups: Vec<SourcedPrimitive>,
     /// Sudo commands, each tagged with its source layer.
@@ -1215,6 +1330,21 @@ pub enum CatalogError {
         /// The permission id carrying the bad value.
         id: String,
         /// The rejected sudo command value.
+        value: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+    /// A `runas` token is unfit to splice into the sudoers run-spec `(<runas>)`.
+    /// The value is rendered as root, so a token carrying a sudoers metacharacter
+    /// (which would change the rule's meaning rather than name an account), a
+    /// control char, whitespace, a `{param}` template (out of scope), or one that
+    /// is simply not a portable Unix username is rejected at the read boundary —
+    /// before it reaches root materialization.
+    #[error("invalid runas {value:?} in permission {id}: {reason}")]
+    InvalidRunas {
+        /// The permission id carrying the bad runas token.
+        id: String,
+        /// The rejected runas value.
         value: String,
         /// Why it was rejected.
         reason: &'static str,
@@ -1354,6 +1484,7 @@ pub fn resolve_leaf(
     // union below), since file grants have no per-grant bare-vs-append distinction.
     let mut raw_files: Vec<(FileGrant, String)> = Vec::new();
     let mut risk: Option<Risk> = None;
+    let mut runas: Option<String> = None;
     let mut limits: Option<Limits> = None;
     let mut limits_layer: Option<String> = None;
     let mut found = false;
@@ -1383,6 +1514,9 @@ pub fn resolve_leaf(
         if let Some(r) = def.risk {
             risk = Some(r); // topmost setter wins
         }
+        if let Some(u) = def.runas {
+            runas = Some(u); // topmost setter wins, mirroring risk
+        }
         if let Some(l) = def.limits {
             limits = Some(l.into());
             limits_layer = Some(layer.clone());
@@ -1393,12 +1527,22 @@ pub fn resolve_leaf(
         return Err(CatalogError::UnknownPermission(id.to_owned()));
     }
 
+    // Stamp this leaf's resolved run-spec onto every one of ITS sudo commands, so
+    // the run-as account travels with each command as a per-primitive fact. When
+    // this leaf is later pulled into a bundle, the bundle union preserves these
+    // per-command run-specs — a member that de-rooted its command keeps that
+    // narrowing instead of being silently widened back to the bundle's `(ALL)`.
+    for cmd in &mut sudo {
+        cmd.runas = runas.clone();
+    }
+
     let file_grants = union_file_grants(raw_files, None);
 
     Ok((
         ResolvedPermission {
             id: id.to_owned(),
             risk,
+            runas,
             groups,
             sudo,
             file_grants,
@@ -1489,6 +1633,8 @@ fn apply_list_override(
     layer: &str,
     via: Option<&str>,
 ) {
+    // `runas` is set later (only on the sudo vec, after the leaf's run-spec is
+    // resolved topmost-wins); the groups vec keeps `None`.
     match ov {
         ListOverride::Replace(values) => {
             acc.clear();
@@ -1497,6 +1643,7 @@ fn apply_list_override(
                     value: v.clone(),
                     layer: layer.to_owned(),
                     via: via.map(str::to_owned),
+                    runas: None,
                 });
             }
         }
@@ -1506,6 +1653,7 @@ fn apply_list_override(
                     value: v.clone(),
                     layer: layer.to_owned(),
                     via: via.map(str::to_owned),
+                    runas: None,
                 });
             }
         }
@@ -1639,6 +1787,14 @@ fn resolve_inner(
     let mut limits = own.limits;
     let mut limits_layer = own.limits_layer;
     let declared_risk = own.risk;
+    // The bundle's OWN run-spec. This applies only to the bundle's own sudo
+    // commands (already stamped onto `own.sudo` by resolve_leaf). Each member's
+    // commands keep the run-spec the member resolved to — carried per primitive
+    // through the union below — so a member that de-rooted its command is never
+    // silently widened back to the bundle's run-spec. The field on the resolved
+    // permission records the bundle's own run-spec for audit; the authoritative
+    // per-command run-spec lives on each `SourcedPrimitive.runas`.
+    let runas = own.runas;
 
     // Materialize include_categories against the catalog as read now: enumerate
     // every id of each category across all layers/namespaces and treat them as
@@ -1748,6 +1904,7 @@ fn resolve_inner(
         ResolvedPermission {
             id: id.to_owned(),
             risk,
+            runas,
             groups,
             sudo,
             file_grants,
@@ -1811,7 +1968,13 @@ fn union_member_primitives(
     via: &str,
 ) {
     for mut p in members {
-        if acc.iter().any(|e| e.value == p.value) {
+        // Dedup by the (value, runas) pair, not value alone. For groups `runas`
+        // is always `None` on both sides, so this is value-equality as before. For
+        // sudo it keeps the same command under two different run-specs as two
+        // distinct grants — collapsing them would drop a member's narrowing (e.g.
+        // a member granting `/opt/tool` as a service account would be discarded if
+        // the bundle already granted it as root), silently widening privilege.
+        if acc.iter().any(|e| e.value == p.value && e.runas == p.runas) {
             continue;
         }
         p.via = Some(via.to_owned());
@@ -2006,6 +2169,10 @@ fn substitute_primitives(
                 value,
                 layer: prim.layer.clone(),
                 via: prim.via.clone(),
+                // Preserve the per-command run-spec across substitution: a
+                // templated sudo command keeps the run-as account of the
+                // permission that declared it (`runas` is not itself templated).
+                runas: prim.runas.clone(),
             });
         }
     }
@@ -2384,6 +2551,7 @@ include_categories = ["network"]
             category: None,
             groups: ListOverride::default(),
             sudo: ListOverride::default(),
+            runas: None,
             limits: None,
             replace: false,
             includes: Vec::new(),
@@ -2689,6 +2857,61 @@ include_categories = ["network"]
         assert_eq!(from_diag.via.as_deref(), Some("network-diag"));
         let from_admin = r.groups.iter().find(|p| p.value == "netdev").unwrap();
         assert_eq!(from_admin.via.as_deref(), Some("network-admin"));
+    }
+
+    #[test]
+    fn bundle_preserves_each_members_runas_per_command() {
+        // Fail-open regression guard. A member de-roots its own command
+        // (`runas = "bfs_solutions"`); the bundle pulls it in and ALSO carries its
+        // own command under its own run-spec (`runas = "ops"`). The member's
+        // command MUST keep its service account — never silently widen back to the
+        // bundle's run-spec or to root `(ALL)` — and the bundle's own command must
+        // carry the bundle's run-spec. runas is a per-primitive fact end-to-end.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/QToolplus".to_owned()]),
+                    runas: Some("bfs_solutions".to_owned()),
+                    ..def("db-tool")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // The bundle's own command, under the bundle's own run-spec.
+                    sudo: ListOverride::Replace(vec!["/usr/bin/own-tool".to_owned()]),
+                    runas: Some("ops".to_owned()),
+                    includes: vec!["db-tool".to_owned()],
+                    ..def("toolbox")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (r, _) = resolve("toolbox", &os, &cat, &ctx()).unwrap();
+
+        let member_cmd = r
+            .sudo
+            .iter()
+            .find(|p| p.value == "/opt/QToolplus")
+            .expect("member command present");
+        assert_eq!(
+            member_cmd.runas.as_deref(),
+            Some("bfs_solutions"),
+            "the member's de-rooted command must keep its own run-spec, not widen to the bundle's"
+        );
+        assert_eq!(member_cmd.via.as_deref(), Some("db-tool"));
+
+        let own_cmd = r
+            .sudo
+            .iter()
+            .find(|p| p.value == "/usr/bin/own-tool")
+            .expect("bundle's own command present");
+        assert_eq!(
+            own_cmd.runas.as_deref(),
+            Some("ops"),
+            "the bundle's own command must carry the bundle's run-spec"
+        );
+        assert_eq!(own_cmd.via, None);
     }
 
     #[test]
@@ -3574,6 +3797,106 @@ include_categories = ["network"]
             resolve_leaf("net", &os, &cat2).unwrap_err(),
             CatalogError::ContradictoryRecord { .. }
         ));
+    }
+
+    // --- runas token is validated at the read boundary ---
+
+    #[test]
+    fn valid_runas_is_accepted_and_resolves() {
+        // A plain service-account name and the machine-account `$` form are both
+        // accepted, and the resolved permission carries the run-as account.
+        for user in ["bfs_solutions", "_svc", "app-runner", "machine$"] {
+            let cat = FakeCatalog::new().with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some(user.to_owned()),
+                    ..def("svc")
+                },
+            );
+            let os = OsTarget::new("linux", "debian", None).unwrap();
+            let (r, _) = resolve_leaf("svc", &os, &cat).expect("valid runas resolves");
+            assert_eq!(r.runas.as_deref(), Some(user), "runas must propagate");
+        }
+    }
+
+    #[test]
+    fn invalid_runas_is_rejected_naming_the_id() {
+        // Each value is unfit for the sudoers run-spec `(<runas>)`: empty, a
+        // metacharacter that would split/close the run-spec, embedded whitespace,
+        // a `{param}` template (out of scope), and a control char. Every rejection
+        // must be `InvalidRunas` and name the offending permission id.
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        for bad in [
+            "",              // empty
+            "root, evil",    // comma + space: would split the Cmnd list
+            "bfs solutions", // embedded space
+            "a(b)",          // parens: open/close a nested run-spec
+            "{param}",       // templated runas is out of scope
+            "ro\tot",        // control char (tab)
+        ] {
+            let cat = FakeCatalog::new().with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some(bad.to_owned()),
+                    ..def("svc")
+                },
+            );
+            assert!(
+                matches!(
+                    resolve_leaf("svc", &os, &cat).unwrap_err(),
+                    CatalogError::InvalidRunas { ref id, .. } if id == "svc"
+                ),
+                "value {bad:?} must be rejected as InvalidRunas naming `svc`"
+            );
+        }
+    }
+
+    #[test]
+    fn runas_overrides_topmost_setter_wins_like_risk() {
+        // A base layer sets runas; a version layer that restates sudo without a
+        // runas leaves the base run-spec standing. A version layer that DOES set
+        // runas wins. Mirrors the `risk` override semantics.
+        let base_only = FakeCatalog::new()
+            .with(
+                "linux-debian",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some("base_acct".to_owned()),
+                    ..def("svc")
+                },
+            )
+            .with(
+                "linux-debian-12",
+                PermissionDef {
+                    // Restates sudo, no runas: base run-spec must stand.
+                    sudo: ListOverride::Append(vec!["/opt/extra".to_owned()]),
+                    ..def("svc")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", Some("12".to_owned())).unwrap();
+        let (r, _) = resolve_leaf("svc", &os, &base_only).unwrap();
+        assert_eq!(r.runas.as_deref(), Some("base_acct"));
+
+        let version_wins = FakeCatalog::new()
+            .with(
+                "linux-debian",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some("base_acct".to_owned()),
+                    ..def("svc")
+                },
+            )
+            .with(
+                "linux-debian-12",
+                PermissionDef {
+                    runas: Some("version_acct".to_owned()),
+                    ..def("svc")
+                },
+            );
+        let (r2, _) = resolve_leaf("svc", &os, &version_wins).unwrap();
+        assert_eq!(r2.runas.as_deref(), Some("version_acct"), "topmost wins");
     }
 
     // --- sudo command values are validated at the read boundary ---

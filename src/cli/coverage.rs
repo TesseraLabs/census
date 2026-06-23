@@ -638,7 +638,10 @@ pub(crate) fn build_group_grant_sources(
             id: g.name.clone(),
             target: coverage::GrantTarget::Group(g.name),
             risk: None,
-            sudo: g.sudo_commands,
+            // The coverage reverse-lookup keys on the command text; the run-as
+            // account does not change which command path is granted, so project
+            // each `SudoCommand` down to its command string here.
+            sudo: g.sudo_commands.into_iter().map(|c| c.command).collect(),
             file_grants: g.file_grants,
         });
     }

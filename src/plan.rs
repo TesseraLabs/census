@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::inspect::GroupFacts;
-use crate::model::{Provenance, ResolvedAccount, ResolvedGroup};
+use crate::model::{Provenance, ResolvedAccount, ResolvedGroup, SudoCommand};
 use crate::state::{ManagedAccount, ManagedFileGrant, ManagedGroup, SystemState};
 
 /// A single planned change.
@@ -179,11 +179,14 @@ fn diff_fields(target: &ResolvedAccount, current: &ManagedAccount) -> Vec<String
             current.sudo_role, target.sudo_role
         ));
     }
-    // Concrete sudo commands: compared set-equal (order-insensitive), mirroring
-    // groups/sudo_role. Granting or revoking a permission that changes the
-    // command set must produce an Update so the NOPASSWD fragment is rewritten —
-    // otherwise a revoked command would leak as a stale rule.
-    if !str_set_equal(&current.sudo_commands, &target.sudo_commands) {
+    // Concrete sudo commands: compared set-equal (order-insensitive) by the
+    // (command, runas) PAIR, mirroring groups/sudo_role. The run-as account is
+    // part of the grant: narrowing a command from root `(ALL)` to a service
+    // account (or widening it back) changes the privilege handed out, so it must
+    // register as an Update that rewrites the NOPASSWD fragment — otherwise a
+    // stale run-spec would leak. A command revoked entirely likewise produces an
+    // Update so its rule is removed.
+    if !sudo_set_equal(&current.sudo_commands, &target.sudo_commands) {
         changes.push(format!(
             "sudo-commands {:?} -> {:?}",
             current.sudo_commands, target.sudo_commands
@@ -262,6 +265,31 @@ fn str_set_equal(a: &[String], b: &[String]) -> bool {
     sa.sort_unstable();
     sb.sort_unstable();
     sa == sb
+}
+
+/// Whether two sudo-command lists are set-equal (order-insensitive) by the
+/// `(command, runas)` pair. The run-as account is part of the grant identity: a
+/// command narrowed from root `(ALL)` to a service account is a *different* grant
+/// than the same command as root, so a run-as-only change registers as a
+/// difference and drives an Update (the NOPASSWD fragment must be rewritten).
+/// Shared by the account and group diffs so both compare the enforced sudo set
+/// identically. Short-circuits on length, then sorts borrowed key tuples (no
+/// String is cloned).
+pub fn sudo_set_equal(a: &[SudoCommand], b: &[SudoCommand]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut sa: Vec<(&str, Option<&str>)> = a.iter().map(sudo_key).collect();
+    let mut sb: Vec<(&str, Option<&str>)> = b.iter().map(sudo_key).collect();
+    sa.sort_unstable();
+    sb.sort_unstable();
+    sa == sb
+}
+
+/// The set-equality key of a sudo command: `(command, runas)`. Borrowed (`&str`)
+/// so sorting the keys clones no String.
+fn sudo_key(c: &SudoCommand) -> (&str, Option<&str>) {
+    (c.command.as_str(), c.runas.as_deref())
 }
 
 /// A short human-readable label for a managed file grant (for change lines).
@@ -538,7 +566,7 @@ pub fn diff_resolved_groups(
 /// members. Mirrors the account `diff_fields` change-line shape.
 fn diff_group_fields(target: &ResolvedGroup, current: &ManagedGroup) -> Vec<String> {
     let mut changes = Vec::new();
-    if !str_set_equal(&current.sudo_commands, &target.sudo_commands) {
+    if !sudo_set_equal(&current.sudo_commands, &target.sudo_commands) {
         changes.push(format!(
             "sudo-commands {:?} -> {:?}",
             current.sudo_commands, target.sudo_commands
@@ -793,9 +821,12 @@ mod tests {
         // Same account otherwise; the permission set expanded a different sudo
         // command set → must be an Update with a change line mentioning it.
         let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
-        t.sudo_commands = vec!["/usr/sbin/ip".into(), "/usr/bin/nmcli".into()];
+        t.sudo_commands = vec![
+            SudoCommand::root("/usr/sbin/ip"),
+            SudoCommand::root("/usr/bin/nmcli"),
+        ];
         let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
-        m.sudo_commands = vec!["/usr/sbin/ip".into()];
+        m.sudo_commands = vec![SudoCommand::root("/usr/sbin/ip")];
         let plan = diff(&[t], &state_of(vec![m]));
         assert_eq!(plan.actions.len(), 1);
         match &plan.actions[0] {
@@ -811,12 +842,41 @@ mod tests {
     }
 
     #[test]
+    fn runas_only_change_on_one_command_yields_update() {
+        // Same command, same set size — only the run-as account changed (root →
+        // service account). The run-as is part of the grant, so this MUST be an
+        // Update so the NOPASSWD fragment is rewritten with the narrowed run-spec.
+        let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
+        t.sudo_commands = vec![SudoCommand::as_user("/opt/tool", "bfs_solutions")];
+        let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
+        m.sudo_commands = vec![SudoCommand::root("/opt/tool")];
+        let plan = diff(&[t], &state_of(vec![m]));
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            Action::Update { changes, .. } => {
+                assert_eq!(changes.len(), 1, "only the run-as should differ");
+                assert!(
+                    changes[0].contains("sudo-commands"),
+                    "a run-as change must register as a sudo-commands update: {changes:?}"
+                );
+            }
+            other => panic!("expected Update for a run-as change, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn identical_sudo_commands_order_insensitive_is_idempotent() {
         // Same command set in a different order must NOT produce an action.
         let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
-        t.sudo_commands = vec!["/usr/sbin/ip".into(), "/usr/bin/nmcli".into()];
+        t.sudo_commands = vec![
+            SudoCommand::root("/usr/sbin/ip"),
+            SudoCommand::root("/usr/bin/nmcli"),
+        ];
         let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
-        m.sudo_commands = vec!["/usr/bin/nmcli".into(), "/usr/sbin/ip".into()];
+        m.sudo_commands = vec![
+            SudoCommand::root("/usr/bin/nmcli"),
+            SudoCommand::root("/usr/sbin/ip"),
+        ];
         let plan = diff(&[t], &state_of(vec![m]));
         assert!(
             plan.is_empty(),
@@ -1200,9 +1260,12 @@ mod tests {
     #[test]
     fn resolved_group_sudo_commands_drift_yields_update() {
         let mut t = rgroup("ops", Some(8020), Provenance::Created);
-        t.sudo_commands = vec!["/usr/sbin/ip".into(), "/usr/bin/nmcli".into()];
+        t.sudo_commands = vec![
+            SudoCommand::root("/usr/sbin/ip"),
+            SudoCommand::root("/usr/bin/nmcli"),
+        ];
         let mut m = mgroup("ops", 8020);
-        m.sudo_commands = vec!["/usr/sbin/ip".into()];
+        m.sudo_commands = vec![SudoCommand::root("/usr/sbin/ip")];
         let registry = managed_groups(&[m]);
         let actions = diff_resolved_groups(&[t], &registry);
         assert_eq!(actions.len(), 1);
@@ -1266,12 +1329,18 @@ mod tests {
     fn resolved_group_fully_in_sync_yields_no_action() {
         // Every materialized field matches (order-insensitive) → no action.
         let mut t = rgroup("ops", Some(8020), Provenance::Created);
-        t.sudo_commands = vec!["/usr/sbin/ip".into(), "/usr/bin/nmcli".into()];
+        t.sudo_commands = vec![
+            SudoCommand::root("/usr/sbin/ip"),
+            SudoCommand::root("/usr/bin/nmcli"),
+        ];
         t.file_grants = vec![rgrant("/etc/net", Access::Rw, true)];
         t.members = vec!["dbops".into(), "netops".into()];
         let mut m = mgroup("ops", 8020);
         // Different ORDER on every set — must still be in sync.
-        m.sudo_commands = vec!["/usr/bin/nmcli".into(), "/usr/sbin/ip".into()];
+        m.sudo_commands = vec![
+            SudoCommand::root("/usr/bin/nmcli"),
+            SudoCommand::root("/usr/sbin/ip"),
+        ];
         m.file_grants = vec![mgrant("/etc/net", Access::Rw, true)];
         m.members_added = vec!["netops".into(), "dbops".into()];
         let registry = managed_groups(&[m]);
@@ -1288,7 +1357,7 @@ mod tests {
         // Managed-only groups (a Created and an Adopted) trail after, in BTreeMap
         // (sorted) order → Delete before Release because "z-created" > "a-...".
         let mut upd = rgroup("ops", Some(8020), Provenance::Created);
-        upd.sudo_commands = vec!["/usr/sbin/ip".into()];
+        upd.sudo_commands = vec![SudoCommand::root("/usr/sbin/ip")];
         let targets = vec![
             upd,                                                // -> Update (ops)
             rgroup("wheel", None, Provenance::Adopted),         // -> Adopt (wheel)

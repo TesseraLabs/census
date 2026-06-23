@@ -14,6 +14,161 @@ use crate::catalog::{self, CatalogError, CatalogSource, OsTarget, ResolveCtx};
 use crate::declaration::Declaration;
 use crate::rolestore::{self, Limits, RoleStoreError};
 
+/// A single concrete sudo command together with the account it must run *as*.
+///
+/// Default sudoers run-specs grant a command as root (`(ALL)`). That is the
+/// right default for an administrative Cmnd, but it is exactly wrong for a
+/// service utility an engineer must launch under a non-root service account:
+/// granting `sudo ./QToolplus` as root hands the operator a root shell-equivalent
+/// when the intent was only "run this tool as `bfs_solutions`". The `runas` field
+/// narrows that grant — `Some("bfs_solutions")` renders the command under
+/// `(bfs_solutions)` instead of `(ALL)`, so the privilege handed out is *be that
+/// service account for this one command*, never root.
+///
+/// `runas: None` means the default run-spec `(ALL)` (run as root), preserving the
+/// historical behaviour for every command that does not opt in. The pair
+/// `(command, runas)` is the identity used everywhere this type is compared,
+/// deduped, or persisted: the same command granted under two different run-specs
+/// is two distinct grants and both survive — collapsing them would silently drop
+/// one privilege boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SudoCommand {
+    /// The concrete absolute-path Cmnd (validated at catalog parse).
+    pub command: String,
+    /// The Unix account this command runs as, or `None` for the default `(ALL)`
+    /// (root) run-spec. A `Some` value is a validated Unix username (the catalog
+    /// `runas` gate rejects anything carrying a sudoers metacharacter), so it
+    /// renders verbatim inside the `(runas)` group.
+    pub runas: Option<String>,
+}
+
+impl SudoCommand {
+    /// A command that runs as root — the default `(ALL)` run-spec (`runas: None`).
+    pub fn root(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            runas: None,
+        }
+    }
+
+    /// A command that runs as the named service account (`(runas)` run-spec).
+    pub fn as_user(command: impl Into<String>, runas: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            runas: Some(runas.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for SudoCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.runas {
+            Some(u) => write!(f, "{} (as {u})", self.command),
+            None => f.write_str(&self.command),
+        }
+    }
+}
+
+/// Serialize as a bare string when the command runs as root (`runas: None`), or
+/// as a `{ command, runas }` table when a run-as account is set.
+///
+/// The bare-string form keeps the persisted registry byte-stable for every
+/// historical (root) command: a `managed.toml` written before `runas` existed
+/// stays `sudo_commands = ["/usr/sbin/ip"]`, and an all-root account never grows
+/// the more verbose table form. Only a genuinely narrowed (`runas: Some`) command
+/// serializes as a table, so the format change is paid for only where it carries
+/// new information.
+impl serde::Serialize for SudoCommand {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        match &self.runas {
+            None => serializer.serialize_str(&self.command),
+            Some(runas) => {
+                let mut s = serializer.serialize_struct("SudoCommand", 2)?;
+                s.serialize_field("command", &self.command)?;
+                s.serialize_field("runas", runas)?;
+                s.end()
+            }
+        }
+    }
+}
+
+/// Deserialize from either a bare string (legacy / root command, `runas: None`)
+/// or a strict `{ command, runas }` table.
+///
+/// The bare-string arm is what makes an old registry — and a hand-written one —
+/// load unchanged: `sudo_commands = ["/usr/sbin/ip"]` parses to a root command.
+/// The table arm is strict (`deny_unknown_fields`) so a typo like `{ comand = ...
+/// }` is rejected rather than silently dropping the grant.
+impl<'de> serde::Deserialize<'de> for SudoCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TableForm {
+            command: String,
+            #[serde(default)]
+            runas: Option<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bare(String),
+            Table(TableForm),
+        }
+
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Bare(command) => Self {
+                command,
+                runas: None,
+            },
+            Raw::Table(t) => Self {
+                command: t.command,
+                runas: t.runas,
+            },
+        })
+    }
+}
+
+/// Hand-written schema for [`SudoCommand`]: the type has a custom (de)serialize
+/// accepting either a bare string (root command) or a `{ command, runas }` table,
+/// so its schema mirrors exactly that one-of. A derive would describe the
+/// in-memory struct, not the accepted on-disk forms, defeating the contract.
+/// Behind the `schema` feature — schema generation is a CI/contract concern.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for SudoCommand {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SudoCommand".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let command = String::json_schema(generator);
+        let runas = <Option<String>>::json_schema(generator);
+        // Arm 1: a bare string (the command, run as root). Arm 2: a strict object
+        // with a required `command` and an optional `runas`.
+        schemars::json_schema!({
+            "oneOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": command,
+                        "runas": runas,
+                    },
+                    "additionalProperties": false,
+                },
+            ],
+        })
+    }
+}
+
 /// How an object (account or group) came under Census management. Drives the
 /// teardown contract: a `Created` object Census made itself, so removing it from
 /// the declaration means a full delete (`userdel`/`groupdel`); an `Adopted`
@@ -59,10 +214,12 @@ pub struct ResolvedAccount {
     /// present. Kept distinct from `sudo_commands` so the two render paths do
     /// not collide.
     pub sudo_role: Option<String>,
-    /// Concrete sudo commands expanded from the role's permissions (deduped,
-    /// stable order). When non-empty these render a concrete NOPASSWD sudoers
-    /// rule, replacing the external-`Cmnd_Alias` indirection.
-    pub sudo_commands: Vec<String>,
+    /// Concrete sudo commands expanded from the role's permissions, each paired
+    /// with the account it runs as (`None` = root / `(ALL)`). Deduped by the
+    /// `(command, runas)` pair, stable order. When non-empty these render a
+    /// concrete NOPASSWD sudoers rule, replacing the external-`Cmnd_Alias`
+    /// indirection.
+    pub sudo_commands: Vec<SudoCommand>,
     /// Resource limits. Raw `payload.limits` if set; otherwise merged from the
     /// permission expansion. An explicit raw limit wins over an expanded one.
     pub limits: Limits,
@@ -136,7 +293,7 @@ impl ResolvedAccountBuilder {
     }
 
     /// Set the concrete (permission-expanded) sudo commands.
-    pub fn sudo_commands(mut self, sudo_commands: Vec<String>) -> Self {
+    pub fn sudo_commands(mut self, sudo_commands: Vec<SudoCommand>) -> Self {
         self.inner.sudo_commands = sudo_commands;
         self
     }
@@ -192,10 +349,11 @@ pub struct ResolvedGroup {
     /// `GroupSpec.members` (validation already restricted an adopted group's
     /// members to Census-managed users).
     pub members: Vec<String>,
-    /// Sudo commands the bound roles grant the group, unioned across every
-    /// bound role's permissions (deduped, stable order). Materialized as a
-    /// `%group` NOPASSWD sudoers fragment.
-    pub sudo_commands: Vec<String>,
+    /// Sudo commands the bound roles grant the group, each paired with the
+    /// account it runs as (`None` = root / `(ALL)`). Unioned across every bound
+    /// role's permissions, deduped by the `(command, runas)` pair, stable order.
+    /// Materialized as a `%group` NOPASSWD sudoers fragment.
+    pub sudo_commands: Vec<SudoCommand>,
     /// File-access grants the bound roles grant the group, unioned by path
     /// (access widens to the max, `recursive` is the OR, provenance accumulates)
     /// — the same rule resolve applies to an account. Materialized as `g:group`
@@ -256,7 +414,7 @@ impl ResolvedGroupBuilder {
     }
 
     /// Set the group's sudo commands.
-    pub fn sudo_commands(mut self, sudo_commands: Vec<String>) -> Self {
+    pub fn sudo_commands(mut self, sudo_commands: Vec<SudoCommand>) -> Self {
         self.inner.sudo_commands = sudo_commands;
         self
     }
@@ -438,7 +596,7 @@ pub fn resolve(
                 groups.push(g.clone());
             }
         }
-        let mut sudo_commands: Vec<String> = Vec::new();
+        let mut sudo_commands: Vec<SudoCommand> = Vec::new();
         // File grants come ONLY from permissions (no raw escape-hatch). Collect
         // every permission's resolved grants, then union by path below.
         let mut file_grants: Vec<catalog::ResolvedFileGrant> = Vec::new();
@@ -497,10 +655,21 @@ pub fn resolve(
                     groups.push(g.value);
                 }
             }
-            // Union expanded sudo commands (dedup by value, stable order).
+            // Union expanded sudo commands, taking each command's run-as from the
+            // PRIMITIVE (not the permission). Inside a bundle, a member that
+            // de-rooted its own command carries its run-spec per primitive, so the
+            // bundle's own run-spec never silently widens a member's command back
+            // to root. Dedup by the (command, runas) PAIR, not the command alone:
+            // two permissions may grant the same command under different run-as
+            // accounts (one as root, one as a service account), and both are
+            // distinct privilege boundaries that must both survive.
             for s in resolved.sudo {
-                if !sudo_commands.contains(&s.value) {
-                    sudo_commands.push(s.value);
+                let cmd = SudoCommand {
+                    command: s.value,
+                    runas: s.runas,
+                };
+                if !sudo_commands.contains(&cmd) {
+                    sudo_commands.push(cmd);
                 }
             }
             // Accumulate this permission's resolved file grants; the by-path
@@ -629,10 +798,19 @@ pub fn resolve_groups(
             for w in catalog_warnings {
                 warnings.push(ResolveWarning::Catalog(w));
             }
-            // Union expanded sudo commands onto the group (dedup, stable order).
+            // Union expanded sudo commands onto the group, taking each command's
+            // run-as from the PRIMITIVE (not the permission) so a bundle member's
+            // de-rooted command keeps its run-spec rather than widening to the
+            // bundle's. Dedup by the (command, runas) pair — see the account path
+            // for why a run-as account is part of the grant identity and two
+            // run-specs of one command must both survive.
             for s in resolved.sudo {
-                if !group.sudo_commands.contains(&s.value) {
-                    group.sudo_commands.push(s.value);
+                let cmd = SudoCommand {
+                    command: s.value,
+                    runas: s.runas,
+                };
+                if !group.sudo_commands.contains(&cmd) {
+                    group.sudo_commands.push(cmd);
                 }
             }
             binding_file_grants.extend(resolved.file_grants);
@@ -704,6 +882,7 @@ mod tests {
             category: None,
             groups: ListOverride::default(),
             sudo: ListOverride::default(),
+            runas: None,
             limits: None,
             replace: false,
             includes: Vec::new(),
@@ -837,7 +1016,7 @@ uid = 9010
         // Inverse: a managed record missing a command must produce an Update so
         // the NOPASSWD fragment is rewritten (no stale/leaked grant).
         let mut stale = managed_from(target);
-        stale.sudo_commands = vec!["/usr/sbin/ip".to_owned()];
+        stale.sudo_commands = vec![SudoCommand::root("/usr/sbin/ip")];
         let mut managed2 = std::collections::BTreeMap::new();
         managed2.insert(target.name.clone(), stale);
         let plan2 = crate::plan::diff(&resolved, &StateOf(managed2));
@@ -874,10 +1053,10 @@ uid = 9010
         assert_eq!(
             resolved[0].sudo_commands,
             vec![
-                "/usr/bin/systemctl restart nginx",
-                "/usr/bin/systemctl restart atm-app",
-                "/usr/bin/systemctl restart nginx.service",
-                "/usr/bin/systemctl restart atm-app.service",
+                SudoCommand::root("/usr/bin/systemctl restart nginx"),
+                SudoCommand::root("/usr/bin/systemctl restart atm-app"),
+                SudoCommand::root("/usr/bin/systemctl restart nginx.service"),
+                SudoCommand::root("/usr/bin/systemctl restart atm-app.service"),
             ]
         );
         // Fully-consumed params emit no UnusedParam warning (an unrelated
@@ -959,7 +1138,10 @@ uid = 9010
         let ctx = ResolveCtx::default();
         let os = os();
         let (resolved, warnings) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
-        assert_eq!(resolved[0].sudo_commands, vec!["/usr/sbin/ip"]);
+        assert_eq!(
+            resolved[0].sudo_commands,
+            vec![SudoCommand::root("/usr/sbin/ip")]
+        );
         assert!(
             warnings.iter().any(|w| matches!(
                 w,
@@ -985,7 +1167,10 @@ uid = 9010
         let ctx = ResolveCtx::default();
         let os = os();
         let (resolved, warnings) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
-        assert_eq!(resolved[0].sudo_commands, vec!["/usr/bin/systemctl"]);
+        assert_eq!(
+            resolved[0].sudo_commands,
+            vec![SudoCommand::root("/usr/bin/systemctl")]
+        );
         // No template-related warnings (an unrelated UnknownOsVersion may surface
         // from the version-only OS target the fixture uses).
         assert!(
@@ -1028,11 +1213,131 @@ uid = 9010
         let (resolved, warnings) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
         let a = &resolved[0];
         assert_eq!(a.groups, vec!["netdev"]);
-        assert_eq!(a.sudo_commands, vec!["/usr/sbin/ip", "/usr/bin/nmcli"]);
+        assert_eq!(
+            a.sudo_commands,
+            vec![
+                SudoCommand::root("/usr/sbin/ip"),
+                SudoCommand::root("/usr/bin/nmcli")
+            ]
+        );
         // Pure permissions, no raw fields → no lint.
         assert!(
             warnings.is_empty(),
             "pure-permission role must not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn permission_runas_propagates_onto_account_sudo_commands() {
+        // A permission that narrows its sudo command to a service account must
+        // carry that run-as onto every resolved account SudoCommand.
+        let (_tmp, decl) = fixture("[payload]\npermissions = [\"svc-tool\"]\n");
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/opt/QToolplus".to_owned()]),
+                runas: Some("bfs_solutions".to_owned()),
+                ..def("svc-tool")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(
+            resolved[0].sudo_commands,
+            vec![SudoCommand::as_user("/opt/QToolplus", "bfs_solutions")]
+        );
+    }
+
+    #[test]
+    fn bundle_member_runas_survives_onto_account_not_widened_to_root() {
+        // Fail-open regression guard at the account boundary. A bundle `toolbox`
+        // includes a member `db-tool` that de-rooted its own command
+        // (`runas = "bfs_solutions"`). The bundle itself sets no runas. The
+        // member's command MUST reach the resolved account under its service
+        // account — never silently widened back to root `(ALL)`. The bundle's own
+        // command (if any) keeps the bundle's run-spec.
+        let (_tmp, decl) = fixture("[payload]\npermissions = [\"toolbox\"]\n");
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/QToolplus".to_owned()]),
+                    runas: Some("bfs_solutions".to_owned()),
+                    ..def("db-tool")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // Bundle's own command under its own run-spec, plus the member.
+                    sudo: ListOverride::Replace(vec!["/usr/bin/own-tool".to_owned()]),
+                    runas: Some("ops".to_owned()),
+                    includes: vec!["db-tool".to_owned()],
+                    ..def("toolbox")
+                },
+            );
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let cmds = &resolved[0].sudo_commands;
+        assert!(
+            cmds.contains(&SudoCommand::as_user("/opt/QToolplus", "bfs_solutions")),
+            "the bundle member's de-rooted command must keep its service account, got {cmds:?}"
+        );
+        assert!(
+            !cmds.contains(&SudoCommand::root("/opt/QToolplus")),
+            "the member's command must NOT have widened to root (ALL): {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&SudoCommand::as_user("/usr/bin/own-tool", "ops")),
+            "the bundle's own command must carry the bundle's run-spec: {cmds:?}"
+        );
+
+        // And it must render that way in the materialized sudoers fragment.
+        let content = crate::sudoers::build_sudoers_content(&resolved[0]).expect("sudo content");
+        assert!(
+            content.contains("(bfs_solutions) NOPASSWD: /opt/QToolplus"),
+            "rendered fragment must run the member command as its service account: {content}"
+        );
+        assert!(
+            !content.contains("(ALL) NOPASSWD: /opt/QToolplus"),
+            "rendered fragment must NOT run the member command as root: {content}"
+        );
+    }
+
+    #[test]
+    fn same_command_under_different_runas_both_survive_dedup() {
+        // Two permissions granting the SAME command, one as root, one as a service
+        // account. Dedup is by the (command, runas) pair, so both survive — they
+        // are distinct privilege boundaries.
+        let (_tmp, decl) = fixture("[payload]\npermissions = [\"as-root\", \"as-svc\"]\n");
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    ..def("as-root")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/opt/tool".to_owned()]),
+                    runas: Some("svc".to_owned()),
+                    ..def("as-svc")
+                },
+            );
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(
+            resolved[0].sudo_commands,
+            vec![
+                SudoCommand::root("/opt/tool"),
+                SudoCommand::as_user("/opt/tool", "svc"),
+            ],
+            "the root and service-account grants of one command must both survive"
         );
     }
 
@@ -1325,7 +1630,7 @@ home_base = "/var/lib/census/home"
         assert_eq!(g.name, "ops");
         assert_eq!(g.gid, Some(8020));
         assert_eq!(g.provenance, Provenance::Created);
-        assert_eq!(g.sudo_commands, vec!["/usr/sbin/ip"]);
+        assert_eq!(g.sudo_commands, vec![SudoCommand::root("/usr/sbin/ip")]);
         assert_eq!(
             g.limits,
             Limits {
@@ -1402,8 +1707,40 @@ home_base = "/var/lib/census/home"
         let os = os();
         let (groups, _) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
         let g = &groups[0];
-        assert_eq!(g.sudo_commands, vec!["/usr/sbin/ip", "/usr/bin/psql"]);
+        assert_eq!(
+            g.sudo_commands,
+            vec![
+                SudoCommand::root("/usr/sbin/ip"),
+                SudoCommand::root("/usr/bin/psql")
+            ]
+        );
         assert_eq!(g.bound_roles, vec!["netops", "dbops"]);
+    }
+
+    #[test]
+    fn permission_runas_propagates_onto_group_sudo_commands() {
+        // A bound role whose permission narrows its sudo command to a service
+        // account must carry that run-as onto the group's SudoCommand.
+        let (_tmp, decl) = group_fixture(
+            &[("svcops", "[payload]\npermissions = [\"svc-tool\"]\n")],
+            "[[group]]\nname = \"ops\"\n\
+             [[role_group]]\nrole = \"svcops\"\ngroup = \"ops\"\n",
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/opt/QToolplus".to_owned()]),
+                runas: Some("bfs_solutions".to_owned()),
+                ..def("svc-tool")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (groups, _) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(
+            groups[0].sudo_commands,
+            vec![SudoCommand::as_user("/opt/QToolplus", "bfs_solutions")]
+        );
     }
 
     #[test]
@@ -1427,7 +1764,10 @@ home_base = "/var/lib/census/home"
         let os = os();
         let (groups, warnings) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
         // The sudo grant still lands; only the membership primitive is dropped.
-        assert_eq!(groups[0].sudo_commands, vec!["/usr/sbin/ip"]);
+        assert_eq!(
+            groups[0].sudo_commands,
+            vec![SudoCommand::root("/usr/sbin/ip")]
+        );
         assert!(
             warnings.iter().any(|w| matches!(
                 w,

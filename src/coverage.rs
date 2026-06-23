@@ -1955,6 +1955,7 @@ mod tests {
             category: None,
             groups: ListOverride::default(),
             sudo: ListOverride::default(),
+            runas: None,
             limits: None,
             replace: false,
             includes: Vec::new(),

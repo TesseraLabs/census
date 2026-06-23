@@ -297,17 +297,12 @@ fn set_mode_0440(_path: &Path) -> Result<(), SudoersError> {
 /// When both are empty → `None` (no fragment file).
 pub fn build_sudoers_content(acct: &ResolvedAccount) -> Option<String> {
     if !acct.sudo_commands.is_empty() {
-        let cmds = acct
-            .sudo_commands
-            .iter()
-            .map(|c| escape_sudoers_command(c))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let run_spec = render_runspec(&acct.sudo_commands);
         return Some(format!(
             "# Managed by Census — role {role}. Do not edit by hand.\n\
              # Concrete commands expanded from the role's permissions.\n\
              # NOPASSWD: role accounts have locked passwords (no password to prompt).\n\
-             {user} ALL=(ALL) NOPASSWD: {cmds}\n",
+             {user} ALL={run_spec}\n",
             role = acct.name,
             user = acct.name,
         ));
@@ -348,21 +343,61 @@ pub fn build_group_sudoers_content(group: &ResolvedGroup) -> Option<String> {
     if group.sudo_commands.is_empty() {
         return None;
     }
-    let cmds = group
-        .sudo_commands
-        .iter()
-        .map(|c| escape_sudoers_command(c))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let run_spec = render_runspec(&group.sudo_commands);
     Some(format!(
         "# Managed by Census — group {group}. Do not edit by hand.\n\
          # Concrete commands expanded from the bound roles' permissions.\n\
          # Subject is the Unix group (%): every effective member inherits the rule,\n\
          # including LDAP nested-group members resolved behind the group name.\n\
          # NOPASSWD: a managed group sudo grant is not an interactive re-auth point.\n\
-         %{group} ALL=(ALL) NOPASSWD: {cmds}\n",
+         %{group} ALL={run_spec}\n",
         group = group.name,
     ))
+}
+
+/// Render the run-spec body that follows `ALL=` for a set of sudo commands,
+/// grouping commands by their run-as account.
+///
+/// Each distinct run-as account becomes one `(<runas>) NOPASSWD: <cmds...>`
+/// group; the groups are concatenated into a single rule line. A command with
+/// `runas: None` renders under `(ALL)` (run as root) — the historical default.
+///
+/// Two invariants matter here:
+/// * **Backward-compat / determinism.** Groups appear in the first-appearance
+///   order of their run-as account across the command list, and commands keep
+///   their accumulated order within a group. When every command has `runas:
+///   None` there is exactly one group — `(ALL) NOPASSWD: c1, c2` — byte-identical
+///   to the pre-`runas` output, so existing fragments and goldens are unchanged.
+/// * **Defense in depth.** Both the command and the run-as token are run through
+///   [`escape_sudoers_command`] so a stray metacharacter neutralizes to a literal
+///   rather than altering the rule. The catalog `runas` gate is the primary
+///   guard (a validated token carries no metacharacter and renders verbatim);
+///   this is the second layer for anything that somehow reaches the renderer.
+fn render_runspec(commands: &[crate::model::SudoCommand]) -> String {
+    // Preserve first-appearance order of each run-as account. A Vec of
+    // (runas, joined-commands) keeps that order without a separate ordering pass.
+    let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for cmd in commands {
+        let escaped = escape_sudoers_command(&cmd.command);
+        match groups.iter_mut().find(|(r, _)| *r == cmd.runas) {
+            Some((_, cmds)) => cmds.push(escaped),
+            None => groups.push((cmd.runas.clone(), vec![escaped])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(runas, cmds)| {
+            let spec = match runas {
+                // `None` is the default run-spec: run as root, rendered `(ALL)`.
+                None => "ALL".to_owned(),
+                // A validated username has no metacharacters, but escape anyway as
+                // defense in depth so it can only ever render as one literal token.
+                Some(u) => escape_sudoers_command(&u),
+            };
+            format!("({spec}) NOPASSWD: {}", cmds.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Escape a command string for inclusion in a comma-separated sudoers Cmnd list.
@@ -424,24 +459,40 @@ mod tests {
         }
     }
 
-    /// An account whose sudo right is a set of concrete commands (the
-    /// permission-expanded path).
+    use crate::model::SudoCommand;
+
+    /// An account whose sudo right is a set of concrete root commands (the
+    /// permission-expanded path; every command runs as root / `(ALL)`).
     fn acct_cmds(name: &str, cmds: &[&str]) -> ResolvedAccount {
         ResolvedAccount {
-            sudo_commands: cmds.iter().map(|c| c.to_string()).collect(),
+            sudo_commands: cmds.iter().map(|c| SudoCommand::root(*c)).collect(),
             ..acct(name, None)
         }
     }
 
-    /// A resolved group carrying the given concrete sudo commands (the only
+    /// An account whose sudo right is an explicit list of `SudoCommand`s (used to
+    /// exercise the run-as grouping).
+    fn acct_runas(name: &str, cmds: Vec<SudoCommand>) -> ResolvedAccount {
+        ResolvedAccount {
+            sudo_commands: cmds,
+            ..acct(name, None)
+        }
+    }
+
+    /// A resolved group carrying the given concrete root sudo commands (the only
     /// field the `%group` sudoers builder reads).
     fn group_cmds(name: &str, cmds: &[&str]) -> ResolvedGroup {
+        group_runas(name, cmds.iter().map(|c| SudoCommand::root(*c)).collect())
+    }
+
+    /// A resolved group carrying an explicit list of `SudoCommand`s.
+    fn group_runas(name: &str, cmds: Vec<SudoCommand>) -> ResolvedGroup {
         ResolvedGroup {
             name: name.to_owned(),
             gid: None,
             provenance: crate::model::Provenance::Created,
             members: Vec::new(),
-            sudo_commands: cmds.iter().map(|c| c.to_string()).collect(),
+            sudo_commands: cmds,
             file_grants: Vec::new(),
             limits: Limits::default(),
             bound_roles: Vec::new(),
@@ -513,6 +564,123 @@ mod tests {
         assert!(line.starts_with("oper ALL=(ALL) NOPASSWD: "));
         // The user field is a single token (no embedded space before ALL).
         assert_eq!(line.split_whitespace().next(), Some("oper"));
+    }
+
+    #[test]
+    fn all_root_commands_render_byte_identical_to_the_legacy_all_runspec() {
+        // Backward-compat invariant: when every command runs as root (runas:
+        // None), the rule line MUST be exactly the pre-`runas` `(ALL)` form. Build
+        // the same account two ways — through the root helper and through an
+        // explicit all-None list — and assert both produce the historical line.
+        let via_helper =
+            build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+                .expect("root commands yield content");
+        let via_explicit = build_sudoers_content(&acct_runas(
+            "oper",
+            vec![
+                SudoCommand::root("/usr/sbin/ip"),
+                SudoCommand::root("/usr/bin/nmcli"),
+            ],
+        ))
+        .expect("explicit None commands yield content");
+        assert_eq!(via_helper, via_explicit, "the two forms must be identical");
+        let rule = via_helper
+            .lines()
+            .find(|l| !l.starts_with('#') && !l.is_empty())
+            .expect("a rule line");
+        assert_eq!(
+            rule,
+            "oper ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli"
+        );
+    }
+
+    #[test]
+    fn mixed_runas_groups_commands_by_runspec_in_first_appearance_order() {
+        // A permission narrowing two commands to a service account, plus one root
+        // command. The service-account group appears first (its commands came
+        // first), then the `(ALL)` group — exactly one rule line.
+        let content = build_sudoers_content(&acct_runas(
+            "oper",
+            vec![
+                SudoCommand::as_user("/opt/x", "bfs_solutions"),
+                SudoCommand::as_user("/opt/y", "bfs_solutions"),
+                SudoCommand::root("/usr/sbin/ip"),
+            ],
+        ))
+        .expect("mixed runas yields content");
+        let rule = content
+            .lines()
+            .find(|l| !l.starts_with('#') && !l.is_empty())
+            .expect("a rule line");
+        assert_eq!(
+            rule,
+            "oper ALL=(bfs_solutions) NOPASSWD: /opt/x, /opt/y, (ALL) NOPASSWD: /usr/sbin/ip"
+        );
+    }
+
+    #[test]
+    fn group_mixed_runas_groups_commands_by_runspec() {
+        // The same grouping on the `%group` builder.
+        let content = build_group_sudoers_content(&group_runas(
+            "wheel",
+            vec![
+                SudoCommand::as_user("/opt/x", "bfs_solutions"),
+                SudoCommand::as_user("/opt/y", "bfs_solutions"),
+                SudoCommand::root("/usr/sbin/ip"),
+            ],
+        ))
+        .expect("mixed runas yields content");
+        let rule = content
+            .lines()
+            .find(|l| !l.starts_with('#') && !l.is_empty())
+            .expect("a rule line");
+        assert_eq!(
+            rule,
+            "%wheel ALL=(bfs_solutions) NOPASSWD: /opt/x, /opt/y, (ALL) NOPASSWD: /usr/sbin/ip"
+        );
+    }
+
+    #[test]
+    fn group_all_root_renders_byte_identical_to_legacy() {
+        // Backward-compat for the %group builder: an all-root group is the
+        // historical `(ALL)` line, unchanged.
+        let content =
+            build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+                .expect("root commands yield content");
+        let rule = content
+            .lines()
+            .find(|l| !l.starts_with('#') && !l.is_empty())
+            .expect("a rule line");
+        assert_eq!(
+            rule,
+            "%wheel ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli"
+        );
+    }
+
+    #[test]
+    fn write_sudoers_validates_mixed_runas_fragment() {
+        // The mixed-runas fragment must pass `visudo -c`: a service-account group
+        // followed by the root group is valid sudoers.
+        if !visudo_available() {
+            eprintln!("skipping mixed-runas visudo test: visudo not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let content = build_sudoers_content(&acct_runas(
+            "oper",
+            vec![
+                SudoCommand::as_user("/opt/x", "bfs_solutions"),
+                SudoCommand::root("/usr/sbin/ip"),
+            ],
+        ))
+        .expect("mixed runas yields content");
+        write_sudoers(dir.path(), "oper", &content).unwrap();
+        let dest = sudoers_path(dir.path(), "oper");
+        assert!(
+            dest.exists(),
+            "validated mixed-runas fragment must activate"
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), content);
     }
 
     #[test]

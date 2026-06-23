@@ -1342,9 +1342,10 @@ fn build_managed_set(
                     && groups_equal(&existing.groups, &t.groups)
                     && existing.sudo_role == t.sudo_role
                     // The concrete sudo command set is part of the account's
-                    // recorded privilege; an unchanged set (order-insensitive)
-                    // preserves from_version, a changed one is a real update.
-                    && groups_equal(&existing.sudo_commands, &t.sudo_commands)
+                    // recorded privilege; an unchanged set (order-insensitive, by
+                    // (command, runas) pair) preserves from_version, a changed one
+                    // — including a run-as re-target — is a real update.
+                    && crate::plan::sudo_set_equal(&existing.sudo_commands, &t.sudo_commands)
                     // The file-grant set is likewise part of the recorded
                     // privilege: an unchanged set (set-equal) preserves
                     // from_version, a changed one is a real update.
@@ -1488,7 +1489,7 @@ fn build_managed_groups(
         let from_version = match prior_record {
             Some(p)
                 if p.provenance == rg.provenance
-                    && groups_equal(&p.sudo_commands, &rg.sudo_commands)
+                    && crate::plan::sudo_set_equal(&p.sudo_commands, &rg.sudo_commands)
                     && groups_equal(&p.members_added, &rg.members)
                     && crate::plan::file_grants_set_equal(&p.file_grants, &rg.file_grants) =>
             {
@@ -1582,7 +1583,7 @@ mod tests {
     use crate::fileaccess::{acl_capabilities, FakeBackend, FileAccessBackend};
     use crate::inspect::{FakeInspector, GroupFacts};
     use crate::lockout::LockoutContext;
-    use crate::model::{CompileInputs, ResolvedAccount};
+    use crate::model::{CompileInputs, ResolvedAccount, SudoCommand};
     use crate::state::FakeState;
 
     /// A fresh dir-only (ACL-equivalent) backend for tests whose roles carry no
@@ -2722,7 +2723,7 @@ mod tests {
         // so the retention is visible rather than silent.
         let (_t, d) = empty_decl();
         let mut rec = managed("oper", 9010, &["wheel"], 4);
-        rec.sudo_commands = vec!["/usr/sbin/ip".to_owned()];
+        rec.sudo_commands = vec![SudoCommand::root("/usr/sbin/ip")];
         rec.file_grants = vec![ManagedFileGrant {
             path: "/etc/ssh".to_owned(),
             access: crate::catalog::Access::Rw,
@@ -3062,6 +3063,7 @@ mod tests {
                 category: None,
                 groups: ListOverride::default(),
                 sudo: ListOverride::default(),
+                runas: None,
                 limits: None,
                 replace: false,
                 includes: Vec::new(),
@@ -3345,6 +3347,7 @@ mod tests {
                 category: None,
                 groups: ListOverride::default(),
                 sudo: ListOverride::Replace(sudo.iter().map(|s| s.to_string()).collect()),
+                runas: None,
                 limits: None,
                 replace: false,
                 includes: Vec::new(),
@@ -3484,7 +3487,7 @@ mod tests {
             .find(|g| g.name == "ops")
             .expect("ops recorded");
         assert_eq!(g.provenance, crate::model::Provenance::Created);
-        assert_eq!(g.sudo_commands, vec!["/usr/sbin/ip"]);
+        assert_eq!(g.sudo_commands, vec![SudoCommand::root("/usr/sbin/ip")]);
         assert_eq!(g.members_added, vec!["netops"]);
         assert_eq!(g.file_grants.len(), 1);
         assert_eq!(g.gid, Some(8050));
@@ -3556,7 +3559,7 @@ mod tests {
             gid: Some(10),
             provenance: crate::model::Provenance::Adopted,
             members_added: vec!["netops".to_owned()],
-            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            sudo_commands: vec![SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![ManagedFileGrant {
                 path: "/etc/net".to_owned(),
                 access: Access::Rw,
@@ -3626,7 +3629,7 @@ mod tests {
             gid: Some(8050),
             provenance: crate::model::Provenance::Created,
             members_added: vec!["netops".to_owned()],
-            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            sudo_commands: vec![SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![ManagedFileGrant {
                 path: "/etc/net".to_owned(),
                 access: Access::Rw,
@@ -3722,7 +3725,7 @@ mod tests {
             gid: Some(8050),
             provenance: crate::model::Provenance::Created,
             members_added: vec!["a".to_owned()],
-            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            sudo_commands: vec![SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![],
             adopt_baseline: None,
             from_version: 4,
@@ -3812,7 +3815,7 @@ mod tests {
             gid: Some(8050),
             provenance: crate::model::Provenance::Created,
             members_added: vec!["netops".to_owned()],
-            sudo_commands: vec!["/usr/sbin/ip".to_owned()],
+            sudo_commands: vec![SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![],
             adopt_baseline: None,
             from_version: 5,
@@ -3822,7 +3825,7 @@ mod tests {
         // supplementary groups, so the account record carries no `ops` group.
         let applied_acct = {
             let mut m = managed("netops", 9010, &[], 5);
-            m.sudo_commands = vec!["/usr/sbin/ip".to_owned()];
+            m.sudo_commands = vec![SudoCommand::root("/usr/sbin/ip")];
             m
         };
         let st = fake_state_with_groups(vec![applied_acct], vec![applied_group]);

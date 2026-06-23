@@ -101,11 +101,11 @@
           "type": "string"
         },
         "sudo_commands": {
-          "description": "Recorded concrete sudo commands (permission-expanded). Persisted so that\ngranting or revoking a permission which changes the sudo command set is\nvisible to the plan diff — the same privilege-revocation correctness that\n`sudo_role` gets, but for the concrete-command path (otherwise a stale\nNOPASSWD rule would leak after a permission is dropped). `#[serde(default)]`\nso a registry written before this field existed still reads (empty set).",
+          "description": "Recorded concrete sudo commands (permission-expanded), each paired with\nthe account it runs as. Persisted so that granting, revoking, or\n*re-targeting* (root → service account) a permission which changes the\nsudo command set is visible to the plan diff — the same\nprivilege-revocation correctness that `sudo_role` gets, but for the\nconcrete-command path (otherwise a stale NOPASSWD rule, or a stale\nrun-spec, would leak after a permission changes). Each entry serializes as\na bare string for a root command (`\"/usr/sbin/ip\"`) and as a `{ command,\nrunas }` table only when narrowed, so a registry written before `runas`\nexisted — and every all-root account — keeps its on-disk form unchanged.\n`#[serde(default)]` so a registry written before this field existed still\nreads (empty set).",
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/SudoCommand"
           }
         },
         "sudo_role": {
@@ -213,11 +213,11 @@
           "default": "created"
         },
         "sudo_commands": {
-          "description": "Concrete sudo commands bound to the group (for diff / revocation — same\nauthority the account record carries). `#[serde(default)]` so an old\nregistry reads as empty.",
+          "description": "Concrete sudo commands bound to the group (for diff / revocation — same\nauthority the account record carries), each paired with the account it\nruns as. Serializes a root command as a bare string and a narrowed one as\na `{ command, runas }` table, keeping an all-root group's on-disk form\nunchanged. `#[serde(default)]` so an old registry reads as empty.",
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/SudoCommand"
           }
         }
       },
@@ -239,6 +239,31 @@
           "description": "The object pre-existed and was taken under management; on removal Census\nreleases it back to baseline and never deletes it.",
           "type": "string",
           "const": "adopted"
+        }
+      ]
+    },
+    "SudoCommand": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "runas": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "command"
+          ]
         }
       ]
     }

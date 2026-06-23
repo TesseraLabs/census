@@ -330,6 +330,7 @@ fn sourced(value: &str, layer: &str, via: Option<&str>) -> SourcedPrimitive {
         value: value.to_owned(),
         layer: layer.to_owned(),
         via: via.map(str::to_owned),
+        runas: None,
     }
 }
 
@@ -343,6 +344,7 @@ fn compiled_perm(
         resolved: ResolvedPermission {
             id: id.to_owned(),
             risk,
+            runas: None,
             groups,
             sudo,
             file_grants: Vec::new(),
@@ -371,6 +373,7 @@ fn compiled_perm_with_file(
         resolved: ResolvedPermission {
             id: id.to_owned(),
             risk: None,
+            runas: None,
             groups: vec![],
             sudo: vec![],
             file_grants: vec![crate::catalog::ResolvedFileGrant {
@@ -686,7 +689,7 @@ fn resolved_group(
         gid: None,
         provenance: model::Provenance::Created,
         members: Vec::new(),
-        sudo_commands: sudo.iter().map(|s| s.to_string()).collect(),
+        sudo_commands: sudo.iter().map(|s| model::SudoCommand::root(*s)).collect(),
         file_grants,
         limits: Limits::default(),
         bound_roles: Vec::new(),
