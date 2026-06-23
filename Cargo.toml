@@ -93,7 +93,6 @@ pedantic = { level = "warn", priority = -1 }
 allow_attributes_without_reason = "deny"
 clone_on_ref_ptr = "deny"
 map_err_ignore = "deny"
-string_to_string = "deny"
 undocumented_unsafe_blocks = "deny"
 unnecessary_safety_comment = "deny"
 unnecessary_safety_doc = "deny"

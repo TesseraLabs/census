@@ -1214,7 +1214,7 @@ fn resolve_roles_honours_catalog_dir_override() {
     let ctx = ResolveCtx::default();
 
     // With the site root passed through, the role resolves and contributes.
-    let roles = resolve_roles(&roles_dir, &[site_root.clone()], &os, &ctx);
+    let roles = resolve_roles(&roles_dir, std::slice::from_ref(&site_root), &os, &ctx);
     assert_eq!(roles.len(), 1);
     assert!(
         roles[0].sudo.iter().any(|c| c == "/usr/sbin/site-tool"),

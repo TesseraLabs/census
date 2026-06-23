@@ -1034,7 +1034,7 @@ fn grant_coverage_note(grant: &ResolvedFileGrant) -> String {
 /// installed would simply not reclassify here.
 fn backend_limited_config(path: &str) -> bool {
     let parent = parent_dir(path);
-    NON_GRANTABLE_PARENTS.iter().any(|p| *p == parent)
+    NON_GRANTABLE_PARENTS.contains(&parent)
 }
 
 /// Whether a unit name is covered by the named-unit set, accepting both `<u>` and
