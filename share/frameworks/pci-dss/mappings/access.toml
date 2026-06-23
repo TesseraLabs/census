@@ -1,36 +1,36 @@
-# Маппинг разрешений каталога Census → control-id PCI DSS 4.0, с полярностью связи.
-# Ключ = id разрешения. satisfies — способность адресует контроль; risk — способность
-# контроль подрывает; related — нейтрально касается области (вне домена Census).
-# Границы домена — через owned в controls.toml.
+# Mapping of Census catalog permissions → PCI DSS 4.0 control-ids, with link polarity.
+# Key = permission id. satisfies — the capability addresses the control; risk — the capability
+# undermines the control; related — neutrally touches the area (outside the Census domain).
+# Domain boundaries are set via owned in controls.toml.
 
-# управление учётками/ролями; конфликтует с моделью роль-учётки — выдаётся редко.
-# 7.2.4 (периодический пересмотр прав) НЕ маппится: это процесс/Control-фича, не грант
-# разрешения — остаётся честным gap в coverage.
+# account/role management; conflicts with the role-account model — rarely granted.
+# 7.2.4 (periodic review of permissions) is NOT mapped: it is a process/Control feature, not a
+# permission grant — it remains an honest gap in coverage.
 [user-admin]
 satisfies = ["7.2.1", "7.2.5"]
 
-# политика sudo = применение наименьших привилегий
+# sudo policy = enforcement of least privilege
 [sudo-config]
 satisfies = ["7.2.2", "7.3.1"]
 
-# контроль удалённого доступа
+# remote access control
 [ssh-admin]
 satisfies = ["7.3.2"]
 
-# роль-ограниченный доступ на чтение данных аудита
+# role-restricted read access to audit data
 [log-read]
 satisfies = ["7.2.6"]
 
-# auth-конфиг; идентификация/пароли/MFA = Tessera (8.2.1 owned=false): нейтрально касается.
+# auth config; identification/passwords/MFA = Tessera (8.2.1 owned=false): neutrally touches.
 [pam-config]
 related = ["8.2.1"]
 
-# грант способности аудита; политика журналирования вне домена (10.2.1 owned=false):
-# нейтрально касается, не удовлетворяет.
+# grant of the audit capability; logging policy is outside the domain (10.2.1 owned=false):
+# neutrally touches, does not satisfy.
 [audit-config]
 related = ["10.2.1"]
 
-# ротация/очистка журналов УГРОЖАЕТ целостности журналов аудита (10.5.1):
-# способность подрывает контроль, а не удовлетворяет его.
+# log rotation/cleanup THREATENS the integrity of audit logs (10.5.1):
+# the capability undermines the control rather than satisfying it.
 [log-admin]
 risk = ["10.5.1"]

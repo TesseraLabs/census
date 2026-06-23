@@ -1,8 +1,8 @@
-# Перечень access-релевантных контролей PCI DSS 4.0 для gap-oracle.
-# title — своими словами (не текст требования PCI SSC). owned=true — домен Census
-# (роль-учётки/группы/sudo-гранты); owned=false — вне домена (auth = Tessera, политика
-# журналирования = device/Tessera), в расчёт покрытия НЕ входит.
-# Ключи квотированы: точка в TOML — разделитель, control-id "7.2.1" должен быть строкой.
+# List of access-relevant PCI DSS 4.0 controls for the gap-oracle.
+# title is paraphrased (not PCI SSC requirement text). owned=true — Census domain
+# (role accounts/groups/sudo grants); owned=false — outside the domain (auth = Tessera, logging
+# policy = device/Tessera), NOT counted toward coverage.
+# Keys are quoted: a dot in TOML is a separator, so control-id "7.2.1" must be a string.
 
 ["7.2.1"]
 title  = "Модель управления доступом и роли определены"

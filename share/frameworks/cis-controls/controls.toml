@@ -1,7 +1,7 @@
-# Перечень Safeguard'ов CIS Control 6 для gap-oracle. title — своими словами (не текст CIS).
-# owned=true — домен Census (роль-учётки/группы/sudo-гранты, RBAC); owned=false — вне домена
-# (6.7 централизация через каталог = противоположность offline-модели Census), в gap НЕ входит.
-# Ключи квотированы: точка в TOML — разделитель, Safeguard "6.1" должен быть строкой.
+# List of CIS Control 6 Safeguards for the gap-oracle. title is paraphrased (not CIS text).
+# owned=true — Census domain (role accounts/groups/sudo grants, RBAC); owned=false — outside the domain
+# (6.7 centralization via a directory = the opposite of Census's offline model), NOT included in the gap.
+# Keys are quoted: a dot in TOML is a separator, so Safeguard "6.1" must be a string.
 
 ["6.1"]
 title  = "Установлен процесс предоставления доступа"
