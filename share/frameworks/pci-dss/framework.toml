@@ -1,0 +1,9 @@
+# PCI DSS — cross-reference access-governance-разрешений Census на требования стандарта.
+# Только номера требований (факты) и заголовки своими словами; текст требований PCI SSC
+# (копирайт) не воспроизводится. Срез: req 7 (ограничение доступа), частично 8/10 —
+# auth/логирование помечены owned=false (вне домена Census).
+id        = "pci-dss"
+version   = "4.0"
+title     = "PCI DSS"
+dimension = "flat"
+provides  = ["crossref", "controls"]

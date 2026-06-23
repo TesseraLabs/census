@@ -3,14 +3,15 @@
 use crate::apply::{self, ApplyInputs};
 use crate::backup::{Backup, BackupTargets};
 use crate::catalog::{
-    self, CatalogError, LiveCatalog, OsTarget, ResolveCtx, ResolvedPermission, Risk,
-    SourcedPrimitive,
+    self, CatalogError, CatalogSource, LiveCatalog, OsTarget, ResolveCtx, ResolvedPermission,
+    Risk, SourcedPrimitive,
 };
 use crate::coverage::{
     self, CoverageCtx, CoverageReport, LiveSurface, ResolvedRole, SurfaceClass, SurfaceScanner,
 };
 use crate::doctor::{self, DoctorReport};
 use crate::fileaccess::AclBackend;
+use crate::framework::{self, LoadedFrameworks};
 use crate::inspect::LiveInspector;
 use crate::l10n::{self, LiveL10n, L10nSource};
 use crate::lockout::LockoutContext;
@@ -426,7 +427,57 @@ pub fn run_doctor(declaration: Option<&Path>, managed: &Path) -> ExitCode {
     };
     let targets = declaration.and_then(resolve_targets);
     let inspector = LiveInspector::new();
-    let report = doctor::run_doctor(&state, &inspector, targets.as_deref());
+    let mut report = doctor::run_doctor(&state, &inspector, targets.as_deref());
+
+    // Append framework cross-reference integrity findings (all advisory Warn —
+    // the layer can never widen/break a grant, so it never fails doctor's exit
+    // code). Best-effort: any failure to determine the OS target, read the
+    // catalog, or load the framework tree just skips these findings with a
+    // warning to stderr — a broken/absent advisory layer must not fail doctor.
+    // An absent frameworks/ tree loads as empty → zero findings (no special-case).
+    match detect_os_target(None) {
+        Ok(os) => {
+            let catalog = LiveCatalog::new(default_catalog_roots());
+            match catalog.all_definitions(&os) {
+                Ok(defs) => {
+                    let known: std::collections::BTreeSet<String> =
+                        defs.into_iter().map(|(_, def)| def.id).collect();
+                    match framework::load_frameworks(&framework::default_framework_roots(), &os) {
+                        Ok(loaded) => {
+                            for w in &loaded.warnings {
+                                report.findings.push(doctor::framework_load_warning(w));
+                            }
+                            report.findings.extend(doctor::framework_findings(
+                                &framework::lint_loaded(&loaded, &known),
+                            ));
+                        }
+                        Err(framework::FrameworkError::IdCollision { id }) => {
+                            let lint = framework::FrameworkLint {
+                                code: "id-collision",
+                                severity: framework::FrameworkLintSeverity::Error,
+                                message: format!(
+                                    "framework id {id} declared in two roots (determinism)"
+                                ),
+                            };
+                            report
+                                .findings
+                                .extend(doctor::framework_findings(&[lint]));
+                        }
+                        Err(e) => {
+                            eprintln!("warning: framework check skipped (load failed): {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: framework check skipped (catalog unreadable): {e}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: cannot determine OS target for framework check: {e}");
+        }
+    }
+
     print!("{}", render_report(&report));
     doctor_exit_code(&report)
 }
@@ -1018,16 +1069,24 @@ pub fn run_compile(
     ExitCode::SUCCESS
 }
 
+/// Options for `census show <role>` (CLI-derived).
+pub struct ShowOpts<'a> {
+    pub role: &'a str,
+    pub declaration: &'a Path,
+    pub catalog_roots: Vec<PathBuf>,
+    pub os_target: Option<&'a str>,
+    pub lang: Option<&'a str>,
+    pub framework: Option<&'a str>,
+    pub framework_roots: Vec<PathBuf>,
+    pub format: Option<&'a str>,
+}
+
 /// Run `census show <role> --lang <l>`: render a tree role → permission/bundle →
 /// expanded primitives, with localized texts and (advisory) risk classes.
 /// Read-only.
-pub fn run_show(
-    role: &str,
-    declaration: &Path,
-    catalog_roots: Vec<PathBuf>,
-    os_target: Option<&str>,
-    lang: Option<&str>,
-) -> ExitCode {
+pub fn run_show(opts: ShowOpts<'_>) -> ExitCode {
+    let ShowOpts { role, declaration, catalog_roots, os_target, lang, framework, framework_roots, format } = opts;
+    let json = format == Some("json");
     let text = match std::fs::read_to_string(declaration) {
         Ok(t) => t,
         Err(e) => {
@@ -1061,6 +1120,46 @@ pub fn run_show(
         }
     };
 
+    // --- framework cross-reference view (--framework given) ---
+    //
+    // When `--framework` is present we load the framework tree and render the
+    // compiled role's permissions against the selected framework(s) — controls +
+    // mapping provenance — in either human or JSON form. This is a wholly
+    // separate, read-only report from the plain show tree.
+    if let Some(fw_spec) = framework {
+        let loaded = match framework::load_frameworks(&framework_roots, &os) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("census: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for w in &loaded.warnings {
+            eprintln!("census: warning: {w}");
+        }
+        let selection = FrameworkSelection::resolve(fw_spec, &loaded);
+        if json {
+            print!("{}", render_show_framework_json(&compiled, &selection, &loaded));
+        } else {
+            print!("{}", render_show_framework_human(&compiled, &selection, &loaded));
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // --- JSON without --framework ---
+    //
+    // `--format json` may be requested without a framework. Per the slice
+    // contract there is no framework stamp to emit (none was requested), so we
+    // render a minimal JSON of the role and its permission ids — valid JSON, no
+    // `frameworks` array. The stamped, framework-bearing JSON is only produced
+    // when `--framework` is also given (handled above).
+    if json {
+        print!("{}", render_show_permissions_json(&compiled));
+        return ExitCode::SUCCESS;
+    }
+
+    // --- default: the plain localized show tree (current behavior) ---
+    //
     // Language selection: explicit --lang beats LC_MESSAGES beats LANG beats en.
     // The real environment is read HERE (the pure picker stays testable).
     let lc_messages = std::env::var("LC_MESSAGES").ok();
@@ -1071,6 +1170,194 @@ pub fn run_show(
     let l10n = LiveL10n::new(catalog_roots);
     print!("{}", render_show_tree(&compiled, &chosen, &l10n));
     ExitCode::SUCCESS
+}
+
+/// Which framework(s) a `census show --framework <spec>` invocation displays.
+///
+/// `<spec>` is either a single framework id or `all`. We resolve it eagerly to a
+/// sorted list of ids drawn from the loaded set so the render functions are pure
+/// over a concrete id list: `all` expands to every loaded framework id (already
+/// sorted, since `frameworks` is a `BTreeMap`), and a single id is kept as-is
+/// (even if not loaded — the render then shows it with no controls, which is the
+/// honest "framework not installed" signal rather than a silent empty report).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameworkSelection {
+    /// The framework ids to display, sorted.
+    pub ids: Vec<String>,
+}
+
+impl FrameworkSelection {
+    /// Resolve a `--framework` spec against the loaded set. `all` → every loaded
+    /// id; any other value → that single id verbatim.
+    pub fn resolve(spec: &str, loaded: &LoadedFrameworks) -> FrameworkSelection {
+        if spec == "all" {
+            FrameworkSelection {
+                ids: loaded.frameworks.keys().cloned().collect(),
+            }
+        } else {
+            FrameworkSelection {
+                ids: vec![spec.to_owned()],
+            }
+        }
+    }
+}
+
+/// The mapping provenance contributions for one (framework, permission): each
+/// physical mapping file that mentioned the permission, with its layer and path.
+/// Drawn from `loaded.mappings` (the pre-union, per-file record) so the report
+/// can point a reviewer at the exact source of every control mapping.
+fn provenance_for<'a>(
+    loaded: &'a LoadedFrameworks,
+    fw: &str,
+    perm: &str,
+) -> Vec<&'a framework::MappingProvenance> {
+    loaded
+        .mappings
+        .iter()
+        .filter(|m| m.framework_id == fw && m.permission_id == perm)
+        .map(|m| &m.provenance)
+        .collect()
+}
+
+/// Render the framework cross-reference for a compiled role (human form). For
+/// each selected framework, every permission of the role is listed with the
+/// control ids it satisfies and the mapping provenance; a permission with no
+/// mapping in that framework is printed with an explicit `(no mapping)` marker
+/// (never omitted). Pure (no filesystem) so it is unit-testable.
+pub fn render_show_framework_human(
+    compiled: &CompiledRole,
+    selected: &FrameworkSelection,
+    loaded: &LoadedFrameworks,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("role {}\n", compiled.role));
+    if selected.ids.is_empty() {
+        out.push_str("  (no frameworks installed)\n");
+        return out;
+    }
+    for fw in &selected.ids {
+        // Version stamp from the manifest when the framework is loaded; an
+        // unknown id is labelled so the report is honest about a missing install.
+        match loaded.frameworks.get(fw) {
+            Some(m) => out.push_str(&format!("framework {} ({})\n", fw, m.version)),
+            None => out.push_str(&format!("framework {} (not installed)\n", fw)),
+        }
+        if compiled.permissions.is_empty() {
+            out.push_str("  (no permissions; raw escape-hatch only)\n");
+        }
+        for perm in &compiled.permissions {
+            let perm_id = &perm.resolved.id;
+            let polar = loaded.controls_for(perm_id, fw);
+            if polar.is_empty() {
+                out.push_str(&format!("  permission {perm_id} (no mapping)\n"));
+                continue;
+            }
+            out.push_str(&format!("  permission {perm_id}:\n"));
+            if !polar.satisfies.is_empty() {
+                out.push_str(&format!("    ✓ satisfies: {}\n", polar.satisfies.join(", ")));
+            }
+            if !polar.risk.is_empty() {
+                out.push_str(&format!("    ⚠ risk: {}\n", polar.risk.join(", ")));
+            }
+            if !polar.related.is_empty() {
+                out.push_str(&format!("    · related: {}\n", polar.related.join(", ")));
+            }
+            for prov in provenance_for(loaded, fw, perm_id) {
+                let layer = prov.layer.as_deref().unwrap_or("-");
+                out.push_str(&format!("    via {} [{}] {}\n", fw, layer, prov.path.display()));
+            }
+        }
+    }
+    out
+}
+
+/// Render the framework cross-reference as JSON (hand-rolled, no serde_json).
+/// Each selected framework carries a version STAMP (`id` + `version`) and a
+/// `permissions` array; an unmapped permission is marked `"mapped":false` with an
+/// empty `controls` array (never omitted). Pure so the shape is unit-testable.
+pub fn render_show_framework_json(
+    compiled: &CompiledRole,
+    selected: &FrameworkSelection,
+    loaded: &LoadedFrameworks,
+) -> String {
+    let mut out = String::new();
+    out.push('{');
+    out.push_str(&format!("\"role\":{},", json_str(&compiled.role)));
+    out.push_str("\"frameworks\":[");
+    let fws: Vec<String> = selected
+        .ids
+        .iter()
+        .map(|fw| {
+            // Version stamp: the manifest version when loaded, else null (an id
+            // the caller named that is not installed).
+            let version = loaded
+                .frameworks
+                .get(fw)
+                .map(|m| json_str(&m.version))
+                .unwrap_or_else(|| "null".to_owned());
+            let perms: Vec<String> = compiled
+                .permissions
+                .iter()
+                .map(|perm| {
+                    let perm_id = &perm.resolved.id;
+                    let polar = loaded.controls_for(perm_id, fw);
+                    let mapped = !polar.is_empty();
+                    let satisfies_json: Vec<String> = polar.satisfies.iter().map(|c| json_str(c)).collect();
+                    let risk_json: Vec<String> = polar.risk.iter().map(|c| json_str(c)).collect();
+                    let related_json: Vec<String> = polar.related.iter().map(|c| json_str(c)).collect();
+                    let prov_json: Vec<String> = provenance_for(loaded, fw, perm_id)
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "{{\"layer\":{},\"path\":{}}}",
+                                p.layer.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+                                json_str(&p.path.display().to_string()),
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{{\"permission\":{},\"satisfies\":[{}],\"risk\":[{}],\"related\":[{}],\"mapped\":{},\"provenance\":[{}]}}",
+                        json_str(perm_id),
+                        satisfies_json.join(","),
+                        risk_json.join(","),
+                        related_json.join(","),
+                        mapped,
+                        prov_json.join(","),
+                    )
+                })
+                .collect();
+            format!(
+                "{{\"id\":{},\"version\":{},\"permissions\":[{}]}}",
+                json_str(fw),
+                version,
+                perms.join(","),
+            )
+        })
+        .collect();
+    out.push_str(&fws.join(","));
+    out.push_str("]}");
+    out.push('\n');
+    out
+}
+
+/// Render a compiled role's permission ids as a minimal JSON object (no framework
+/// block). Used by `census show --format json` WITHOUT `--framework`: no
+/// framework was requested, so there is no version stamp and no `frameworks`
+/// array — just the role and its permission ids. Pure / unit-testable.
+pub fn render_show_permissions_json(compiled: &CompiledRole) -> String {
+    let mut out = String::new();
+    out.push('{');
+    out.push_str(&format!("\"role\":{},", json_str(&compiled.role)));
+    out.push_str("\"permissions\":[");
+    let perms: Vec<String> = compiled
+        .permissions
+        .iter()
+        .map(|p| json_str(&p.resolved.id))
+        .collect();
+    out.push_str(&perms.join(","));
+    out.push_str("]}");
+    out.push('\n');
+    out
 }
 
 /// Render the show tree: role → each permission (localized title + risk class +
@@ -1143,6 +1430,622 @@ pub fn render_show_tree(compiled: &CompiledRole, lang: &str, l10n: &dyn L10nSour
     if let Some(r) = &compiled.raw_sudo_role {
         out.push_str(&format!("  raw sudo_role (escape hatch): {r}\n"));
     }
+    out
+}
+
+// ============================================================================
+// framework subcommand (read-only compliance cross-reference)
+//
+// `census framework {list,show,coverage}` surface the loaded framework tree:
+// list installed frameworks, show one framework's controls + coverage stats, and
+// the coverage gap-oracle (owned controls with no mapping). All strictly
+// read-only metadata — they never touch compile/plan/apply. Each run_* loads the
+// frameworks (resolving os-layered ones against the detected OS target) and
+// delegates the output to a pure render helper.
+// ============================================================================
+
+/// Load the framework tree for a `framework` subcommand: resolve the OS target
+/// (for os-layered frameworks) and call `load_frameworks`. Emits forward-compat
+/// warnings to stderr. Returns the loaded set or an exit-failing error already
+/// printed to stderr.
+fn load_frameworks_for_cli(
+    framework_roots: &[PathBuf],
+    os_target: Option<String>,
+) -> Result<LoadedFrameworks, ExitCode> {
+    let os = match detect_os_target(os_target.as_deref()) {
+        Ok(os) => os,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    match framework::load_frameworks(framework_roots, &os) {
+        Ok(loaded) => {
+            for w in &loaded.warnings {
+                eprintln!("census: warning: {w}");
+            }
+            Ok(loaded)
+        }
+        Err(e) => {
+            eprintln!("census: {e}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Run `census framework list`: enumerate installed frameworks with their version
+/// and advertised `provides`. Always exits 0 (a query). Read-only.
+pub fn run_framework_list(
+    framework_roots: Vec<PathBuf>,
+    os_target: Option<String>,
+    json: bool,
+) -> ExitCode {
+    let loaded = match load_frameworks_for_cli(&framework_roots, os_target) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    if json {
+        print!("{}", render_framework_list_json(&loaded));
+    } else {
+        print!("{}", render_framework_list_human(&loaded));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Render the framework list (human form): one line per installed framework with
+/// its id, version, title and `provides` tags. An empty tree reports
+/// "no frameworks installed". Pure / unit-testable.
+pub fn render_framework_list_human(loaded: &LoadedFrameworks) -> String {
+    let mut out = String::new();
+    if loaded.frameworks.is_empty() {
+        out.push_str("no frameworks installed\n");
+        return out;
+    }
+    out.push_str("frameworks:\n");
+    for (id, m) in &loaded.frameworks {
+        let provides = if m.provides.is_empty() {
+            "-".to_owned()
+        } else {
+            m.provides.join(", ")
+        };
+        out.push_str(&format!(
+            "  {} {} — {} [provides: {}]\n",
+            id, m.version, m.title, provides
+        ));
+    }
+    out
+}
+
+/// Render the framework list as JSON (hand-rolled). Each entry carries id,
+/// version, title and the `provides` array. An empty tree yields an empty array.
+/// Pure / unit-testable.
+pub fn render_framework_list_json(loaded: &LoadedFrameworks) -> String {
+    let mut out = String::new();
+    out.push_str("{\"frameworks\":[");
+    let items: Vec<String> = loaded
+        .frameworks
+        .iter()
+        .map(|(id, m)| {
+            let provides: Vec<String> = m.provides.iter().map(|p| json_str(p)).collect();
+            format!(
+                "{{\"id\":{},\"version\":{},\"title\":{},\"provides\":[{}]}}",
+                json_str(id),
+                json_str(&m.version),
+                json_str(&m.title),
+                provides.join(","),
+            )
+        })
+        .collect();
+    out.push_str(&items.join(","));
+    out.push_str("]}");
+    out.push('\n');
+    out
+}
+
+/// Run `census framework lint`: load the framework cross-reference layer and
+/// report integrity findings (orphaned mappings, provides/files desync, unknown
+/// control dimension, id collision). The known-permission set is built from the
+/// catalog so an orphaned mapping (a permission id absent from the catalog) is
+/// detected. Read-only. Exit FAILURE iff any finding is an ERROR (only the
+/// determinism-breaking id collision), else SUCCESS — warnings never gate.
+pub fn run_framework_lint(
+    framework_roots: Vec<PathBuf>,
+    catalog_roots: Vec<PathBuf>,
+    os_target: Option<String>,
+    json: bool,
+) -> ExitCode {
+    let os = match detect_os_target(os_target.as_deref()) {
+        Ok(os) => os,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Build the set of known catalog permission ids a mapping is validated
+    // against. A catalog read failure is a hard error (we cannot tell orphaned
+    // from valid without it).
+    let catalog = LiveCatalog::new(catalog_roots);
+    let known: std::collections::BTreeSet<String> = match catalog.all_definitions(&os) {
+        Ok(defs) => defs.into_iter().map(|(_, def)| def.id).collect(),
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Load the framework tree directly (not via load_frameworks_for_cli) so the
+    // determinism IdCollision error can be turned into a reported Error finding
+    // rather than a bare process failure.
+    let findings = match framework::load_frameworks(&framework_roots, &os) {
+        Ok(loaded) => {
+            for w in &loaded.warnings {
+                eprintln!("census: warning: {w}");
+            }
+            framework::lint_loaded(&loaded, &known)
+        }
+        Err(framework::FrameworkError::IdCollision { id }) => {
+            // The one determinism Error the lint surface REPORTS (not aborts on):
+            // a duplicate framework id across roots makes the loaded set depend on
+            // read order. Surface it as an Error finding and render normally.
+            vec![framework::FrameworkLint {
+                code: "id-collision",
+                severity: framework::FrameworkLintSeverity::Error,
+                message: format!("framework id {id} declared in two roots (determinism)"),
+            }]
+        }
+        Err(e) => {
+            // A malformed/unreadable framework file is a hard error, not a lint
+            // finding — fail closed.
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if json {
+        print!("{}", render_framework_lint_json(&findings));
+    } else {
+        print!("{}", render_framework_lint_human(&findings));
+    }
+
+    if findings
+        .iter()
+        .any(|f| f.severity == framework::FrameworkLintSeverity::Error)
+    {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Render framework lint findings (human form): one line per finding as
+/// `{TAG} [{code}] {message}` (TAG is `ERROR`/`WARNING`), or a single
+/// "no findings" line when empty. Pure / unit-testable.
+pub fn render_framework_lint_human(findings: &[framework::FrameworkLint]) -> String {
+    if findings.is_empty() {
+        return "framework lint: no findings\n".to_owned();
+    }
+    let mut out = String::new();
+    for f in findings {
+        let tag = match f.severity {
+            framework::FrameworkLintSeverity::Warning => "WARNING",
+            framework::FrameworkLintSeverity::Error => "ERROR",
+        };
+        out.push_str(&format!("{} [{}] {}\n", tag, f.code, f.message));
+    }
+    out
+}
+
+/// Render framework lint findings as JSON (hand-rolled, no serde_json):
+/// `{"findings":[{"code":..,"severity":"warning"|"error","message":..}, ...]}`.
+/// Pure / unit-testable.
+pub fn render_framework_lint_json(findings: &[framework::FrameworkLint]) -> String {
+    let mut out = String::new();
+    out.push_str("{\"findings\":[");
+    let items: Vec<String> = findings
+        .iter()
+        .map(|f| {
+            let severity = match f.severity {
+                framework::FrameworkLintSeverity::Warning => "warning",
+                framework::FrameworkLintSeverity::Error => "error",
+            };
+            format!(
+                "{{\"code\":{},\"severity\":{},\"message\":{}}}",
+                json_str(f.code),
+                json_str(severity),
+                json_str(&f.message),
+            )
+        })
+        .collect();
+    out.push_str(&items.join(","));
+    out.push_str("]}");
+    out.push('\n');
+    out
+}
+
+/// The set of control ids covered by at least one **satisfies** mapping in
+/// framework `fw`: the controls any mapping addresses (satisfies-polarity).
+/// Empty when the framework has no satisfies mappings (or is absent).
+fn covered_controls(loaded: &LoadedFrameworks, fw: &str) -> Vec<String> {
+    loaded.satisfied_controls(fw)
+}
+
+/// Run `census framework show <fw>`: list the framework's controls (id, title,
+/// owned, domain) plus coverage statistics (owned total / covered / uncovered).
+/// A framework id that is not installed is an error (FAILURE). Read-only.
+pub fn run_framework_show(
+    fw: &str,
+    framework_roots: Vec<PathBuf>,
+    os_target: Option<String>,
+    json: bool,
+) -> ExitCode {
+    let loaded = match load_frameworks_for_cli(&framework_roots, os_target) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    if !loaded.frameworks.contains_key(fw) {
+        eprintln!("census: framework {fw} not installed");
+        return ExitCode::FAILURE;
+    }
+    if json {
+        print!("{}", render_framework_show_json(fw, &loaded));
+    } else {
+        print!("{}", render_framework_show_human(fw, &loaded));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Coverage statistics for one framework: how many *owned* controls there are and
+/// how many of them are covered by a mapping (vs left as a gap).
+struct OwnedCoverageStats {
+    owned_total: usize,
+    owned_covered: usize,
+    owned_uncovered: usize,
+}
+
+/// Compute owned-control coverage stats for framework `fw`: of the controls
+/// flagged `owned = true`, how many appear in at least one mapping (covered) and
+/// how many do not (the gap). Out-of-domain (`owned = false`) controls are not
+/// counted here — they are surfaced separately by the coverage report.
+fn owned_coverage_stats(loaded: &LoadedFrameworks, fw: &str) -> OwnedCoverageStats {
+    let covered = covered_controls(loaded, fw);
+    let defs = loaded.controls.get(fw);
+    let owned_ids: Vec<&String> = defs
+        .map(|d| d.iter().filter(|(_, c)| c.owned).map(|(id, _)| id).collect())
+        .unwrap_or_default();
+    let owned_total = owned_ids.len();
+    let owned_covered = owned_ids
+        .iter()
+        .filter(|id| covered.iter().any(|c| &c == *id))
+        .count();
+    OwnedCoverageStats {
+        owned_total,
+        owned_covered,
+        owned_uncovered: owned_total - owned_covered,
+    }
+}
+
+/// Render `framework show` (human form): the version stamp, every control
+/// definition (id, owned flag, optional domain, title), and the owned-coverage
+/// statistics line. Pure / unit-testable.
+pub fn render_framework_show_human(fw: &str, loaded: &LoadedFrameworks) -> String {
+    let mut out = String::new();
+    // Caller guarantees the framework is loaded; fall back gracefully regardless.
+    let version = loaded
+        .frameworks
+        .get(fw)
+        .map(|m| m.version.as_str())
+        .unwrap_or("?");
+    out.push_str(&format!("framework {fw} ({version})\n"));
+    let covered = covered_controls(loaded, fw);
+    out.push_str("controls:\n");
+    match loaded.controls.get(fw) {
+        Some(defs) if !defs.is_empty() => {
+            for (id, def) in defs {
+                let owned = if def.owned { "owned" } else { "inherited" };
+                let domain = def.domain.as_deref().map(|d| format!(" {{{d}}}")).unwrap_or_default();
+                let cov = if covered.iter().any(|c| c == id) { "covered" } else { "uncovered" };
+                out.push_str(&format!("  {id} [{owned}] [{cov}]{domain} — {}\n", def.title));
+            }
+        }
+        _ => out.push_str("  (no control definitions)\n"),
+    }
+    let stats = owned_coverage_stats(loaded, fw);
+    out.push_str(&format!(
+        "coverage: {}/{} owned controls covered ({} uncovered)\n",
+        stats.owned_covered, stats.owned_total, stats.owned_uncovered,
+    ));
+    out
+}
+
+/// Render `framework show` as JSON (hand-rolled). Includes the id+version stamp,
+/// a `controls` array (id/title/owned/domain/covered) and a `coverage` object
+/// with owned totals. Pure / unit-testable.
+pub fn render_framework_show_json(fw: &str, loaded: &LoadedFrameworks) -> String {
+    let version = loaded
+        .frameworks
+        .get(fw)
+        .map(|m| json_str(&m.version))
+        .unwrap_or_else(|| "null".to_owned());
+    let covered = covered_controls(loaded, fw);
+    let mut out = String::new();
+    out.push('{');
+    out.push_str(&format!("\"id\":{},\"version\":{},", json_str(fw), version));
+    out.push_str("\"controls\":[");
+    let controls: Vec<String> = loaded
+        .controls
+        .get(fw)
+        .map(|defs| {
+            defs.iter()
+                .map(|(id, def)| {
+                    format!(
+                        "{{\"id\":{},\"title\":{},\"owned\":{},\"domain\":{},\"covered\":{}}}",
+                        json_str(id),
+                        json_str(&def.title),
+                        def.owned,
+                        def.domain.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
+                        covered.iter().any(|c| c == id),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.push_str(&controls.join(","));
+    out.push_str("],");
+    let stats = owned_coverage_stats(loaded, fw);
+    out.push_str(&format!(
+        "\"coverage\":{{\"owned_total\":{},\"owned_covered\":{},\"owned_uncovered\":{}}}}}",
+        stats.owned_total, stats.owned_covered, stats.owned_uncovered,
+    ));
+    out.push('\n');
+    out
+}
+
+/// The computed coverage gap for a framework: which owned controls are covered by
+/// a mapping, which owned controls are a gap (uncovered), and which controls are
+/// out-of-domain (`owned = false`, surfaced separately and never counted as a
+/// gap). All vectors are sorted (BTreeMap-derived) for deterministic output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameworkCoverage {
+    /// Owned controls that appear in at least one mapping.
+    pub covered: Vec<String>,
+    /// Owned controls with no mapping — the gap a reviewer must close.
+    pub gap: Vec<String>,
+    /// Controls flagged `owned = false`: inherited / out of the org's scope.
+    /// Listed for visibility, never counted in the gap.
+    pub out_of_domain: Vec<String>,
+}
+
+/// Compute the coverage gap for framework `fw`.
+///
+///   * `covered` = owned controls present in some mapping (`reverse[fw]` keys).
+///   * `gap`     = owned controls MINUS covered.
+///   * `out_of_domain` = controls with `owned = false` (surfaced separately).
+///
+/// Coverage is judged only over controls that have a `controls.toml` definition
+/// (the org's declared scope). A control referenced by a mapping but never
+/// defined contributes nothing here (it cannot be "owned"); it simply is not in
+/// the owned/gap/out-of-domain partition. Pure / unit-testable.
+pub fn compute_framework_coverage(loaded: &LoadedFrameworks, fw: &str) -> FrameworkCoverage {
+    let covered_set = covered_controls(loaded, fw);
+    let mut covered = Vec::new();
+    let mut gap = Vec::new();
+    let mut out_of_domain = Vec::new();
+    if let Some(defs) = loaded.controls.get(fw) {
+        // BTreeMap iteration is sorted → deterministic output.
+        for (id, def) in defs {
+            if !def.owned {
+                out_of_domain.push(id.clone());
+            } else if covered_set.iter().any(|c| c == id) {
+                covered.push(id.clone());
+            } else {
+                gap.push(id.clone());
+            }
+        }
+    }
+    FrameworkCoverage { covered, gap, out_of_domain }
+}
+
+/// Run `census framework coverage <fw>`: the gap oracle. Reports the framework's
+/// owned controls that no mapping covers (plus the covered and out-of-domain
+/// sets). A framework id that is not installed is an error (FAILURE). Read-only.
+pub fn run_framework_coverage(
+    fw: &str,
+    framework_roots: Vec<PathBuf>,
+    os_target: Option<String>,
+    json: bool,
+) -> ExitCode {
+    let loaded = match load_frameworks_for_cli(&framework_roots, os_target) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    if !loaded.frameworks.contains_key(fw) {
+        eprintln!("census: framework {fw} not installed");
+        return ExitCode::FAILURE;
+    }
+    let coverage = compute_framework_coverage(&loaded, fw);
+    if json {
+        print!("{}", render_framework_coverage_json(fw, &loaded, &coverage));
+    } else {
+        print!("{}", render_framework_coverage_human(fw, &loaded, &coverage));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Render `framework coverage` (human form): the version stamp, the gap list
+/// (owned-uncovered controls — the actionable output), the covered list, and the
+/// out-of-domain list. Pure / unit-testable.
+pub fn render_framework_coverage_human(
+    fw: &str,
+    loaded: &LoadedFrameworks,
+    coverage: &FrameworkCoverage,
+) -> String {
+    let version = loaded
+        .frameworks
+        .get(fw)
+        .map(|m| m.version.as_str())
+        .unwrap_or("?");
+    let mut out = String::new();
+    out.push_str(&format!("framework {fw} ({version})\n"));
+    out.push_str(&format!(
+        "gap: {} owned control(s) with no mapping\n",
+        coverage.gap.len()
+    ));
+    if coverage.gap.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for id in &coverage.gap {
+            out.push_str(&format!("  {id}\n"));
+        }
+    }
+    out.push_str(&format!("covered: {}\n", coverage.covered.len()));
+    for id in &coverage.covered {
+        out.push_str(&format!("  {id}\n"));
+    }
+    out.push_str(&format!("out-of-domain (not counted): {}\n", coverage.out_of_domain.len()));
+    for id in &coverage.out_of_domain {
+        out.push_str(&format!("  {id}\n"));
+    }
+    out
+}
+
+/// Render `framework coverage` as JSON (hand-rolled). Includes the id+version
+/// stamp plus `covered`, `gap`/`uncovered`, and `out_of_domain` arrays. Pure /
+/// unit-testable.
+pub fn render_framework_coverage_json(
+    fw: &str,
+    loaded: &LoadedFrameworks,
+    coverage: &FrameworkCoverage,
+) -> String {
+    let version = loaded
+        .frameworks
+        .get(fw)
+        .map(|m| json_str(&m.version))
+        .unwrap_or_else(|| "null".to_owned());
+    let arr = |v: &[String]| -> String {
+        v.iter().map(|s| json_str(s)).collect::<Vec<_>>().join(",")
+    };
+    let mut out = String::new();
+    out.push('{');
+    out.push_str(&format!("\"id\":{},\"version\":{},", json_str(fw), version));
+    out.push_str(&format!("\"covered\":[{}],", arr(&coverage.covered)));
+    // `gap` and `uncovered` are the same set (the actionable owned-uncovered
+    // controls); both keys are emitted so either consumer name works.
+    out.push_str(&format!("\"gap\":[{}],", arr(&coverage.gap)));
+    out.push_str(&format!("\"uncovered\":[{}],", arr(&coverage.gap)));
+    out.push_str(&format!("\"out_of_domain\":[{}]", arr(&coverage.out_of_domain)));
+    out.push('}');
+    out.push('\n');
+    out
+}
+
+/// The controls under risk in a framework: each control with at least one `risk`
+/// link, and the permission ids that threaten it. NOT filtered by `owned` — a
+/// threat to an out-of-domain control is still significant (Census does not cover
+/// it, but the capability can still undermine it). Sorted by control id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameworkRisk {
+    /// `(control-id, [threatening permission ids])` pairs, sorted by control id.
+    pub controls: Vec<(String, Vec<String>)>,
+}
+
+/// Compute the risk view for framework `fw`: every control with a `risk`-polarity
+/// link and the permissions that threaten it, regardless of `owned`. Pure /
+/// unit-testable.
+pub fn compute_framework_risk(loaded: &LoadedFrameworks, fw: &str) -> FrameworkRisk {
+    FrameworkRisk { controls: loaded.risk_controls(fw) }
+}
+
+/// Run `census framework risk <fw>`: list controls under threat (≥1 risk link)
+/// and the permissions that undermine them. A framework id not installed is an
+/// error (FAILURE). Read-only.
+pub fn run_framework_risk(
+    fw: &str,
+    framework_roots: Vec<PathBuf>,
+    os_target: Option<String>,
+    json: bool,
+) -> ExitCode {
+    let loaded = match load_frameworks_for_cli(&framework_roots, os_target) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    if !loaded.frameworks.contains_key(fw) {
+        eprintln!("census: framework {fw} not installed");
+        return ExitCode::FAILURE;
+    }
+    let risk = compute_framework_risk(&loaded, fw);
+    if json {
+        print!("{}", render_framework_risk_json(fw, &loaded, &risk));
+    } else {
+        print!("{}", render_framework_risk_human(fw, &loaded, &risk));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Render `framework risk` (human form): the version stamp, then each control
+/// under threat with its title (when defined), an out-of-domain marker when the
+/// control is `owned = false`, and the threatening permissions. Pure.
+pub fn render_framework_risk_human(
+    fw: &str,
+    loaded: &LoadedFrameworks,
+    risk: &FrameworkRisk,
+) -> String {
+    let version = loaded.frameworks.get(fw).map(|m| m.version.as_str()).unwrap_or("?");
+    let defs = loaded.controls.get(fw);
+    let mut out = String::new();
+    out.push_str(&format!("framework {fw} ({version})\n"));
+    out.push_str(&format!("controls under risk: {}\n", risk.controls.len()));
+    if risk.controls.is_empty() {
+        out.push_str("  (none)\n");
+        return out;
+    }
+    for (ctrl, perms) in &risk.controls {
+        let def = defs.and_then(|d| d.get(ctrl));
+        let domain = match def {
+            Some(d) if !d.owned => " [out-of-domain]",
+            _ => "",
+        };
+        let title = def.map(|d| format!(" — {}", d.title)).unwrap_or_default();
+        out.push_str(&format!("  ⚠ {ctrl}{domain}{title}\n"));
+        out.push_str(&format!("    threatened by: {}\n", perms.join(", ")));
+    }
+    out
+}
+
+/// Render `framework risk` as JSON (hand-rolled). Carries the id+version stamp and
+/// a `controls` array of `{id, owned, threatened_by:[perm...]}`. `owned` is null
+/// when the control has no controls.toml definition. Pure.
+pub fn render_framework_risk_json(
+    fw: &str,
+    loaded: &LoadedFrameworks,
+    risk: &FrameworkRisk,
+) -> String {
+    let version = loaded.frameworks.get(fw).map(|m| json_str(&m.version)).unwrap_or_else(|| "null".to_owned());
+    let defs = loaded.controls.get(fw);
+    let mut out = String::new();
+    out.push('{');
+    out.push_str(&format!("\"id\":{},\"version\":{},", json_str(fw), version));
+    out.push_str("\"controls\":[");
+    let items: Vec<String> = risk
+        .controls
+        .iter()
+        .map(|(ctrl, perms)| {
+            let owned = defs
+                .and_then(|d| d.get(ctrl))
+                .map(|d| d.owned.to_string())
+                .unwrap_or_else(|| "null".to_owned());
+            let by: Vec<String> = perms.iter().map(|p| json_str(p)).collect();
+            format!(
+                "{{\"id\":{},\"owned\":{},\"threatened_by\":[{}]}}",
+                json_str(ctrl),
+                owned,
+                by.join(","),
+            )
+        })
+        .collect();
+    out.push_str(&items.join(","));
+    out.push_str("]}");
+    out.push('\n');
     out
 }
 
@@ -3736,7 +4639,415 @@ mod tests {
 
         // Drive the public entry point; it reads the real env for LANG, but
         // explicit --lang ru wins regardless of the host env.
-        let code = run_show("oper", &decl, vec![catalog_root], Some("linux-debian"), Some("ru"));
+        let code = run_show(ShowOpts {
+            role: "oper",
+            declaration: &decl,
+            catalog_roots: vec![catalog_root],
+            os_target: Some("linux-debian"),
+            lang: Some("ru"),
+            framework: None,
+            framework_roots: vec![],
+            format: None,
+        });
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    // ---- framework cross-reference (slices 3 & 4) ----
+
+    /// Build an artificial framework tree under `<dir>/frameworks/` and load it.
+    /// Mirrors the helper style in `framework.rs` tests: a `framework.toml`
+    /// manifest, `mappings/*.toml`, and an optional `controls.toml`. Returns the
+    /// loaded set over a flat OS target (enough for flat frameworks).
+    fn load_fw_tree(
+        dir: &Path,
+        manifests: &[(&str, &str)],
+        mappings: &[(&str, &str)],
+        controls: &[(&str, &str)],
+    ) -> LoadedFrameworks {
+        let root = dir.join("frameworks");
+        for (relpath, body) in manifests.iter().chain(mappings).chain(controls) {
+            let path = root.join(relpath);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, body).unwrap();
+        }
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        framework::load_frameworks(&[root], &os).unwrap()
+    }
+
+    /// A `pci-dss` flat framework: maps `net-admin → 1.1, 1.2` and `log-read →
+    /// 10.1`; `legacy` (not mapped by any role permission here) exists too. The
+    /// `controls.toml` flags `1.1`/`1.2`/`10.1`/`9.9` owned and `2.1` inherited;
+    /// `9.9` is owned-but-uncovered (the gap).
+    fn pci_dss_tree(dir: &Path) -> LoadedFrameworks {
+        load_fw_tree(
+            dir,
+            &[(
+                "pci-dss/framework.toml",
+                "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI DSS\"\ndimension = \"flat\"\nprovides = [\"crossref\", \"controls\"]\n",
+            )],
+            &[
+                ("pci-dss/mappings/a.toml", "[net-admin]\nsatisfies = [\"1.1\", \"1.2\"]\n"),
+                ("pci-dss/mappings/b.toml", "[log-read]\nsatisfies = [\"10.1\"]\n"),
+            ],
+            &[(
+                "pci-dss/controls.toml",
+                "[\"1.1\"]\ntitle = \"Firewall\"\nowned = true\ndomain = \"Network\"\n\
+                 [\"1.2\"]\ntitle = \"Default deny\"\nowned = true\n\
+                 [\"2.1\"]\ntitle = \"No vendor defaults\"\nowned = false\n\
+                 [\"10.1\"]\ntitle = \"Audit logging\"\nowned = true\n\
+                 [\"9.9\"]\ntitle = \"Uncovered owned\"\nowned = true\n",
+            )],
+        )
+    }
+
+    fn show_role() -> CompiledRole {
+        CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![
+                compiled_perm("net-admin", None, vec![], vec![]),
+                // unmapped: present in the role but absent from the framework.
+                compiled_perm("disk-admin", None, vec![], vec![]),
+            ],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        }
+    }
+
+    // --- SLICE 3 ---
+
+    #[test]
+    fn show_framework_human_shows_controls_provenance_and_no_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = pci_dss_tree(tmp.path());
+        let sel = FrameworkSelection::resolve("pci-dss", &loaded);
+        let out = render_show_framework_human(&show_role(), &sel, &loaded);
+        // Mapped permission shows its controls and provenance file path.
+        assert!(out.contains("permission net-admin:"), "{out}");
+        assert!(out.contains("✓ satisfies: 1.1, 1.2"), "{out}");
+        assert!(out.contains("via pci-dss"), "{out}");
+        assert!(out.contains("a.toml"), "{out}");
+        // Unmapped permission carries the explicit marker, never omitted.
+        assert!(out.contains("permission disk-admin (no mapping)"), "{out}");
+        // Version stamp present in the human header too.
+        assert!(out.contains("framework pci-dss (4.0)"), "{out}");
+    }
+
+    #[test]
+    fn show_framework_all_iterates_every_framework() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two frameworks in the tree.
+        let loaded = load_fw_tree(
+            tmp.path(),
+            &[
+                ("pci-dss/framework.toml", "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI\"\ndimension = \"flat\"\n"),
+                ("soc2/framework.toml", "id = \"soc2\"\nversion = \"2\"\ntitle = \"SOC 2\"\ndimension = \"flat\"\n"),
+            ],
+            &[
+                ("pci-dss/mappings/a.toml", "[net-admin]\nsatisfies = [\"1.1\"]\n"),
+                ("soc2/mappings/a.toml", "[net-admin]\nsatisfies = [\"CC6.1\"]\n"),
+            ],
+            &[],
+        );
+        let sel = FrameworkSelection::resolve("all", &loaded);
+        assert_eq!(sel.ids, vec!["pci-dss".to_owned(), "soc2".to_owned()]);
+        let out = render_show_framework_human(&show_role(), &sel, &loaded);
+        assert!(out.contains("framework pci-dss"), "{out}");
+        assert!(out.contains("framework soc2"), "{out}");
+        assert!(out.contains("1.1"), "{out}");
+        assert!(out.contains("CC6.1"), "{out}");
+    }
+
+    #[test]
+    fn show_framework_json_has_version_stamp_and_mapped_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = pci_dss_tree(tmp.path());
+        let sel = FrameworkSelection::resolve("pci-dss", &loaded);
+        let out = render_show_framework_json(&show_role(), &sel, &loaded);
+        // Version stamp (id + version) MUST be present.
+        assert!(out.contains("\"id\":\"pci-dss\""), "{out}");
+        assert!(out.contains("\"version\":\"4.0\""), "{out}");
+        // Mapped + unmapped permissions both present, with the mapped flag.
+        assert!(out.contains("\"permission\":\"net-admin\""), "{out}");
+        assert!(out.contains("\"satisfies\":[\"1.1\",\"1.2\"]"), "{out}");
+        assert!(out.contains("\"mapped\":true"), "{out}");
+        assert!(out.contains("\"permission\":\"disk-admin\""), "{out}");
+        assert!(out.contains("\"mapped\":false"), "{out}");
+        // Well-formed: balanced braces, single trailing newline.
+        assert!(out.ends_with("}\n"), "{out}");
+    }
+
+    #[test]
+    fn show_permissions_json_without_framework_has_no_frameworks_array() {
+        let out = render_show_permissions_json(&show_role());
+        assert!(out.contains("\"role\":\"oper\""), "{out}");
+        assert!(out.contains("\"permissions\":[\"net-admin\",\"disk-admin\"]"), "{out}");
+        // No framework stamp when no framework was requested.
+        assert!(!out.contains("frameworks"), "{out}");
+    }
+
+    // --- SLICE 4 ---
+
+    #[test]
+    fn framework_list_human_and_json_show_version_and_provides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = pci_dss_tree(tmp.path());
+        let human = render_framework_list_human(&loaded);
+        assert!(human.contains("pci-dss 4.0"), "{human}");
+        assert!(human.contains("provides: crossref, controls"), "{human}");
+        let json = render_framework_list_json(&loaded);
+        assert!(json.contains("\"id\":\"pci-dss\""), "{json}");
+        assert!(json.contains("\"version\":\"4.0\""), "{json}");
+        assert!(json.contains("\"provides\":[\"crossref\",\"controls\"]"), "{json}");
+    }
+
+    #[test]
+    fn framework_list_empty_reports_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An empty tree (no frameworks dir created) → empty load.
+        let loaded = load_fw_tree(tmp.path(), &[], &[], &[]);
+        assert_eq!(render_framework_list_human(&loaded), "no frameworks installed\n");
+        assert_eq!(render_framework_list_json(&loaded), "{\"frameworks\":[]}\n");
+    }
+
+    #[test]
+    fn framework_coverage_computes_owned_covered_gap_and_out_of_domain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = pci_dss_tree(tmp.path());
+        let cov = compute_framework_coverage(&loaded, "pci-dss");
+        // Owned + covered: 1.1, 1.2, 10.1 (all owned and referenced by a mapping).
+        assert_eq!(cov.covered, vec!["1.1", "1.2", "10.1"]);
+        // Owned but never mapped → the gap.
+        assert_eq!(cov.gap, vec!["9.9"]);
+        // owned = false → out-of-domain, NOT counted in the gap.
+        assert_eq!(cov.out_of_domain, vec!["2.1"]);
+        assert!(!cov.gap.contains(&"2.1".to_owned()));
+    }
+
+    #[test]
+    fn framework_coverage_json_has_stamp_and_arrays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = pci_dss_tree(tmp.path());
+        let cov = compute_framework_coverage(&loaded, "pci-dss");
+        let json = render_framework_coverage_json("pci-dss", &loaded, &cov);
+        assert!(json.contains("\"id\":\"pci-dss\""), "{json}");
+        assert!(json.contains("\"version\":\"4.0\""), "{json}");
+        assert!(json.contains("\"gap\":[\"9.9\"]"), "{json}");
+        assert!(json.contains("\"uncovered\":[\"9.9\"]"), "{json}");
+        assert!(json.contains("\"out_of_domain\":[\"2.1\"]"), "{json}");
+        assert!(json.contains("\"covered\":[\"1.1\",\"1.2\",\"10.1\"]"), "{json}");
+        assert!(json.ends_with("}\n"), "{json}");
+    }
+
+    #[test]
+    fn framework_show_human_lists_controls_and_owned_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = pci_dss_tree(tmp.path());
+        let out = render_framework_show_human("pci-dss", &loaded);
+        assert!(out.contains("framework pci-dss (4.0)"), "{out}");
+        // Owned/covered annotations per control.
+        assert!(out.contains("1.1 [owned] [covered]"), "{out}");
+        assert!(out.contains("2.1 [inherited]"), "{out}");
+        assert!(out.contains("9.9 [owned] [uncovered]"), "{out}");
+        // Owned coverage: 4 owned (1.1,1.2,10.1,9.9), 3 covered, 1 uncovered.
+        assert!(out.contains("3/4 owned controls covered (1 uncovered)"), "{out}");
+    }
+
+    #[test]
+    fn run_framework_list_over_tempdir_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Materialize a tree and drive the public entry point against it.
+        let _ = pci_dss_tree(tmp.path());
+        let root = tmp.path().join("frameworks");
+        let code = run_framework_list(vec![root], Some("linux-debian".to_owned()), false);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn run_framework_coverage_missing_framework_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = pci_dss_tree(tmp.path());
+        let root = tmp.path().join("frameworks");
+        let code = run_framework_coverage("nope", vec![root], Some("linux-debian".to_owned()), true);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+    }
+
+    #[test]
+    fn framework_lint_human_empty_is_no_findings() {
+        assert_eq!(
+            render_framework_lint_human(&[]),
+            "framework lint: no findings\n"
+        );
+    }
+
+    #[test]
+    fn framework_lint_human_and_json_render_warning() {
+        let findings = vec![framework::FrameworkLint {
+            code: "orphaned-mapping",
+            severity: framework::FrameworkLintSeverity::Warning,
+            message: "x".into(),
+        }];
+        let human = render_framework_lint_human(&findings);
+        assert!(human.contains("WARNING [orphaned-mapping]"), "{human}");
+        let json = render_framework_lint_json(&findings);
+        assert!(json.contains("\"severity\":\"warning\""), "{json}");
+        assert!(json.contains("\"code\":\"orphaned-mapping\""), "{json}");
+    }
+
+    #[test]
+    fn framework_lint_id_collision_renders_error() {
+        let findings = vec![framework::FrameworkLint {
+            code: "id-collision",
+            severity: framework::FrameworkLintSeverity::Error,
+            message: "collision".into(),
+        }];
+        let human = render_framework_lint_human(&findings);
+        assert!(human.contains("ERROR [id-collision]"), "{human}");
+        let json = render_framework_lint_json(&findings);
+        assert!(json.contains("\"severity\":\"error\""), "{json}");
+    }
+
+    #[test]
+    fn run_framework_lint_over_tempdir_tree_succeeds_with_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Materialize the pci-dss tree: its mapped perms (net-admin, log-read) are
+        // absent from an empty catalog → orphaned-mapping WARNINGS, no errors.
+        let _ = pci_dss_tree(tmp.path());
+        let fw_root = tmp.path().join("frameworks");
+        // A fresh empty catalog root (no permission dirs).
+        let cat_root = tmp.path().join("empty-catalog");
+        std::fs::create_dir_all(&cat_root).unwrap();
+        let code = run_framework_lint(
+            vec![fw_root],
+            vec![cat_root],
+            Some("linux-debian".to_owned()),
+            false,
+        );
+        // Warnings do not gate: exit SUCCESS.
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn show_framework_human_prints_polarity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_fw_tree(
+            tmp.path(),
+            &[(
+                "pci-dss/framework.toml",
+                "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI\"\ndimension = \"flat\"\n",
+            )],
+            &[(
+                "pci-dss/mappings/a.toml",
+                "[net-admin]\nsatisfies = [\"1.1\"]\n[log-admin]\nrisk = [\"10.5.1\"]\n[audit]\nrelated = [\"10.2.1\"]\n",
+            )],
+            &[],
+        );
+        let role = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![
+                compiled_perm("net-admin", None, vec![], vec![]),
+                compiled_perm("log-admin", None, vec![], vec![]),
+                compiled_perm("audit", None, vec![], vec![]),
+                compiled_perm("ghost", None, vec![], vec![]),
+            ],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        let sel = FrameworkSelection::resolve("pci-dss", &loaded);
+        let out = render_show_framework_human(&role, &sel, &loaded);
+        assert!(out.contains("✓ satisfies:"), "{out}");
+        assert!(out.contains("⚠ risk:"), "{out}");
+        assert!(out.contains("· related:"), "{out}");
+        assert!(out.contains("permission ghost (no mapping)"), "{out}");
+    }
+
+    #[test]
+    fn show_framework_json_carries_each_polarity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_fw_tree(
+            tmp.path(),
+            &[(
+                "pci-dss/framework.toml",
+                "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI\"\ndimension = \"flat\"\n",
+            )],
+            &[(
+                "pci-dss/mappings/a.toml",
+                "[net-admin]\nsatisfies = [\"1.1\"]\n[log-admin]\nrisk = [\"10.5.1\"]\n[audit]\nrelated = [\"10.2.1\"]\n",
+            )],
+            &[],
+        );
+        let role = CompiledRole {
+            role: "oper".to_owned(),
+            permissions: vec![
+                compiled_perm("net-admin", None, vec![], vec![]),
+                compiled_perm("log-admin", None, vec![], vec![]),
+                compiled_perm("audit", None, vec![], vec![]),
+            ],
+            raw_groups: vec![],
+            raw_sudo_role: None,
+            raw_limits: Limits::default(),
+        };
+        let sel = FrameworkSelection::resolve("pci-dss", &loaded);
+        let out = render_show_framework_json(&role, &sel, &loaded);
+        assert!(out.contains("\"satisfies\":["), "{out}");
+        assert!(out.contains("\"risk\":["), "{out}");
+        assert!(out.contains("\"related\":["), "{out}");
+        assert!(out.contains("\"id\":\"pci-dss\""), "{out}");
+        assert!(out.contains("\"version\":"), "{out}");
+    }
+
+    #[test]
+    fn framework_risk_lists_controls_and_threats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_fw_tree(
+            tmp.path(),
+            &[(
+                "pci-dss/framework.toml",
+                "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI\"\ndimension = \"flat\"\nprovides = [\"crossref\", \"controls\"]\n",
+            )],
+            &[("pci-dss/mappings/a.toml", "[log-admin]\nrisk = [\"10.5.1\"]\n")],
+            &[("pci-dss/controls.toml", "[\"10.5.1\"]\ntitle = \"Log integrity\"\nowned = false\n")],
+        );
+        let risk = compute_framework_risk(&loaded, "pci-dss");
+        assert!(risk
+            .controls
+            .contains(&("10.5.1".to_owned(), vec!["log-admin".to_owned()])));
+        let human = render_framework_risk_human("pci-dss", &loaded, &risk);
+        assert!(human.contains("⚠ 10.5.1"), "{human}");
+        assert!(human.contains("[out-of-domain]"), "{human}");
+        assert!(human.contains("threatened by: log-admin"), "{human}");
+        let json = render_framework_risk_json("pci-dss", &loaded, &risk);
+        assert!(json.contains("\"id\":\"10.5.1\""), "{json}");
+        assert!(json.contains("\"owned\":false"), "{json}");
+        assert!(json.contains("\"threatened_by\":[\"log-admin\"]"), "{json}");
+    }
+
+    #[test]
+    fn framework_coverage_ignores_risk_and_related() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_fw_tree(
+            tmp.path(),
+            &[(
+                "pci-dss/framework.toml",
+                "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI\"\ndimension = \"flat\"\nprovides = [\"crossref\", \"controls\"]\n",
+            )],
+            &[("pci-dss/mappings/a.toml", "[log-admin]\nrisk = [\"7.2.2\"]\n")],
+            &[("pci-dss/controls.toml", "[\"7.2.2\"]\ntitle = \"Least privilege\"\nowned = true\n")],
+        );
+        let cov = compute_framework_coverage(&loaded, "pci-dss");
+        assert!(!cov.covered.contains(&"7.2.2".to_owned()));
+        assert!(cov.gap.contains(&"7.2.2".to_owned()));
+    }
+
+    #[test]
+    fn run_framework_risk_missing_framework_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = pci_dss_tree(tmp.path());
+        let root = tmp.path().join("frameworks");
+        let code = run_framework_risk("nope", vec![root], Some("linux-debian".to_owned()), true);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 }

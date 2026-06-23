@@ -71,6 +71,7 @@ const CHECK_ANTILOCKOUT: &str = "anti-lockout";
 const CHECK_DRIFT: &str = "drift";
 const CHECK_FILE_ACCESS_DRIFT: &str = "file-access-drift";
 const CHECK_ADOPTED_GROUP_DRIFT: &str = "adopted-group-drift";
+const CHECK_FRAMEWORK_INTEGRITY: &str = "framework-integrity";
 
 /// Run all read-only doctor checks. `managed` is the registry-authoritative
 /// state; `inspector` reads the live system; `targets` (if given) is the
@@ -347,6 +348,35 @@ pub fn run_doctor(
     }
 
     DoctorReport { findings }
+}
+
+/// Map framework cross-reference lint findings into doctor [`Finding`]s, ALWAYS as
+/// [`Severity::Warn`]. The framework layer is advisory (it can never widen/break a
+/// grant), so its integrity problems — orphaned mapping, provides/files desync,
+/// unknown dimension, even an id collision — are surfaced as warnings that never
+/// fail the doctor exit code. Gap coverage is intentionally NOT computed here (it
+/// stays in `census framework coverage`).
+pub fn framework_findings(lints: &[crate::framework::FrameworkLint]) -> Vec<Finding> {
+    lints
+        .iter()
+        .map(|l| Finding {
+            severity: Severity::Warn,
+            check: CHECK_FRAMEWORK_INTEGRITY,
+            target: "<framework>".to_owned(),
+            message: format!("[{}] {}", l.code, l.message),
+        })
+        .collect()
+}
+
+/// Map a loader forward-compat warning string (unknown dimension / unknown provides
+/// tag — the skips `load_frameworks` records) into a doctor Warn finding.
+pub fn framework_load_warning(message: &str) -> Finding {
+    Finding {
+        severity: Severity::Warn,
+        check: CHECK_FRAMEWORK_INTEGRITY,
+        target: "<framework>".to_owned(),
+        message: message.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -911,5 +941,49 @@ mod tests {
         insp.login_capable.insert("root".into());
         let report = run_doctor(&st, &insp, None);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn framework_findings_map_both_severities_to_warn() {
+        let lints = vec![
+            crate::framework::FrameworkLint {
+                code: "orphaned-mapping",
+                severity: crate::framework::FrameworkLintSeverity::Warning,
+                message: "orphan".into(),
+            },
+            crate::framework::FrameworkLint {
+                code: "id-collision",
+                severity: crate::framework::FrameworkLintSeverity::Error,
+                message: "collision".into(),
+            },
+        ];
+        let findings = framework_findings(&lints);
+        assert_eq!(findings.len(), 2);
+        for f in &findings {
+            assert_eq!(f.severity, Severity::Warn);
+            assert_eq!(f.check, "framework-integrity");
+        }
+        assert!(findings[0].message.contains("orphaned-mapping"));
+        assert!(findings[1].message.contains("id-collision"));
+    }
+
+    #[test]
+    fn framework_error_lint_does_not_flip_doctor_exit() {
+        let lints = vec![crate::framework::FrameworkLint {
+            code: "id-collision",
+            severity: crate::framework::FrameworkLintSeverity::Error,
+            message: "collision".into(),
+        }];
+        let mut report = DoctorReport::default();
+        report.findings.extend(framework_findings(&lints));
+        assert!(!report.has_errors(), "framework findings are Warn, never errors");
+    }
+
+    #[test]
+    fn framework_load_warning_is_warn_integrity() {
+        let f = framework_load_warning("framework future skipped: unknown dimension");
+        assert_eq!(f.severity, Severity::Warn);
+        assert_eq!(f.check, "framework-integrity");
+        assert!(f.message.contains("unknown dimension"));
     }
 }

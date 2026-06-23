@@ -1,0 +1,28 @@
+# taplo configuration: bind Census's example and packaged TOML files to the
+# generated contract schemas (census/contract/*.schema.json).
+#
+# taplo is an external CLI (https://taplo.tamasfe.dev/), NOT a crate dependency.
+# `taplo check` (a CI step) validates that the committed examples and the
+# packaged catalog conform to the schemas the code generates — so a schema drift
+# or a malformed example is caught, and editors get schema-driven completion.
+#
+# The schemas themselves are regenerated and byte-checked by `cargo test`
+# (tests/contract.rs); this file only wires the on-disk TOML to those goldens.
+
+# Declaration format (strict).
+[[rule]]
+include = ["examples/declaration.toml"]
+[rule.schema]
+path = "contract/declaration.schema.json"
+
+# Role-store slices (tolerant — Census reads the Linux/payload subset).
+[[rule]]
+include = ["examples/roles/*.toml"]
+[rule.schema]
+path = "contract/role-store.schema.json"
+
+# Permission-catalog slices (strict, layered by OS target).
+[[rule]]
+include = ["share/permissions/**/*.toml"]
+[rule.schema]
+path = "contract/catalog-permission.schema.json"

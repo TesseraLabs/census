@@ -1,0 +1,9 @@
+# CIS Critical Security Controls v8 — cross-reference на Control 6 (Access Control
+# Management). Только номера Safeguard'ов (факты) и заголовки своими словами; текст CIS
+# (терма CIS) не воспроизводится. Это CIS Controls (governance), НЕ CIS Benchmark (hardening,
+# поставляется отдельным os-layered каталогом cis-benchmark позже).
+id        = "cis-controls"
+version   = "8"
+title     = "CIS Controls v8"
+dimension = "flat"
+provides  = ["crossref", "controls"]

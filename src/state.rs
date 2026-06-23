@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 /// leak as a stale ACL). Only the enforcement-relevant fields are stored
 /// (`path`/`access`/`recursive`); provenance and the derived shape are
 /// recomputable from these at resolve time and need not be persisted.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedFileGrant {
     /// Absolute path the grant targets.
@@ -44,7 +44,7 @@ impl ManagedFileGrant {
 /// Snapshot of an adopted group's state at the moment Census adopted it — so a
 /// later release can return it to "how it was" (its GID and pre-existing
 /// members) without deleting the group itself.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GroupBaseline {
     /// GID the group had at adopt time.
@@ -57,7 +57,7 @@ pub struct GroupBaseline {
 }
 
 /// A single managed account as last recorded by Census.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedAccount {
     /// Unix login name.
@@ -109,7 +109,7 @@ pub struct ManagedAccount {
 /// (full `groupdel` for `Created`, release-to-baseline for `Adopted`). The
 /// registry stores what Census actually applied — its own grants and its own
 /// added members — not the recomputable bindings.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedGroup {
     /// Group name.
@@ -164,9 +164,13 @@ pub struct RegistryState {
     groups: BTreeMap<String, ManagedGroup>,
 }
 
-#[derive(serde::Deserialize, Default)]
+/// On-disk shape of the managed registry (`managed.toml`): the `[[account]]`
+/// and `[[group]]` arrays. Strict (`deny_unknown_fields`) — Census owns this
+/// file and an unknown key is a typo or a smuggled field. `pub` so the
+/// interface-contract test can generate its golden schema.
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct RegistryFile {
+pub struct RegistryFile {
     #[serde(default, rename = "account")]
     accounts: Vec<ManagedAccount>,
     #[serde(default, rename = "group")]

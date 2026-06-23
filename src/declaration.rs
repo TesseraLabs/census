@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 /// Defaults applied to role accounts that omit a field.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// Inclusive [min, max] UID band for role accounts. Must be within the
@@ -21,7 +21,7 @@ pub struct Defaults {
 
 /// A declared group: an optional GID pin for stability across the fleet
 /// (audit/NFS). `gid = None` lets the OS assign the GID at creation time.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GroupSpec {
     /// POSIX group name (the key used to reference / create the group).
@@ -46,7 +46,7 @@ pub struct GroupSpec {
 }
 
 /// One role account: the projection of a role into a Unix account.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoleAccount {
     /// Role id; key into the role-store (`<role_store>/<role>.toml`).
@@ -87,7 +87,7 @@ impl RoleAccount {
 /// every member of the group inherits them (many-to-one — several roles may
 /// bind to the same group). `group` MUST name a `[[group]]` declared in the
 /// same declaration; `role` is a role-store role id.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoleGroup {
     /// Role id whose grants are bound to the group.
@@ -97,7 +97,7 @@ pub struct RoleGroup {
 }
 
 /// A parsed, schema-valid declaration.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Declaration {
     /// Monotonic version; anti-rollback uses it (verification is a later slice).

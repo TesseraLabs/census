@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "1"
 ed25519-dalek = "2"
 hex = "0.4"
+schemars = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,0 +1,210 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PermissionDef",
+  "description": "A single catalog policy record, parsed strictly.\n\nOne `PermissionDef` is one *layer's* statement about an id. The cross-layer merge (see [`resolve_leaf`]) combines several of these for the same id.",
+  "type": "object",
+  "required": [
+    "id"
+  ],
+  "properties": {
+    "category": {
+      "description": "Category tag (used by `include_categories` in slice 2; inert here).",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "file": {
+      "description": "File-access grants this permission carries (`[[file]]` sub-tables). Each is parsed strictly and its path validated at the read boundary.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/FileGrant"
+      }
+    },
+    "groups": {
+      "description": "Group memberships this permission grants.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ListOverride"
+        }
+      ]
+    },
+    "id": {
+      "description": "Permission id (top-level in slice 1; namespaced ids are slice 2).",
+      "type": "string"
+    },
+    "include_categories": {
+      "description": "Categories this permission aggregates. Inert in slice 1.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "includes": {
+      "description": "Explicit ids this permission aggregates. Inert in slice 1.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "limits": {
+      "description": "Resource limits this permission sets. A higher layer that sets `limits` replaces wholesale (limits are a small fixed struct, not a list). Uses the strict [`CatalogLimits`] so an unknown key (notably `mac_mask`) under `[limits]` is rejected rather than silently dropped.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CatalogLimits"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "replace": {
+      "description": "When `true`, this layer wipes everything accumulated from lower layers and takes its own statement wholesale (full override, not field-by-field).",
+      "default": false,
+      "type": "boolean"
+    },
+    "risk": {
+      "description": "Risk class. Optional per-layer: a higher layer may override primitives without restating risk, in which case the lower layer's risk stands.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Risk"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sudo": {
+      "description": "Sudo commands this permission grants.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ListOverride"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Access": {
+      "description": "File-access mode a grant requests.\n\n`ro` maps to POSIX ACL `r-X` (read + traverse-only on directories — the `X` is execute *only* on dirs, so a reader can walk into a tree without gaining execute on regular files); `rw` maps to `rwX`. The two values form an ordered lattice for the resolve-time union (`Ro` < `Rw`): two grants on the same path merge to the wider access.",
+      "oneOf": [
+        {
+          "description": "Read + directory-traverse (`r-X`).",
+          "type": "string",
+          "enum": [
+            "ro"
+          ]
+        },
+        {
+          "description": "Read + write + directory-traverse (`rwX`).",
+          "type": "string",
+          "enum": [
+            "rw"
+          ]
+        }
+      ]
+    },
+    "CatalogLimits": {
+      "description": "The `[limits]` sub-table as written in a catalog record, parsed *strictly*.\n\n`rolestore::Limits` is intentionally tolerant (no `deny_unknown_fields`) because Tessera owns the role schema and Census must ignore role fields it does not consume. The catalog is the opposite: Census owns it and expands it as root, so an unknown key under `[limits]` is a typo or a smuggled field and must be rejected — most importantly `mac_mask`, which is a Tessera enforcement primitive and MUST NOT appear in a catalog expansion. Hiding it under `[limits]` (where the tolerant role type would silently drop it) would otherwise be worse than the correctly-rejected top-level form. This local strict type closes that gap without touching the tolerant role-slice parse.",
+      "type": "object",
+      "properties": {
+        "nofile": {
+          "description": "`RLIMIT_NOFILE`.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "nproc": {
+          "description": "`RLIMIT_NPROC`.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileGrant": {
+      "description": "A single file-access grant as written in a catalog record, parsed *strictly*.\n\nStrict (`deny_unknown_fields`) for the same reason the whole catalog is: Census owns this format and materializes it as root (setfacl). An unrecognised key is a typo or a smuggled field, not something to silently ignore.\n\nThe `path` is validated (absolute, no control chars, no `..` component) at the read boundary; `{param}` placeholders are filled and re-validated at resolve time, mirroring the parametrized-sudo path exactly.",
+      "type": "object",
+      "required": [
+        "access",
+        "path"
+      ],
+      "properties": {
+        "access": {
+          "description": "Read-only or read-write.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Access"
+            }
+          ]
+        },
+        "path": {
+          "description": "Absolute path to a directory, file, or glob pattern.",
+          "type": "string"
+        },
+        "recursive": {
+          "description": "For directories: apply recursively and set a default-ACL so new files in the tree inherit the access. Absent defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ListOverride": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "append"
+          ],
+          "properties": {
+            "append": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Risk": {
+      "description": "Risk class of a permission. Advisory only (honest labelling, not enforcement): it never blocks expansion or apply.",
+      "oneOf": [
+        {
+          "description": "Capability stays within its intended scope.",
+          "type": "string",
+          "enum": [
+            "contained"
+          ]
+        },
+        {
+          "description": "Capability can be a path to root (e.g. membership in `docker`).",
+          "type": "string",
+          "enum": [
+            "escalation-capable"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 /// Risk class of a permission. Advisory only (honest labelling, not
 /// enforcement): it never blocks expansion or apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 pub enum Risk {
     /// Capability stays within its intended scope.
     #[serde(rename = "contained")]
@@ -108,6 +108,48 @@ impl<'de> Deserialize<'de> for ListOverride {
     }
 }
 
+/// Hand-written schema for [`ListOverride`]: the type has a custom
+/// `Deserialize` (a bare array OR a `{ append = [...] }` table), so its schema
+/// is written by hand to mirror exactly that one-of. A derive would not match
+/// the custom deserializer, defeating the point of the contract. The two arms
+/// are: a plain array of strings (replace), or a strict object with a required
+/// `append` array (append).
+impl schemars::JsonSchema for ListOverride {
+    fn schema_name() -> String {
+        "ListOverride".to_string()
+    }
+
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{
+            InstanceType, ObjectValidation, Schema, SchemaObject, SubschemaValidation,
+        };
+
+        let strings = <Vec<String>>::json_schema(gen);
+
+        // Arm 1: bare array → Replace.
+        let replace = strings.clone();
+
+        // Arm 2: `{ append = [...] }` → Append (strict object, append required).
+        let mut append_obj = ObjectValidation::default();
+        append_obj.properties.insert("append".to_string(), strings);
+        append_obj.required.insert("append".to_string());
+        append_obj.additional_properties = Some(Box::new(Schema::Bool(false)));
+        let append = Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(append_obj)),
+            ..Default::default()
+        });
+
+        Schema::Object(SchemaObject {
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![replace, append]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
 /// The `[limits]` sub-table as written in a catalog record, parsed *strictly*.
 ///
 /// `rolestore::Limits` is intentionally tolerant (no `deny_unknown_fields`)
@@ -119,7 +161,7 @@ impl<'de> Deserialize<'de> for ListOverride {
 /// under `[limits]` (where the tolerant role type would silently drop it) would
 /// otherwise be worse than the correctly-rejected top-level form. This local
 /// strict type closes that gap without touching the tolerant role-slice parse.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogLimits {
     /// `RLIMIT_NOFILE`.
@@ -146,7 +188,7 @@ impl From<CatalogLimits> for Limits {
 /// execute on regular files); `rw` maps to `rwX`. The two values form an ordered
 /// lattice for the resolve-time union (`Ro` < `Rw`): two grants on the same path
 /// merge to the wider access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub enum Access {
     /// Read + directory-traverse (`r-X`).
     #[serde(rename = "ro")]
@@ -213,7 +255,7 @@ fn has_glob_metachar(path: &str) -> bool {
 /// The `path` is validated (absolute, no control chars, no `..` component) at the
 /// read boundary; `{param}` placeholders are filled and re-validated at resolve
 /// time, mirroring the parametrized-sudo path exactly.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileGrant {
     /// Absolute path to a directory, file, or glob pattern.
@@ -258,7 +300,7 @@ impl FileGrant {
 ///
 /// One `PermissionDef` is one *layer's* statement about an id. The cross-layer
 /// merge (see [`resolve_leaf`]) combines several of these for the same id.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionDef {
     /// Permission id (top-level in slice 1; namespaced ids are slice 2).

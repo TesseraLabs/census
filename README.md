@@ -94,11 +94,30 @@ census apply     [--declaration P] [--managed P] ...     # verify → plan → b
 census doctor    [--declaration P] [--managed P]         # read-only readiness/integrity checks
 census status    [--declaration P] [--managed P]         # managed accounts, version, drift
 census compile   <role> [--os-target T] [--catalog-dir D] [--lint]   # expand permissions → primitives + provenance
-census show      <role> [--lang ru|en|zh] [--os-target T]            # tree of permissions → primitives, localized
+census show      <role> [--lang ru|en|zh] [--os-target T] [--framework F]   # tree of permissions → primitives, localized; with --framework, control ids per permission
+census framework list                                                # installed compliance frameworks (id, version, provides)
+census framework show     <fw>                                       # a framework's controls + coverage stats
+census framework coverage <fw>                                       # gap-oracle: owned controls with no mapping
+census framework risk     <fw>                                       # controls a mapping undermines (risk links) + threatening permissions
+census framework lint     [--catalog-dir D]                          # validate mappings against the catalog
 ```
 
 (`census catalog coverage` — auditing which privileged surface is not covered by
 the catalog — is designed and planned.)
+
+## Compliance frameworks
+
+A read-only **cross-reference** layer maps catalog permissions to the access-governance
+requirements of compliance frameworks (ships with `pci-dss` and `cis-controls`; more add as
+data, no code change). It is **advisory** — it never participates in `compile`/grant/`apply`,
+so a tampered mapping cannot escalate privilege, only mislabel coverage. Frameworks live in
+`frameworks/<fw>/` (a `framework.toml` manifest with `dimension` = `flat` | `os-layered`,
+`mappings/*.toml` keyed by permission id, and an optional `controls.toml` whose `owned` flag
+marks the boundary of what Census actually covers — host-hardening is out of scope).
+Each mapping link carries a polarity — `satisfies` (addresses the control, the only polarity
+coverage counts), `risk` (undermines it — surfaced by `framework risk`), or `related`
+(neutrally touches it).
+`framework coverage` then reports which `owned` controls no role yet satisfies.
 
 ## Build
 
@@ -118,6 +137,7 @@ Census is open-core: **local application is open; managing a fleet is commercial
 |---|---|---|
 | Engine | declaration format, plan/apply/doctor/status, permission catalog (compile/show/lint), local signature verification, fail-safe, rollback | — |
 | Delivery | `apply` of a locally-signed declaration (no server) | declaration delivery via a control plane |
+| Compliance | framework cross-reference engine + starter `pci-dss` / `cis-controls` mappings, `show --framework`, `framework coverage` | framework curation subscription, per-fleet conformance reports |
 | Fleet | — | inventory + aggregated drift, staged rollout / canary, catalog curation |
 
 The open core is self-sufficient: applying a locally-signed declaration works

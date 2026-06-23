@@ -21,7 +21,7 @@ use std::path::PathBuf;
 /// never delete the underlying user or group. Reused by the persisted state in a
 /// later slice, so the resolve layer and the state layer agree on the contract.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {

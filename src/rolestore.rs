@@ -75,8 +75,58 @@ impl<'de> serde::Deserialize<'de> for PermissionRef {
     }
 }
 
+/// Hand-written schema for [`PermissionRef`]: the type has a custom
+/// `Deserialize` (a bare id string OR a `{ id = "...", <params> }` table) and
+/// holds a `toml::Value` map schemars cannot reflect, so the schema is written
+/// by hand to mirror the two accepted forms. The table arm stays tolerant
+/// (`additionalProperties: true`) — extra keys are captured as params, matching
+/// the tolerant role-store contract (§4.2).
+impl schemars::JsonSchema for PermissionRef {
+    fn schema_name() -> String {
+        "PermissionRef".to_string()
+    }
+
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{
+            InstanceType, ObjectValidation, Schema, SchemaObject, SubschemaValidation,
+        };
+
+        // Arm 1: a bare id string.
+        let bare = Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            ..Default::default()
+        });
+
+        // Arm 2: a table with a required `id` string plus free-form params
+        // (tolerant: additionalProperties left unset → true).
+        let mut table_obj = ObjectValidation::default();
+        table_obj.properties.insert(
+            "id".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                ..Default::default()
+            }),
+        );
+        table_obj.required.insert("id".to_string());
+        let table = Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(table_obj)),
+            ..Default::default()
+        });
+        let _ = gen;
+
+        Schema::Object(SchemaObject {
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![bare, table]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
 /// systemd/rlimit composition subset Census consumes.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 pub struct Limits {
     /// `RLIMIT_NOFILE`.
     #[serde(default)]
@@ -102,10 +152,23 @@ pub struct RoleComposition {
     pub permissions: Vec<PermissionRef>,
 }
 
-// --- private tolerant mirror of the role-slice subset we read ---
+// --- tolerant mirror of the role-slice subset we read ---
+//
+// These two types are the SHAPE Census actually deserializes from a role slice:
+// the consumed fields live UNDER a `[payload]` table, and the top level holds
+// the role-wide keys Tessera owns (`role`, `version`, `os`, `name`, `level`, …)
+// which Census ignores. They are the schema root for the role-store contract
+// (NOT `RoleComposition`, which is the post-parse assembled view): a golden
+// generated from `Slice` shows `groups`/`sudo_role`/`limits`/`permissions`
+// nested under `payload`, matching the on-disk format and the taplo binding.
+// Tolerant on purpose (no `deny_unknown_fields`) — Tessera owns the role schema
+// and Census must ignore the adapter fields it does not consume (§4.2).
 
-#[derive(serde::Deserialize)]
-struct SlicePayload {
+/// The `[payload]` subset Census reads from a role slice. Tolerant: unknown
+/// keys are ignored (Census reads only the Linux/payload subset of a format
+/// Tessera owns). `pub` so the interface-contract test can schematize it.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SlicePayload {
     #[serde(default)]
     groups: Option<Vec<String>>,
     #[serde(default)]
@@ -116,8 +179,13 @@ struct SlicePayload {
     permissions: Option<Vec<PermissionRef>>,
 }
 
-#[derive(serde::Deserialize)]
-struct Slice {
+/// The on-disk role slice as Census reads it: the role-wide top level (whose
+/// keys Census ignores) plus the optional `[payload]` table it consumes.
+/// Tolerant (no `deny_unknown_fields`) so foreign adapter fields are skipped.
+/// This is the schema root for `contract/role-store.schema.json`. `pub` so the
+/// interface-contract test can schematize it.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct Slice {
     #[serde(default)]
     payload: Option<SlicePayload>,
 }

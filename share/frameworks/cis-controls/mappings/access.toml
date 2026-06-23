@@ -1,0 +1,14 @@
+# Маппинг разрешений каталога Census → Safeguard'ы CIS Control 6 (Access Control Management),
+# с полярностью связи. satisfies — способность адресует Safeguard.
+
+# процессы предоставления/отзыва доступа; в модели Census выдаётся редко
+[user-admin]
+satisfies = ["6.1", "6.2"]
+
+# ролевая модель прав через sudo-политику
+[sudo-config]
+satisfies = ["6.8"]
+
+# предоставление удалённого доступа
+[ssh-admin]
+satisfies = ["6.1"]

@@ -1,0 +1,106 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Slice",
+  "description": "The on-disk role slice as Census reads it: the role-wide top level (whose keys Census ignores) plus the optional `[payload]` table it consumes. Tolerant (no `deny_unknown_fields`) so foreign adapter fields are skipped. This is the schema root for `contract/role-store.schema.json`. `pub` so the interface-contract test can schematize it.",
+  "type": "object",
+  "properties": {
+    "payload": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SlicePayload"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "Limits": {
+      "description": "systemd/rlimit composition subset Census consumes.",
+      "type": "object",
+      "properties": {
+        "nofile": {
+          "description": "`RLIMIT_NOFILE`.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "nproc": {
+          "description": "`RLIMIT_NPROC`.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "PermissionRef": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "SlicePayload": {
+      "description": "The `[payload]` subset Census reads from a role slice. Tolerant: unknown keys are ignored (Census reads only the Linux/payload subset of a format Tessera owns). `pub` so the interface-contract test can schematize it.",
+      "type": "object",
+      "properties": {
+        "groups": {
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Limits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "permissions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/PermissionRef"
+          }
+        },
+        "sudo_role": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}
