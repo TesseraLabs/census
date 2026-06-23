@@ -128,3 +128,55 @@ fn packaged_catalog_layers_parse_through_real_parser() {
         "expected at least one packaged permission record"
     );
 }
+
+#[test]
+fn packaged_frameworks_have_a_title_for_every_control() {
+    use census::framework::{controls_missing_title, load_frameworks};
+    use census::l10n::{L10nSource, LiveL10n, DEFAULT_LOCALE};
+
+    // The shipped frameworks (cis-controls, pci-dss) must keep their structural
+    // controls.toml and their independently-edited l10n title tree in lockstep: a
+    // control with no title in ANY locale would render as the bare control id in
+    // reports. This guards against that drift on the packaged data — the same
+    // check `census framework lint` runs as a `control-missing-title` finding,
+    // here asserted to produce NOTHING on the real tree (no false positive on
+    // shipped data, and a real regression if a future edit drops a title).
+    let frameworks_root = repo("share/frameworks");
+    // A flat OS target is enough: the shipped frameworks' control SETS do not vary
+    // by layer (only os-layered *mappings* would), so any valid target loads every
+    // controls.toml.
+    let os = census::catalog::OsTarget::new("linux", "debian", Some("12".to_owned()))
+        .expect("valid os target");
+    let loaded = load_frameworks(std::slice::from_ref(&frameworks_root), &os)
+        .unwrap_or_else(|e| panic!("packaged frameworks no longer load: {e}"));
+
+    assert!(
+        !loaded.controls.is_empty(),
+        "expected at least one packaged framework with a controls.toml under {}",
+        frameworks_root.display()
+    );
+
+    for (fw, defs) in &loaded.controls {
+        if defs.is_empty() {
+            continue;
+        }
+        let dir = loaded
+            .framework_dirs
+            .get(fw)
+            .unwrap_or_else(|| panic!("loaded framework {fw} has no recorded directory"));
+        let l10n = LiveL10n::new(vec![dir.clone()]);
+        let mut locales: Vec<String> = vec![DEFAULT_LOCALE.to_owned()];
+        for loc in l10n.available_locales() {
+            if !locales.iter().any(|l| l == &loc) {
+                locales.push(loc);
+            }
+        }
+        let locale_refs: Vec<&str> = locales.iter().map(String::as_str).collect();
+        let ids: Vec<&str> = defs.keys().map(String::as_str).collect();
+        let missing = controls_missing_title(&ids, &l10n, &locale_refs);
+        assert!(
+            missing.is_empty(),
+            "packaged framework {fw} has control(s) with no title in any locale {locales:?}: {missing:?}"
+        );
+    }
+}

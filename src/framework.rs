@@ -473,8 +473,10 @@ pub enum FrameworkLintSeverity {
 /// `code` is a stable identifier (never a free-form string) so downstream tooling
 /// and tests can match on the *kind* of finding without parsing the message. The
 /// defined codes are: `"orphaned-mapping"`, `"provides-desync"`,
-/// `"mapping-unknown-control"`, `"satisfies-risk-conflict"`, `"id-collision"`, and
-/// (for the version-delta comparator) `"controls-membership-delta"`.
+/// `"mapping-unknown-control"`, `"satisfies-risk-conflict"`, `"id-collision"`,
+/// `"control-missing-title"` (a control defined in `controls.toml` with no title
+/// in any locale — see [`controls_missing_title`]), and (for the version-delta
+/// comparator) `"controls-membership-delta"`.
 ///
 /// [`code`]: FrameworkLint::code
 /// [`severity`]: FrameworkLint::severity
@@ -642,6 +644,50 @@ pub fn controls_membership_delta(
     }
 
     findings
+}
+
+/// The structural control ids that resolve to NO title in **any** of `locales` —
+/// the controls a report would render as the bare control id with nothing to flag
+/// it.
+///
+/// This guards the exact drift the structural/l10n split risks: `controls.toml`
+/// (which control ids exist) and the l10n tree (`l10n/<locale>/controls.toml`,
+/// which carries the titles) are edited independently, so a control added to the
+/// structural file but never given a title — or one whose id is typo'd between the
+/// two — silently degrades to its bare id in every locale via the
+/// `locale → en → id` fallback. The permission layer treats the same situation as
+/// a first-class lint signal; this is the framework-layer mirror.
+///
+/// A title in **any** single locale clears the id: one resolvable title is enough
+/// to give the report a real label, so the per-locale completeness gap (a control
+/// translated in `en` but not `ru`) is deliberately not flagged here — that is a
+/// translation-coverage concern, not the drift this detects. Reuses
+/// [`crate::l10n::missing_translations`] over the control-id set (as the "catalog
+/// ids") and keeps only the ids it reports as missing in *every* linted locale, so
+/// the title-presence rule cannot drift from the permission lint's.
+///
+/// Pure over the supplied [`L10nSource`] and id/locale slices (no filesystem walk
+/// of its own), so it is unit-tested with an in-memory source; the CLI lint wrapper
+/// builds a [`crate::l10n::LiveL10n`] over the framework's own directory and passes
+/// the live locale set in. Returned ids preserve the input `control_ids` order.
+pub fn controls_missing_title(
+    control_ids: &[&str],
+    l10n: &dyn crate::l10n::L10nSource,
+    locales: &[&str],
+) -> Vec<String> {
+    // `missing_translations` yields one `Missing` per (locale, id) that lacks a
+    // title. An id is a drift signal only when it is missing in EVERY linted
+    // locale, so count the locales each id is missing in and keep the ids whose
+    // miss-count equals the number of locales linted.
+    let missing = crate::l10n::missing_translations(l10n, locales, control_ids);
+    control_ids
+        .iter()
+        .filter(|&&id| {
+            let miss_count = missing.iter().filter(|m| m.id == id).count();
+            miss_count == locales.len()
+        })
+        .map(|&id| id.to_owned())
+        .collect()
 }
 
 /// The default framework roots in precedence order (lowest first): the vendor
@@ -1878,5 +1924,98 @@ provides = ["crossref", "controls"]
             resolve_control_title(&loaded, "no-such-fw", "7.2.2", "ru"),
             "7.2.2"
         );
+    }
+
+    // --- SLICE: control-missing-title integrity (structural vs l10n drift) ---
+
+    #[test]
+    fn controls_missing_title_flags_id_absent_from_every_locale() {
+        // A control defined structurally but with no title in ANY linted locale —
+        // exactly the drift the structural/l10n split risks: it would silently
+        // render as the bare id in a report with nothing to flag it.
+        let l10n = crate::l10n::FakeL10n::new()
+            .with(
+                "en",
+                "7.2.2",
+                crate::l10n::Description {
+                    title: Some("Least privilege".to_owned()),
+                    summary: None,
+                    risk_note: None,
+                },
+            )
+            .with(
+                "ru",
+                "7.2.2",
+                crate::l10n::Description {
+                    title: Some("Наименьшие привилегии".to_owned()),
+                    summary: None,
+                    risk_note: None,
+                },
+            );
+        // 7.2.2 has a title (in both); 7.2.4 has none anywhere → only 7.2.4 flagged.
+        let missing = controls_missing_title(&["7.2.2", "7.2.4"], &l10n, &["en", "ru"]);
+        assert_eq!(missing, vec!["7.2.4".to_owned()]);
+    }
+
+    #[test]
+    fn controls_missing_title_title_in_one_locale_clears_the_id() {
+        // A title in ANY single locale is enough to resolve the report label, so
+        // the id is NOT flagged even when other locales lack it (the per-locale
+        // gap is a translation-completeness concern, not a drift concern).
+        let l10n = crate::l10n::FakeL10n::new().with(
+            "ru",
+            "7.2.4",
+            crate::l10n::Description {
+                title: Some("Только по-русски".to_owned()),
+                summary: None,
+                risk_note: None,
+            },
+        );
+        let missing = controls_missing_title(&["7.2.4"], &l10n, &["en", "ru"]);
+        assert!(
+            missing.is_empty(),
+            "a title in any locale clears the id: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn controls_missing_title_empty_when_all_translated() {
+        let l10n = crate::l10n::FakeL10n::new()
+            .with(
+                "en",
+                "a",
+                crate::l10n::Description {
+                    title: Some("A".to_owned()),
+                    summary: None,
+                    risk_note: None,
+                },
+            )
+            .with(
+                "en",
+                "b",
+                crate::l10n::Description {
+                    title: Some("B".to_owned()),
+                    summary: None,
+                    risk_note: None,
+                },
+            );
+        assert!(controls_missing_title(&["a", "b"], &l10n, &["en"]).is_empty());
+    }
+
+    #[test]
+    fn controls_missing_title_over_live_tree_flags_undefined_control() {
+        // End-to-end over a real framework l10n tree: 7.2.4 is in controls.toml
+        // but has no title in en or ru → flagged; 7.2.2 is translated → not.
+        let tmp = tempfile::tempdir().unwrap();
+        fw_with_control_l10n(tmp.path());
+        let loaded = load_frameworks(&[tmp.path().to_path_buf()], &flat_os()).unwrap();
+        let dir = loaded.framework_dirs.get("pci-dss").unwrap();
+        let l10n = crate::l10n::LiveL10n::new(vec![dir.clone()]);
+        let ids: Vec<&str> = loaded.controls["pci-dss"]
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let missing = controls_missing_title(&ids, &l10n, &["en", "ru"]);
+        assert_eq!(missing, vec!["7.2.4".to_owned()]);
     }
 }

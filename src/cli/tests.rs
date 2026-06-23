@@ -2054,6 +2054,93 @@ fn run_framework_lint_over_tempdir_tree_succeeds_with_warnings() {
     assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
 }
 
+/// Build a framework tree whose `controls.toml` defines `7.2.2` and `7.2.4` with
+/// the supplied l10n files, then render the CLI lint's `control-missing-title`
+/// findings over it as JSON so the emitted codes/messages can be asserted.
+///
+/// The full `run_framework_lint` wrapper prints to stdout, so the test exercises
+/// it once for its exit code (a WARNING must not gate → SUCCESS) and asserts on the
+/// same renderer + finding-builder the wrapper delegates to, fed the same loaded
+/// tree. The catalog root is empty — the title-drift check is independent of
+/// catalog coverage.
+fn run_framework_lint_title_json_over(dir: &Path, controls: &[(&str, &str)]) -> String {
+    let manifests = &[(
+        "pci-dss/framework.toml",
+        "id = \"pci-dss\"\nversion = \"4.0\"\ntitle = \"PCI DSS\"\ndimension = \"flat\"\nprovides = [\"crossref\", \"controls\"]\n",
+    )];
+    let mappings = &[(
+        "pci-dss/mappings/a.toml",
+        "[net-admin]\nsatisfies = [\"7.2.2\"]\n",
+    )];
+    let loaded = load_fw_tree(dir, manifests, mappings, controls);
+    let fw_root = dir.join("frameworks");
+    let cat_root = dir.join("empty-catalog");
+    std::fs::create_dir_all(&cat_root).unwrap();
+    let code = run_framework_lint(
+        vec![fw_root],
+        vec![cat_root],
+        Some("linux-debian".to_owned()),
+        true,
+    );
+    // control-missing-title is a WARNING, so the run still exits 0.
+    assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    render_framework_lint_json(&control_missing_title_findings(&loaded))
+}
+
+#[test]
+fn run_framework_lint_emits_control_missing_title_for_untranslated_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let json = run_framework_lint_title_json_over(
+        tmp.path(),
+        &[
+            (
+                "pci-dss/controls.toml",
+                "[\"7.2.2\"]\nowned = true\n[\"7.2.4\"]\nowned = true\n",
+            ),
+            // en translates 7.2.2 only; 7.2.4 has no title in any locale.
+            (
+                "pci-dss/l10n/en/controls.toml",
+                "[\"7.2.2\"]\ntitle = \"Least privilege\"\n",
+            ),
+        ],
+    );
+    assert!(
+        json.contains("\"code\":\"control-missing-title\""),
+        "{json}"
+    );
+    // The finding names the framework id and the offending control id.
+    assert!(json.contains("pci-dss"), "{json}");
+    assert!(json.contains("7.2.4"), "{json}");
+    // The translated control must NOT be flagged.
+    assert!(
+        !json.contains("7.2.2\\\" has no title"),
+        "translated control wrongly flagged: {json}"
+    );
+}
+
+#[test]
+fn run_framework_lint_no_control_missing_title_when_fully_translated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let json = run_framework_lint_title_json_over(
+        tmp.path(),
+        &[
+            (
+                "pci-dss/controls.toml",
+                "[\"7.2.2\"]\nowned = true\n[\"7.2.4\"]\nowned = true\n",
+            ),
+            // Every control has an en title → no control-missing-title finding.
+            (
+                "pci-dss/l10n/en/controls.toml",
+                "[\"7.2.2\"]\ntitle = \"Least privilege\"\n[\"7.2.4\"]\ntitle = \"Access review\"\n",
+            ),
+        ],
+    );
+    assert!(
+        !json.contains("control-missing-title"),
+        "fully-translated framework must not flag a missing title: {json}"
+    );
+}
+
 #[test]
 fn show_framework_human_prints_polarity() {
     let tmp = tempfile::tempdir().unwrap();

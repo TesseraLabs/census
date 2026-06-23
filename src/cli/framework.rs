@@ -16,7 +16,7 @@ use crate::catalog::CatalogSource;
 use crate::cli::detect_os_target;
 use crate::cli::render::json_str;
 use crate::framework::{self, resolve_control_title, LoadedFrameworks};
-use crate::l10n;
+use crate::l10n::{self, L10nSource};
 use crate::LiveCatalog;
 
 /// Resolve the display locale for a framework report from an explicit `--lang`
@@ -169,7 +169,19 @@ pub fn run_framework_lint(
             for w in &loaded.warnings {
                 eprintln!("census: warning: {w}");
             }
-            framework::lint_loaded(&loaded, &known)
+            let mut findings = framework::lint_loaded(&loaded, &known);
+            // Control-title drift: a control present in a framework's structural
+            // controls.toml but with no title in ANY locale would render as the
+            // bare control id in reports with nothing to flag it. The structural
+            // facts (controls.toml) and the titles (l10n/<locale>/controls.toml)
+            // are edited independently, so this gap is exactly what the split
+            // risks. This is an I/O step (it reads each framework's l10n tree), so
+            // it lives here in the CLI wrapper rather than in the pure
+            // `lint_loaded` — mirroring how the catalog/framework reads are done
+            // here too. The permission layer flags the same drift; this is its
+            // framework-layer mirror.
+            findings.extend(control_missing_title_findings(&loaded));
+            findings
         }
         Err(framework::FrameworkError::IdCollision { id }) => {
             // The one determinism Error the lint surface REPORTS (not aborts on):
@@ -203,6 +215,61 @@ pub fn run_framework_lint(
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Build the `control-missing-title` findings: for every loaded framework, the
+/// control ids defined in its structural `controls.toml` that resolve to NO title
+/// in any locale. This is the I/O half of the framework lint — it walks each
+/// framework's own l10n tree (`<fw_dir>/l10n/<locale>/controls.toml`), so it stays
+/// in the CLI wrapper rather than the pure [`framework::lint_loaded`].
+///
+/// For each framework a [`crate::l10n::LiveL10n`] is rooted at the framework's own
+/// directory (captured in [`framework::LoadedFrameworks::framework_dirs`]),
+/// matching how [`framework::resolve_control_title`] resolves a single title. The
+/// linted locale set is every locale materially present in that framework's tree
+/// (`available_locales`) plus `en` (the fallback every starter set ships), so a
+/// framework that ships only `ru` is still checked against `en`. The pure
+/// [`framework::controls_missing_title`] then reports the ids with no title in any
+/// of those locales. Findings are advisory WARNINGs — a missing title degrades
+/// gracefully to the bare id and must never gate.
+pub(crate) fn control_missing_title_findings(
+    loaded: &framework::LoadedFrameworks,
+) -> Vec<framework::FrameworkLint> {
+    let mut out = Vec::new();
+    // BTreeMap iteration is sorted → deterministic finding order across frameworks.
+    for (fw, defs) in &loaded.controls {
+        if defs.is_empty() {
+            continue;
+        }
+        let Some(dir) = loaded.framework_dirs.get(fw) else {
+            // No directory recorded means no l10n tree to read; nothing to check.
+            continue;
+        };
+        let l10n = l10n::LiveL10n::new(vec![dir.clone()]);
+
+        // Locales present in this framework's tree, plus `en` as the guaranteed
+        // fallback (so a tree shipping only `ru` is still measured against `en`).
+        let mut locales: Vec<String> = vec![l10n::DEFAULT_LOCALE.to_owned()];
+        for loc in l10n.available_locales() {
+            if !locales.iter().any(|l| l == &loc) {
+                locales.push(loc);
+            }
+        }
+        let locale_refs: Vec<&str> = locales.iter().map(String::as_str).collect();
+
+        let ids: Vec<&str> = defs.keys().map(String::as_str).collect();
+        for id in framework::controls_missing_title(&ids, &l10n, &locale_refs) {
+            out.push(framework::FrameworkLint {
+                code: "control-missing-title",
+                severity: framework::FrameworkLintSeverity::Warning,
+                message: format!(
+                    "framework {fw} control {id:?} has no title in any locale (renders as the bare id); \
+                     add it to {fw}/l10n/<locale>/controls.toml"
+                ),
+            });
+        }
+    }
+    out
 }
 
 /// Render framework lint findings (human form): one line per finding as
