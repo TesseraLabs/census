@@ -55,12 +55,12 @@ pub fn render_status(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
-    use crate::plan::Action;
+    use crate::model::ResolvedAccount;
     use crate::rolestore::Limits;
     use crate::state::{FakeState, ManagedAccount};
-    use crate::model::ResolvedAccount;
-    use std::path::PathBuf;
 
     fn state_of(accts: Vec<ManagedAccount>) -> FakeState {
         FakeState {
@@ -122,7 +122,10 @@ mod tests {
         let plan = Plan {
             actions: vec![
                 Action::Create(target("new")),
-                Action::Update { account: target("oper"), changes: vec!["x".into()] },
+                Action::Update {
+                    account: target("oper"),
+                    changes: vec!["x".into()],
+                },
                 Action::Delete { name: "old".into() },
             ],
             ..Default::default()

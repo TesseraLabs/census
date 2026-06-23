@@ -53,23 +53,26 @@ struct SessionEntry {
 /// Errors reading the live-session registry. Surfaced as an apply abort
 /// (fail-closed) ONLY when the plan is destructive — see [`crate::apply`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SessionError {
     /// The registry file is present but could not be read.
-    #[error("cannot read live-session registry {path}: {reason}")]
+    #[error("cannot read live-session registry {path}: {source}")]
     Io {
         /// The registry path consulted.
         path: PathBuf,
-        /// The underlying IO error.
-        reason: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
     },
     /// The registry file is present but its JSON is malformed/truncated. A
     /// corrupt registry is NOT treated as "no sessions" — see fail-closed below.
-    #[error("live-session registry {path} is invalid JSON: {reason}")]
+    #[error("live-session registry {path} is invalid JSON: {source}")]
     Parse {
         /// The registry path consulted.
         path: PathBuf,
-        /// The parse error.
-        reason: String,
+        /// The underlying JSON deserialization error.
+        #[source]
+        source: serde_json::Error,
     },
 }
 
@@ -106,10 +109,10 @@ impl SessionSource for LiveSessionSource {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(LiveSessions::default());
             }
-            Err(e) => {
+            Err(source) => {
                 return Err(SessionError::Io {
                     path: self.path.clone(),
-                    reason: e.to_string(),
+                    source,
                 });
             }
         };
@@ -117,9 +120,9 @@ impl SessionSource for LiveSessionSource {
         // whole snapshot. Corrupt/truncated JSON is therefore a genuine read
         // error, NOT an empty registry — never silently treat it as "no sessions".
         let entries: Vec<SessionEntry> =
-            serde_json::from_str(&text).map_err(|e| SessionError::Parse {
+            serde_json::from_str(&text).map_err(|source| SessionError::Parse {
                 path: self.path.clone(),
-                reason: e.to_string(),
+                source,
             })?;
         let mut live = LiveSessions::default();
         for e in entries {
@@ -131,32 +134,44 @@ impl SessionSource for LiveSessionSource {
 }
 
 /// In-memory source for tests (orchestrator units without a filesystem).
+///
+/// Holds either a live set to report or a marker that the read should fail; the
+/// concrete [`SessionError`] (whose source is not `Clone`) is synthesized fresh
+/// on each `live()` call rather than stored.
 #[cfg(test)]
 pub struct FakeSessionSource {
-    /// The live set this fake reports, or an error to simulate an unreadable
-    /// registry.
-    pub result: Result<LiveSessions, SessionError>,
+    outcome: FakeOutcome,
+}
+
+/// What a [`FakeSessionSource`] reports on `live()`.
+#[cfg(test)]
+enum FakeOutcome {
+    /// Report this live set.
+    Live(LiveSessions),
+    /// Fail the read (corrupt/unreadable registry).
+    Fail,
 }
 
 #[cfg(test)]
 impl FakeSessionSource {
     /// A source reporting the given live set.
     pub fn with_live(live: LiveSessions) -> Self {
-        FakeSessionSource { result: Ok(live) }
+        FakeSessionSource {
+            outcome: FakeOutcome::Live(live),
+        }
     }
 
     /// A source reporting an empty live set.
     pub fn empty() -> Self {
-        FakeSessionSource { result: Ok(LiveSessions::default()) }
+        FakeSessionSource {
+            outcome: FakeOutcome::Live(LiveSessions::default()),
+        }
     }
 
     /// A source that fails the read (corrupt/unreadable registry).
     pub fn failing() -> Self {
         FakeSessionSource {
-            result: Err(SessionError::Parse {
-                path: PathBuf::from("/run/tessera/sessions.json"),
-                reason: "injected".to_owned(),
-            }),
+            outcome: FakeOutcome::Fail,
         }
     }
 }
@@ -164,16 +179,17 @@ impl FakeSessionSource {
 #[cfg(test)]
 impl SessionSource for FakeSessionSource {
     fn live(&self) -> Result<LiveSessions, SessionError> {
-        match &self.result {
-            Ok(live) => Ok(live.clone()),
-            Err(SessionError::Io { path, reason }) => Err(SessionError::Io {
-                path: path.clone(),
-                reason: reason.clone(),
-            }),
-            Err(SessionError::Parse { path, reason }) => Err(SessionError::Parse {
-                path: path.clone(),
-                reason: reason.clone(),
-            }),
+        match &self.outcome {
+            FakeOutcome::Live(live) => Ok(live.clone()),
+            FakeOutcome::Fail => {
+                // Synthesize a genuine parse error so the source chain is real.
+                let source = serde_json::from_str::<Vec<SessionEntry>>("{not json")
+                    .expect_err("malformed JSON must fail to parse");
+                Err(SessionError::Parse {
+                    path: PathBuf::from("/run/tessera/sessions.json"),
+                    source,
+                })
+            }
         }
     }
 }

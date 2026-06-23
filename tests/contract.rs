@@ -14,21 +14,44 @@
 //!
 //! See that spec, §6, for the enforcement design.
 
+// Integration tests are a separate crate, so the crate-root test exemption in
+// lib.rs does not reach them. In a test a panic on a broken fixture is the
+// intended failure mode, so the production-hazard restriction lints are allowed
+// here, mirroring lib.rs's `cfg_attr(test, ...)`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a panic on a broken fixture is the intended failure mode in tests"
+)]
+
 use std::path::{Path, PathBuf};
 
+// The TOML-schema goldens are generated from `schemars`, which is only compiled
+// under the `schema` feature (the contract job enables it). Gate the schema
+// imports, helpers, and tests so the default `cargo test` build — without
+// `schemars` — still compiles and runs the CLI-surface and version contracts.
+#[cfg(feature = "schema")]
 use census::catalog::PermissionDef;
 use census::cli_def::Cli;
+#[cfg(feature = "schema")]
 use census::declaration::Declaration;
+#[cfg(feature = "schema")]
 use census::framework::{ControlDef, FrameworkManifest};
+#[cfg(feature = "schema")]
 use census::rolestore::Slice as RoleSlice;
+#[cfg(feature = "schema")]
 use census::state::RegistryFile;
-
 use clap::CommandFactory;
+#[cfg(feature = "schema")]
 use schemars::schema_for;
 
 /// Absolute path to a committed golden file under `census/contract/`.
 fn contract_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("contract").join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("contract")
+        .join(name)
 }
 
 /// Compare `actual` to the committed golden `name`, or rewrite it when
@@ -57,17 +80,20 @@ fn assert_or_update(name: &str, actual: &str) {
 }
 
 /// Pretty-print a schemars schema to the exact JSON form committed as golden.
+#[cfg(feature = "schema")]
 fn schema_json<T: schemars::JsonSchema>() -> String {
     serde_json::to_string_pretty(&schema_for!(T)).expect("schema serializes")
 }
 
 // --- TOML schema goldens (§6.1) ---
 
+#[cfg(feature = "schema")]
 #[test]
 fn declaration_schema_matches_golden() {
     assert_or_update("declaration.schema.json", &schema_json::<Declaration>());
 }
 
+#[cfg(feature = "schema")]
 #[test]
 fn role_store_schema_matches_golden() {
     // `Slice` is the type Census actually deserializes from a role slice: the
@@ -80,6 +106,7 @@ fn role_store_schema_matches_golden() {
     assert_or_update("role-store.schema.json", &schema_json::<RoleSlice>());
 }
 
+#[cfg(feature = "schema")]
 #[test]
 fn catalog_permission_schema_matches_golden() {
     assert_or_update(
@@ -88,6 +115,7 @@ fn catalog_permission_schema_matches_golden() {
     );
 }
 
+#[cfg(feature = "schema")]
 #[test]
 fn framework_schema_matches_golden() {
     // The framework format spans two files; the manifest is the root schema and
@@ -95,6 +123,7 @@ fn framework_schema_matches_golden() {
     assert_or_update("framework.schema.json", &framework_schema_json());
 }
 
+#[cfg(feature = "schema")]
 #[test]
 fn managed_registry_schema_matches_golden() {
     assert_or_update(
@@ -107,6 +136,7 @@ fn managed_registry_schema_matches_golden() {
 /// definition. `manifest.toml` and `controls.toml` are separate files, so a
 /// single root struct does not exist; the golden wraps both under one document
 /// so a change to either surfaces as drift.
+#[cfg(feature = "schema")]
 fn framework_schema_json() -> String {
     let manifest = schema_for!(FrameworkManifest);
     let control = schema_for!(ControlDef);
@@ -153,8 +183,7 @@ fn model_command(cmd: &clap::Command) -> CommandModel {
         .collect();
     args.sort_by(|a, b| a.id.cmp(&b.id));
 
-    let mut subcommands: Vec<CommandModel> =
-        cmd.get_subcommands().map(model_command).collect();
+    let mut subcommands: Vec<CommandModel> = cmd.get_subcommands().map(model_command).collect();
     subcommands.sort_by(|a, b| a.name.cmp(&b.name));
 
     CommandModel {

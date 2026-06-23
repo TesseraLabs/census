@@ -8,10 +8,11 @@
 //! (`groups`/`sudo_role`/`limits`) are unioned with the expansion; using a raw
 //! primitive alongside permissions is allowed but lint-flagged.
 
+use std::path::PathBuf;
+
 use crate::catalog::{self, CatalogError, CatalogSource, OsTarget, ResolveCtx};
 use crate::declaration::Declaration;
 use crate::rolestore::{self, Limits, RoleStoreError};
-use std::path::PathBuf;
 
 /// How an object (account or group) came under Census management. Drives the
 /// teardown contract: a `Created` object Census made itself, so removing it from
@@ -20,9 +21,8 @@ use std::path::PathBuf;
 /// removal means *release* to baseline (strip Census's own grants/members) and
 /// never delete the underlying user or group. Reused by the persisted state in a
 /// later slice, so the resolve layer and the state layer agree on the contract.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
     /// Census created the object; on removal it is fully deleted.
@@ -36,7 +36,12 @@ pub enum Provenance {
 /// A fully-resolved target account: declaration account-layer merged with the
 /// role-store composition (raw escape-hatch primitives unioned with the
 /// permission expansion), plus Census invariants.
+///
+/// `#[non_exhaustive]`: this struct grows as later slices add resolved fields;
+/// construct it through [`ResolvedAccount::builder`] so adding a field is not a
+/// breaking change to downstream code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResolvedAccount {
     /// Unix login name (equals the role id; spec "role = account").
     pub name: String,
@@ -77,12 +82,103 @@ pub struct ResolvedAccount {
     pub provenance: Provenance,
 }
 
+impl ResolvedAccount {
+    /// Start building a [`ResolvedAccount`] from its required identity fields
+    /// (name, UID, shell, home). Optional grant fields default empty and are set
+    /// with the `with_*` methods; `locked_password` defaults to the Census
+    /// invariant (`true`) and `provenance` to [`Provenance::Created`].
+    ///
+    /// Non-positional construction so a new resolved field is an additive
+    /// `with_*` method, not a breaking change at every call site (pairs with the
+    /// `#[non_exhaustive]` on the struct).
+    pub fn builder(
+        name: impl Into<String>,
+        uid: u32,
+        shell: impl Into<String>,
+        home: impl Into<PathBuf>,
+    ) -> ResolvedAccountBuilder {
+        ResolvedAccountBuilder {
+            inner: ResolvedAccount {
+                name: name.into(),
+                uid,
+                shell: shell.into(),
+                home: home.into(),
+                groups: Vec::new(),
+                sudo_role: None,
+                sudo_commands: Vec::new(),
+                limits: Limits::default(),
+                file_grants: Vec::new(),
+                locked_password: true,
+                provenance: Provenance::Created,
+            },
+        }
+    }
+}
+
+/// Builder for [`ResolvedAccount`]. Construct via [`ResolvedAccount::builder`].
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct ResolvedAccountBuilder {
+    inner: ResolvedAccount,
+}
+
+impl ResolvedAccountBuilder {
+    /// Set the supplementary groups.
+    pub fn groups(mut self, groups: Vec<String>) -> Self {
+        self.inner.groups = groups;
+        self
+    }
+
+    /// Set the raw sudo-role escape hatch.
+    pub fn sudo_role(mut self, sudo_role: Option<String>) -> Self {
+        self.inner.sudo_role = sudo_role;
+        self
+    }
+
+    /// Set the concrete (permission-expanded) sudo commands.
+    pub fn sudo_commands(mut self, sudo_commands: Vec<String>) -> Self {
+        self.inner.sudo_commands = sudo_commands;
+        self
+    }
+
+    /// Set the resource limits.
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.inner.limits = limits;
+        self
+    }
+
+    /// Set the file-access grants.
+    pub fn file_grants(mut self, file_grants: Vec<catalog::ResolvedFileGrant>) -> Self {
+        self.inner.file_grants = file_grants;
+        self
+    }
+
+    /// Override the password-locked invariant (defaults to `true`).
+    pub fn locked_password(mut self, locked: bool) -> Self {
+        self.inner.locked_password = locked;
+        self
+    }
+
+    /// Set the management provenance (defaults to [`Provenance::Created`]).
+    pub fn provenance(mut self, provenance: Provenance) -> Self {
+        self.inner.provenance = provenance;
+        self
+    }
+
+    /// Finish building.
+    #[must_use]
+    pub fn build(self) -> ResolvedAccount {
+        self.inner
+    }
+}
+
 /// A fully-resolved target group: the declared group object joined with the
 /// grants every role bound to it contributes. Membership-style primitives are
 /// projected to group-forms (`%group` sudoers, `g:group` ACL, `@group` limits)
 /// by the apply layer; the in-group-membership sub-primitive (`groups`) has no
 /// local meaning on a group target and is dropped with a warning at resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResolvedGroup {
     /// POSIX group name (the key used to reference / create the group).
     pub name: String,
@@ -112,6 +208,82 @@ pub struct ResolvedGroup {
     /// duplicates removed. Audit/reporting shows which roles a group's grants
     /// come from.
     pub bound_roles: Vec<String>,
+}
+
+impl ResolvedGroup {
+    /// Start building a [`ResolvedGroup`] from its required identity fields
+    /// (name, provenance). The GID, members, grants, limits, and bound-role list
+    /// default to empty/`None` and are set with the `with_*` methods.
+    ///
+    /// Non-positional construction so a new resolved field is an additive
+    /// `with_*` method, not a breaking change at every call site (pairs with the
+    /// `#[non_exhaustive]` on the struct).
+    pub fn builder(name: impl Into<String>, provenance: Provenance) -> ResolvedGroupBuilder {
+        ResolvedGroupBuilder {
+            inner: ResolvedGroup {
+                name: name.into(),
+                gid: None,
+                provenance,
+                members: Vec::new(),
+                sudo_commands: Vec::new(),
+                file_grants: Vec::new(),
+                limits: Limits::default(),
+                bound_roles: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Builder for [`ResolvedGroup`]. Construct via [`ResolvedGroup::builder`].
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct ResolvedGroupBuilder {
+    inner: ResolvedGroup,
+}
+
+impl ResolvedGroupBuilder {
+    /// Set the pinned GID (`Created` groups only; an `Adopted` group observes its
+    /// GID at apply time and keeps `None` here).
+    pub fn gid(mut self, gid: Option<u32>) -> Self {
+        self.inner.gid = gid;
+        self
+    }
+
+    /// Set the Census-managed members.
+    pub fn members(mut self, members: Vec<String>) -> Self {
+        self.inner.members = members;
+        self
+    }
+
+    /// Set the group's sudo commands.
+    pub fn sudo_commands(mut self, sudo_commands: Vec<String>) -> Self {
+        self.inner.sudo_commands = sudo_commands;
+        self
+    }
+
+    /// Set the group's file-access grants.
+    pub fn file_grants(mut self, file_grants: Vec<catalog::ResolvedFileGrant>) -> Self {
+        self.inner.file_grants = file_grants;
+        self
+    }
+
+    /// Set the group's resource limits.
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.inner.limits = limits;
+        self
+    }
+
+    /// Set the contributing bound-role ids.
+    pub fn bound_roles(mut self, bound_roles: Vec<String>) -> Self {
+        self.inner.bound_roles = bound_roles;
+        self
+    }
+
+    /// Finish building.
+    #[must_use]
+    pub fn build(self) -> ResolvedGroup {
+        self.inner
+    }
 }
 
 /// A resolve-time warning surfaced as data (routed to stderr by the CLI, into
@@ -172,6 +344,7 @@ impl std::fmt::Display for ResolveWarning {
 
 /// Errors resolving a declaration into target accounts.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ResolveError {
     /// Reading or parsing a role-store slice failed.
     #[error(transparent)]
@@ -183,21 +356,50 @@ pub enum ResolveError {
     Catalog {
         /// The role whose permission failed to resolve.
         role: String,
-        /// The underlying catalog error.
-        source: CatalogError,
+        /// The underlying catalog error. Boxed because `CatalogError` is large
+        /// relative to the other variants, and keeping `ResolveError` small keeps
+        /// every `Result<_, ResolveError>` on the success path cheap to move.
+        source: Box<CatalogError>,
+    },
+    /// A `[[role_group]]` binding names a group that no `[[group]]` block
+    /// declares. Declaration validation normally rejects this, but
+    /// [`resolve_groups`] is `pub` and may be handed an externally-built
+    /// `Declaration` that never went through that check, so the lookup must fail
+    /// closed rather than panic.
+    #[error("role_group binding references group {group:?} which is not declared")]
+    UndeclaredGroup {
+        /// The undeclared group the binding pointed at.
+        group: String,
     },
 }
 
 /// Inputs to permission expansion threaded through [`resolve`]. Bundles the
 /// catalog source, the OS target, and the resolve context so the signature
 /// stays small as later slices add fields (e.g. lint flags).
-pub struct CompileInputs<'a> {
+///
+/// The catalog is held as a generic `&C` (not `&dyn CatalogSource`): a resolve
+/// call works against exactly one catalog source, so static dispatch is the right
+/// choice — no vtable indirection and the source monomorphizes per call site
+/// (M-DI-HIERARCHY: concrete > generic > `dyn`).
+pub struct CompileInputs<'a, C: CatalogSource> {
     /// The catalog to expand permissions against.
-    pub catalog: &'a dyn CatalogSource,
+    pub catalog: &'a C,
     /// The OS target the device resolves for.
     pub os: &'a OsTarget,
     /// Resolve context (catalog version, …).
     pub ctx: &'a ResolveCtx,
+}
+
+// The catalog source is a generic dependency with no public `Debug` bound, so
+// the formatter reports the target and context and elides the catalog rather
+// than forcing `C: Debug` onto every caller.
+impl<C: CatalogSource> std::fmt::Debug for CompileInputs<'_, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompileInputs")
+            .field("os", &self.os)
+            .field("ctx", &self.ctx)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Resolve every role account in the declaration against the role-store and the
@@ -208,7 +410,7 @@ pub struct CompileInputs<'a> {
 /// expanded (unknown id, cycle, …) — fail-closed before any plan/apply.
 pub fn resolve(
     decl: &Declaration,
-    inputs: &CompileInputs<'_>,
+    inputs: &CompileInputs<'_, impl CatalogSource>,
 ) -> Result<(Vec<ResolvedAccount>, Vec<ResolveWarning>), ResolveError> {
     let mut out = Vec::with_capacity(decl.role_accounts.len());
     let mut warnings = Vec::new();
@@ -225,8 +427,17 @@ pub fn resolve(
         let comp = rolestore::read_composition(&decl.role_store, &acct.role)?;
 
         // Start from the raw escape-hatch primitives. The permission expansion
-        // is unioned on top (raw wins for limits — see below).
-        let mut groups: Vec<String> = comp.groups.clone();
+        // is unioned on top (raw wins for limits — see below). The raw groups are
+        // deduped at the seed so a slice that lists the same group twice
+        // (`["wheel","wheel"]`) does not produce a managed record that diffs
+        // forever against a deduped declaration — set-equality compares lengths
+        // first, so an undeduped duplicate would never converge.
+        let mut groups: Vec<String> = Vec::with_capacity(comp.groups.len());
+        for g in &comp.groups {
+            if !groups.contains(g) {
+                groups.push(g.clone());
+            }
+        }
         let mut sudo_commands: Vec<String> = Vec::new();
         // File grants come ONLY from permissions (no raw escape-hatch). Collect
         // every permission's resolved grants, then union by path below.
@@ -275,7 +486,7 @@ pub fn resolve(
             )
             .map_err(|source| ResolveError::Catalog {
                 role: acct.role.clone(),
-                source,
+                source: Box::new(source),
             })?;
             for w in catalog_warnings {
                 warnings.push(ResolveWarning::Catalog(w));
@@ -309,21 +520,23 @@ pub fn resolve(
             }
         }
 
-        out.push(ResolvedAccount {
-            name: acct.role.clone(),
-            uid,
-            shell: decl.shell_for(acct).to_owned(),
-            home: decl.home_for(acct),
-            groups,
-            sudo_role: comp.sudo_role,
-            sudo_commands,
-            limits,
-            file_grants: catalog::union_resolved_file_grants(file_grants),
-            locked_password: true,
-            // Only created accounts reach this point — adopted accounts (no uid)
-            // are skipped above, so resolve never emits an Adopted account today.
-            provenance: Provenance::Created,
-        });
+        out.push(
+            ResolvedAccount::builder(
+                acct.role.clone(),
+                uid,
+                decl.shell_for(acct).to_owned(),
+                decl.home_for(acct),
+            )
+            .groups(groups)
+            .sudo_role(comp.sudo_role)
+            .sudo_commands(sudo_commands)
+            .limits(limits)
+            .file_grants(catalog::union_resolved_file_grants(file_grants))
+            // locked_password defaults to true (the Census invariant); only
+            // created accounts reach this point — adopted accounts (no uid) are
+            // skipped above, so provenance stays the builder default Created.
+            .build(),
+        );
     }
     Ok((out, warnings))
 }
@@ -355,7 +568,7 @@ fn merge_limits_first_wins(acc: &mut Limits, expanded: &Limits) {
 /// cannot be expanded.
 pub fn resolve_groups(
     decl: &Declaration,
-    inputs: &CompileInputs<'_>,
+    inputs: &CompileInputs<'_, impl CatalogSource>,
 ) -> Result<(Vec<ResolvedGroup>, Vec<ResolveWarning>), ResolveError> {
     let mut warnings = Vec::new();
 
@@ -365,29 +578,33 @@ pub fn resolve_groups(
     let mut groups: Vec<ResolvedGroup> = decl
         .groups
         .iter()
-        .map(|g| ResolvedGroup {
-            name: g.name.clone(),
-            gid: if g.adopt { None } else { g.gid },
-            provenance: if g.adopt {
+        .map(|g| {
+            let provenance = if g.adopt {
                 Provenance::Adopted
             } else {
                 Provenance::Created
-            },
-            members: g.members.clone(),
-            sudo_commands: Vec::new(),
-            file_grants: Vec::new(),
-            limits: Limits::default(),
-            bound_roles: Vec::new(),
+            };
+            // An adopted group observes its GID at apply time; only a created
+            // group carries a pin here.
+            let gid = if g.adopt { None } else { g.gid };
+            ResolvedGroup::builder(g.name.clone(), provenance)
+                .gid(gid)
+                .members(g.members.clone())
+                .build()
         })
         .collect();
 
     for rg in &decl.role_groups {
-        // Validation (slice 1) guarantees `rg.group` names a declared [[group]],
-        // so the lookup always hits.
-        let idx = groups
-            .iter()
-            .position(|g| g.name == rg.group)
-            .expect("role_group target is a declared group (validated in slice 1)");
+        // Declaration validation (slice 1) normally guarantees `rg.group` names a
+        // declared [[group]]. But this function is `pub` and may receive an
+        // externally-built Declaration that bypassed that check, so a missing
+        // group must fail closed rather than panic — `resolve_groups` runs before
+        // any mutation, so an error here aborts apply cleanly.
+        let Some(group) = groups.iter_mut().find(|g| g.name == rg.group) else {
+            return Err(ResolveError::UndeclaredGroup {
+                group: rg.group.clone(),
+            });
+        };
 
         // First point a role bound to a group is checked against the role-store.
         let comp = rolestore::read_composition(&decl.role_store, &rg.role)?;
@@ -407,15 +624,15 @@ pub fn resolve_groups(
             )
             .map_err(|source| ResolveError::Catalog {
                 role: rg.role.clone(),
-                source,
+                source: Box::new(source),
             })?;
             for w in catalog_warnings {
                 warnings.push(ResolveWarning::Catalog(w));
             }
             // Union expanded sudo commands onto the group (dedup, stable order).
             for s in resolved.sudo {
-                if !groups[idx].sudo_commands.contains(&s.value) {
-                    groups[idx].sudo_commands.push(s.value);
+                if !group.sudo_commands.contains(&s.value) {
+                    group.sudo_commands.push(s.value);
                 }
             }
             binding_file_grants.extend(resolved.file_grants);
@@ -423,9 +640,9 @@ pub fn resolve_groups(
             // have no raw escape-hatch limits, so the accumulator starts empty
             // and fills field-by-field across permissions and bound roles.
             if let Some(expanded) = resolved.limits {
-                let mut merged = groups[idx].limits.clone();
+                let mut merged = group.limits.clone();
                 merge_limits_first_wins(&mut merged, &expanded);
-                groups[idx].limits = merged;
+                group.limits = merged;
             }
             // The in-group-membership primitive has no group-target meaning;
             // drop it and warn once per binding if any permission carried one.
@@ -440,14 +657,14 @@ pub fn resolve_groups(
 
         // Union this binding's file grants into the group's, by path.
         if !binding_file_grants.is_empty() {
-            let mut all = std::mem::take(&mut groups[idx].file_grants);
+            let mut all = std::mem::take(&mut group.file_grants);
             all.extend(binding_file_grants);
-            groups[idx].file_grants = catalog::union_resolved_file_grants(all);
+            group.file_grants = catalog::union_resolved_file_grants(all);
         }
 
         // Record the contributing role (dedup, insertion order).
-        if !groups[idx].bound_roles.contains(&rg.role) {
-            groups[idx].bound_roles.push(rg.role.clone());
+        if !group.bound_roles.contains(&rg.role) {
+            group.bound_roles.push(rg.role.clone());
         }
     }
 
@@ -456,10 +673,10 @@ pub fn resolve_groups(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::catalog::{FakeCatalog, ListOverride, OsTarget, PermissionDef, ResolveCtx};
-    use crate::rolestore::Limits;
     use std::io::Write;
+
+    use super::*;
+    use crate::catalog::{FakeCatalog, ListOverride, PermissionDef};
 
     /// A fixed OS target for tests (no /etc/os-release dependency).
     fn os() -> OsTarget {
@@ -468,8 +685,16 @@ mod tests {
 
     /// An empty catalog + fixed OS + empty ctx — the "no permissions" path,
     /// behaving exactly as before (pure raw fields).
-    fn empty_inputs<'a>(cat: &'a FakeCatalog, os: &'a OsTarget, ctx: &'a ResolveCtx) -> CompileInputs<'a> {
-        CompileInputs { catalog: cat, os, ctx }
+    fn empty_inputs<'a>(
+        cat: &'a FakeCatalog,
+        os: &'a OsTarget,
+        ctx: &'a ResolveCtx,
+    ) -> CompileInputs<'a, FakeCatalog> {
+        CompileInputs {
+            catalog: cat,
+            os,
+            ctx,
+        }
     }
 
     fn def(id: &str) -> PermissionDef {
@@ -532,10 +757,16 @@ uid = 9010
         assert_eq!(a.home, PathBuf::from("/var/lib/census/home/oper"));
         assert_eq!(a.groups, vec!["wheel"]);
         assert_eq!(a.sudo_role.as_deref(), Some("ops"));
-        assert!(a.sudo_commands.is_empty(), "raw-only role has no expanded sudo commands");
+        assert!(
+            a.sudo_commands.is_empty(),
+            "raw-only role has no expanded sudo commands"
+        );
         assert!(a.locked_password, "role accounts must be password-locked");
         // No permissions → no lint about raw primitives.
-        assert!(warnings.is_empty(), "raw-only role must not warn: {warnings:?}");
+        assert!(
+            warnings.is_empty(),
+            "raw-only role must not warn: {warnings:?}"
+        );
     }
 
     /// Mirror a resolved target account into the managed record Census would
@@ -611,7 +842,10 @@ uid = 9010
         managed2.insert(target.name.clone(), stale);
         let plan2 = crate::plan::diff(&resolved, &StateOf(managed2));
         assert!(
-            matches!(plan2.actions.as_slice(), [crate::plan::Action::Update { .. }]),
+            matches!(
+                plan2.actions.as_slice(),
+                [crate::plan::Action::Update { .. }]
+            ),
             "a differing command set must Update: {plan2:?}"
         );
     }
@@ -677,7 +911,8 @@ uid = 9010
         assert!(
             matches!(
                 err,
-                ResolveError::Catalog { source: CatalogError::InvalidParamValue { .. }, .. }
+                ResolveError::Catalog { ref source, .. }
+                    if matches!(**source, CatalogError::InvalidParamValue { .. })
             ),
             "injection via param value must fail closed: {err:?}"
         );
@@ -687,9 +922,8 @@ uid = 9010
     fn parametrized_ref_missing_placeholder_param_fails_closed() {
         // A template with {unit} but a ref that supplies no `unit` param must
         // fail closed — an unfilled placeholder must never reach sudoers literally.
-        let (_tmp, decl) = fixture(
-            "[payload]\npermissions = [{ id = \"service-restart\", other = \"x\" }]\n",
-        );
+        let (_tmp, decl) =
+            fixture("[payload]\npermissions = [{ id = \"service-restart\", other = \"x\" }]\n");
         let cat = FakeCatalog::new().with(
             "linux",
             PermissionDef {
@@ -703,7 +937,8 @@ uid = 9010
         assert!(
             matches!(
                 err,
-                ResolveError::Catalog { source: CatalogError::MissingParam { .. }, .. }
+                ResolveError::Catalog { ref source, .. }
+                    if matches!(**source, CatalogError::MissingParam { .. })
             ),
             "unfilled placeholder must fail closed: {err:?}"
         );
@@ -713,9 +948,7 @@ uid = 9010
     fn parametrized_ref_unused_param_warns() {
         // A supplied param that matches no placeholder surfaces as a warning
         // (forward-compat / typo signal), not an error.
-        let (_tmp, decl) = fixture(
-            "[payload]\npermissions = [{ id = \"net\", bogus = \"x\" }]\n",
-        );
+        let (_tmp, decl) = fixture("[payload]\npermissions = [{ id = \"net\", bogus = \"x\" }]\n");
         let cat = FakeCatalog::new().with(
             "linux",
             PermissionDef {
@@ -797,7 +1030,10 @@ uid = 9010
         assert_eq!(a.groups, vec!["netdev"]);
         assert_eq!(a.sudo_commands, vec!["/usr/sbin/ip", "/usr/bin/nmcli"]);
         // Pure permissions, no raw fields → no lint.
-        assert!(warnings.is_empty(), "pure-permission role must not warn: {warnings:?}");
+        assert!(
+            warnings.is_empty(),
+            "pure-permission role must not warn: {warnings:?}"
+        );
     }
 
     #[test]
@@ -862,7 +1098,11 @@ uid = 9010
         assert_eq!(a.file_grants.len(), 1, "same path unions to one grant");
         assert_eq!(a.file_grants[0].access, Access::Rw, "access widens to rw");
         assert!(a.file_grants[0].recursive, "recursive ORs to true");
-        assert_eq!(a.file_grants[0].sources.len(), 2, "both contributors recorded");
+        assert_eq!(
+            a.file_grants[0].sources.len(),
+            2,
+            "both contributors recorded"
+        );
     }
 
     #[test]
@@ -887,7 +1127,10 @@ uid = 9010
         assert!(
             warnings.iter().any(|w| matches!(
                 w,
-                ResolveWarning::RawPrimitiveAlongsidePermissions { primitive: "groups", .. }
+                ResolveWarning::RawPrimitiveAlongsidePermissions {
+                    primitive: "groups",
+                    ..
+                }
             )),
             "raw group alongside permissions must lint: {warnings:?}"
         );
@@ -907,7 +1150,11 @@ uid = 9010
         let ctx = ResolveCtx::default();
         let os = OsTarget::new("linux", "debian", None).unwrap();
         let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
-        assert_eq!(resolved[0].groups, vec!["netdev"], "duplicate group deduped");
+        assert_eq!(
+            resolved[0].groups,
+            vec!["netdev"],
+            "duplicate group deduped"
+        );
     }
 
     #[test]
@@ -919,7 +1166,11 @@ uid = 9010
         let os = OsTarget::new("linux", "debian", None).unwrap();
         let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
         assert!(
-            matches!(err, ResolveError::Catalog { source: CatalogError::UnknownPermission(_), .. }),
+            matches!(
+                err,
+                ResolveError::Catalog { ref source, .. }
+                    if matches!(**source, CatalogError::UnknownPermission(_))
+            ),
             "unknown permission must fail closed: {err:?}"
         );
     }
@@ -928,13 +1179,15 @@ uid = 9010
     fn raw_limits_win_over_expanded() {
         // The role sets raw limits AND a permission that also expands limits;
         // the raw value wins (explicit operator choice).
-        let (_tmp, decl) = fixture(
-            "[payload]\npermissions = [\"big-files\"]\n[payload.limits]\nnofile = 1024\n",
-        );
+        let (_tmp, decl) =
+            fixture("[payload]\npermissions = [\"big-files\"]\n[payload.limits]\nnofile = 1024\n");
         let cat = FakeCatalog::new().with(
             "linux",
             PermissionDef {
-                limits: Some(crate::catalog::CatalogLimits { nofile: Some(99999), nproc: Some(512) }),
+                limits: Some(crate::catalog::CatalogLimits {
+                    nofile: Some(99999),
+                    nproc: Some(512),
+                }),
                 ..def("big-files")
             },
         );
@@ -945,11 +1198,17 @@ uid = 9010
         // Raw nofile wins; nproc is NOT filled from the expansion because raw
         // limits were present (raw wins wholesale to keep operator intent clear).
         assert_eq!(a.limits.nofile, Some(1024), "raw nofile wins");
-        assert_eq!(a.limits.nproc, None, "raw-limits-present blocks expanded merge");
+        assert_eq!(
+            a.limits.nproc, None,
+            "raw-limits-present blocks expanded merge"
+        );
         assert!(
             warnings.iter().any(|w| matches!(
                 w,
-                ResolveWarning::RawPrimitiveAlongsidePermissions { primitive: "limits", .. }
+                ResolveWarning::RawPrimitiveAlongsidePermissions {
+                    primitive: "limits",
+                    ..
+                }
             )),
             "raw limits alongside permissions must lint"
         );
@@ -961,14 +1220,23 @@ uid = 9010
         let cat = FakeCatalog::new().with(
             "linux",
             PermissionDef {
-                limits: Some(crate::catalog::CatalogLimits { nofile: Some(4096), nproc: None }),
+                limits: Some(crate::catalog::CatalogLimits {
+                    nofile: Some(4096),
+                    nproc: None,
+                }),
                 ..def("big-files")
             },
         );
         let ctx = ResolveCtx::default();
         let os = OsTarget::new("linux", "debian", None).unwrap();
         let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
-        assert_eq!(resolved[0].limits, Limits { nofile: Some(4096), nproc: None });
+        assert_eq!(
+            resolved[0].limits,
+            Limits {
+                nofile: Some(4096),
+                nproc: None
+            }
+        );
     }
 
     #[test]
@@ -1035,7 +1303,10 @@ home_base = "/var/lib/census/home"
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
-                limits: Some(crate::catalog::CatalogLimits { nofile: Some(4096), nproc: None }),
+                limits: Some(crate::catalog::CatalogLimits {
+                    nofile: Some(4096),
+                    nproc: None,
+                }),
                 files: vec![crate::catalog::FileGrant {
                     path: "/etc/net".to_owned(),
                     access: crate::catalog::Access::Rw,
@@ -1055,11 +1326,20 @@ home_base = "/var/lib/census/home"
         assert_eq!(g.gid, Some(8020));
         assert_eq!(g.provenance, Provenance::Created);
         assert_eq!(g.sudo_commands, vec!["/usr/sbin/ip"]);
-        assert_eq!(g.limits, Limits { nofile: Some(4096), nproc: None });
+        assert_eq!(
+            g.limits,
+            Limits {
+                nofile: Some(4096),
+                nproc: None
+            }
+        );
         assert_eq!(g.file_grants.len(), 1);
         assert_eq!(g.file_grants[0].path, "/etc/net");
         assert_eq!(g.bound_roles, vec!["netops"]);
-        assert!(warnings.is_empty(), "clean binding must not warn: {warnings:?}");
+        assert!(
+            warnings.is_empty(),
+            "clean binding must not warn: {warnings:?}"
+        );
     }
 
     #[test]
@@ -1155,6 +1435,61 @@ home_base = "/var/lib/census/home"
                     if role == "netops" && group == "ops"
             )),
             "groups primitive on a group target must warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn role_group_to_undeclared_group_fails_closed_not_panics() {
+        // Build a valid declaration, then mutate the binding to reference a group
+        // that no `[[group]]` block declares — the path an externally-built
+        // Declaration could reach. resolve_groups must return UndeclaredGroup, not
+        // panic on the `.position()` lookup.
+        let (_tmp, mut decl) = group_fixture(
+            &[("netops", "[payload]\npermissions = [\"net\"]\n")],
+            "[[group]]\nname = \"ops\"\n[[role_group]]\nrole = \"netops\"\ngroup = \"ops\"\n",
+        );
+        // Repoint the binding at a group with no declaration block.
+        decl.role_groups[0].group = "ghost-group".to_owned();
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                ..def("net")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let err = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::UndeclaredGroup { ref group } if group == "ghost-group"),
+            "binding to an undeclared group must fail closed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_raw_group_is_deduped_for_idempotent_diff() {
+        // A slice that lists the same group twice must dedup at the seed so the
+        // resolved account does not carry a duplicate that diffs forever against a
+        // deduped registry record (set-equality compares lengths first).
+        let (_tmp, decl) = fixture("[payload]\ngroups = [\"wheel\", \"wheel\"]\n");
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(
+            resolved[0].groups,
+            vec!["wheel"],
+            "duplicate raw group deduped"
+        );
+
+        // Round-trip: a registry record mirroring the (deduped) target must produce
+        // an empty plan — proving the duplicate cannot drive a perpetual diff.
+        let mut managed = std::collections::BTreeMap::new();
+        managed.insert(resolved[0].name.clone(), managed_from(&resolved[0]));
+        let plan = crate::plan::diff(&resolved, &StateOf(managed));
+        assert!(
+            plan.is_empty(),
+            "deduped groups must round-trip idempotently: {plan:?}"
         );
     }
 

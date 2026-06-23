@@ -42,6 +42,7 @@ impl BackupTargets {
 
 /// Errors from snapshot / restore.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BackupError {
     /// Could not create the snapshot directory.
     #[error("cannot create snapshot dir {path}: {reason}")]
@@ -93,7 +94,10 @@ impl Backup {
         }
     }
 
-    /// Whether a snapshot has been taken.
+    /// Whether a snapshot has been taken. Test-only inspector for the rollback
+    /// state (production drives rollback through the apply orchestrator, not by
+    /// querying this).
+    #[cfg(test)]
     pub fn has_snapshot(&self) -> bool {
         self.snapshot_dir.is_some()
     }
@@ -141,7 +145,17 @@ impl Backup {
                 atomic_replace(copy_path, original)?;
             } else {
                 // Did not exist at snapshot time → ensure it does not exist now.
-                let _ = std::fs::remove_file(original);
+                // Best-effort: an already-absent file is the desired state; any
+                // other removal failure is logged but never fails the restore.
+                if let Err(e) = std::fs::remove_file(original) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %original.display(),
+                            error = %e,
+                            "restore: failed to remove file absent at snapshot time"
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -150,7 +164,18 @@ impl Backup {
     /// Success path: drop the snapshot directory (retention policy).
     pub fn commit_success(&mut self) {
         if let Some(dir) = self.snapshot_dir.take() {
-            let _ = std::fs::remove_dir_all(&dir);
+            // Best-effort cleanup: a retained snapshot dir is harmless (forensics
+            // only) and must never turn a successful apply into a failure. A
+            // `NotFound` is expected; anything else is logged.
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "failed to remove snapshot directory after successful apply"
+                    );
+                }
+            }
         }
         self.saved.clear();
     }
@@ -169,12 +194,19 @@ fn sanitize(path: &Path) -> String {
         .collect()
 }
 
-/// A monotonic-ish timestamp directory component. Falls back to a fixed token
-/// if the clock is unavailable (no panic).
+/// A monotonic-ish timestamp directory component. If the clock reads before the
+/// Unix epoch (so a duration is unavailable), fall back to a per-process,
+/// per-call unique token `snapshot-<pid>-<n>` instead of a constant string —
+/// otherwise two snapshots taken under a broken clock would target the same
+/// directory and the second would clobber the first. Never panics.
 fn timestamp_component() -> String {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => format!("{}-{:09}", d.as_secs(), d.subsec_nanos()),
-        Err(_) => "snapshot".to_owned(),
+        Err(_) => {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("snapshot-{}-{n}", std::process::id())
+        }
     }
 }
 
@@ -200,16 +232,27 @@ fn create_dir_0700(dir: &Path) -> Result<(), BackupError> {
 }
 
 fn copy_file(from: &Path, to: &Path) -> Result<(), BackupError> {
-    std::fs::copy(from, to).map(|_| ()).map_err(|e| BackupError::Copy {
-        from: from.to_path_buf(),
-        to: to.to_path_buf(),
-        reason: e.to_string(),
-    })
+    std::fs::copy(from, to)
+        .map(|_| ())
+        .map_err(|e| BackupError::Copy {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+            reason: e.to_string(),
+        })
 }
 
-/// Atomically replace `dest` with the contents of `src`: copy to a temp sibling
+/// Atomically replace `dest` with the contents of `src`: write to a temp sibling
 /// of `dest`, then rename over `dest` (same filesystem → atomic).
+///
+/// The temp is created with `create_new(true)` (O_EXCL): the open fails if the
+/// path already exists, including a symlink, so a pre-planted link at the
+/// predictable temp name can never be followed to clobber an arbitrary file —
+/// the same guard `sudoers::open_excl` uses for privileged writes. A stale
+/// REGULAR temp (left by a crashed prior restore) is removed and the open
+/// retried once; removing a symlink at that path drops the link, never its
+/// target, so the retry creates a fresh real file.
 fn atomic_replace(src: &Path, dest: &Path) -> Result<(), BackupError> {
+    use std::io::Write;
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(format!(
         ".census-restore-{}",
@@ -217,9 +260,50 @@ fn atomic_replace(src: &Path, dest: &Path) -> Result<(), BackupError> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "tmp".to_owned())
     ));
-    copy_file(src, &tmp)?;
+
+    let bytes = std::fs::read(src).map_err(|e| BackupError::Copy {
+        from: src.to_path_buf(),
+        to: tmp.clone(),
+        reason: e.to_string(),
+    })?;
+
+    let open_excl = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+    };
+    let mut file = match open_excl() {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Stale temp or a planted symlink — drop the path entry and retry.
+            cleanup_temp(&tmp);
+            open_excl().map_err(|e| BackupError::Copy {
+                from: src.to_path_buf(),
+                to: tmp.clone(),
+                reason: e.to_string(),
+            })?
+        }
+        Err(e) => {
+            return Err(BackupError::Copy {
+                from: src.to_path_buf(),
+                to: tmp.clone(),
+                reason: e.to_string(),
+            })
+        }
+    };
+    file.write_all(&bytes).map_err(|e| {
+        cleanup_temp(&tmp);
+        BackupError::Copy {
+            from: src.to_path_buf(),
+            to: tmp.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    drop(file);
+
     std::fs::rename(&tmp, dest).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+        cleanup_temp(&tmp);
         BackupError::Copy {
             from: tmp.clone(),
             to: dest.to_path_buf(),
@@ -228,10 +312,23 @@ fn atomic_replace(src: &Path, dest: &Path) -> Result<(), BackupError> {
     })
 }
 
+/// Best-effort removal of a leftover backup temp file. Never propagates — a
+/// cleanup failure must not mask the primary copy error. A `NotFound` is the
+/// expected race (already gone / consumed by the rename) and is silent; any
+/// other failure is logged at warn so a leaked temp file is visible.
+fn cleanup_temp(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), error = %e, "failed to remove backup temp file");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     fn write(path: &Path, body: &[u8]) {
         let mut f = std::fs::File::create(path).unwrap();
@@ -260,8 +357,14 @@ mod tests {
         write(&shadow, b"CORRUPTED\n");
 
         backup.restore().unwrap();
-        assert_eq!(std::fs::read(&passwd).unwrap(), b"root:x:0:0:root:/root:/bin/bash\n");
-        assert_eq!(std::fs::read(&shadow).unwrap(), b"root:!:19000:0:99999:7:::\n");
+        assert_eq!(
+            std::fs::read(&passwd).unwrap(),
+            b"root:x:0:0:root:/root:/bin/bash\n"
+        );
+        assert_eq!(
+            std::fs::read(&shadow).unwrap(),
+            b"root:!:19000:0:99999:7:::\n"
+        );
     }
 
     #[test]
@@ -269,24 +372,61 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sudoers = tmp.path().join("census-oper");
         // Did NOT exist at snapshot.
-        let targets = BackupTargets { files: vec![sudoers.clone()] };
+        let targets = BackupTargets {
+            files: vec![sudoers.clone()],
+        };
         let mut backup = Backup::new(targets, tmp.path().join("rollback"));
         backup.snapshot().unwrap();
         // Mutation creates it.
         write(&sudoers, b"oper ALL=(ALL) CENSUS_OPS\n");
         assert!(sudoers.exists());
         backup.restore().unwrap();
-        assert!(!sudoers.exists(), "file absent at snapshot must be removed on restore");
+        assert!(
+            !sudoers.exists(),
+            "file absent at snapshot must be removed on restore"
+        );
     }
 
     #[test]
     fn restore_without_snapshot_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut backup = Backup::new(
-            BackupTargets { files: vec![] },
-            tmp.path().join("rollback"),
+        let mut backup = Backup::new(BackupTargets { files: vec![] }, tmp.path().join("rollback"));
+        assert!(matches!(
+            backup.restore().unwrap_err(),
+            BackupError::NoSnapshot
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_replace_does_not_follow_symlink_at_temp() {
+        // Pre-plant a symlink at the predictable restore-temp path pointing at a
+        // victim file outside the operation. The O_EXCL create must NOT write
+        // through the link: the victim is left untouched and dest still gets the
+        // src contents (the link is removed and a fresh real temp is created).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        write(&src, b"NEW CONTENTS\n");
+        let dest = tmp.path().join("passwd");
+        write(&dest, b"OLD\n");
+
+        let victim = tmp.path().join("victim");
+        write(&victim, b"DO NOT TOUCH\n");
+
+        // The temp name atomic_replace derives for `dest`.
+        let temp = tmp.path().join(".census-restore-passwd");
+        std::os::unix::fs::symlink(&victim, &temp).unwrap();
+
+        atomic_replace(&src, &dest).unwrap();
+
+        // The victim the symlink pointed at was never written through.
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"DO NOT TOUCH\n",
+            "O_EXCL temp must not follow the planted symlink to the victim"
         );
-        assert!(matches!(backup.restore().unwrap_err(), BackupError::NoSnapshot));
+        // dest got the new contents via the fresh real temp.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW CONTENTS\n");
     }
 
     #[test]
@@ -322,7 +462,9 @@ mod tests {
 
     #[test]
     fn add_file_dedups() {
-        let mut t = BackupTargets { files: vec![PathBuf::from("/etc/passwd")] };
+        let mut t = BackupTargets {
+            files: vec![PathBuf::from("/etc/passwd")],
+        };
         t.add_file(PathBuf::from("/etc/sudoers.d/census-oper"));
         t.add_file(PathBuf::from("/etc/sudoers.d/census-oper"));
         assert_eq!(t.files.len(), 2);

@@ -10,8 +10,9 @@
 //!
 //! Census never edits foreign sudoers files — only `census-*` / `census-grp-*`.
 
-use crate::model::{ResolvedAccount, ResolvedGroup};
 use std::path::{Path, PathBuf};
+
+use crate::model::{ResolvedAccount, ResolvedGroup};
 
 /// Default directory Census owns role sudoers fragments in. Injectable as a
 /// parameter so tests/containers can point at a writable temp dir.
@@ -31,6 +32,7 @@ pub fn sudoers_group_filename(group: &str) -> String {
 
 /// Errors raised while materializing or removing a role sudoers fragment.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SudoersError {
     /// Could not write the temporary fragment before validation.
     #[error("cannot write temp sudoers file {path}: {reason}")]
@@ -83,6 +85,9 @@ pub enum SudoersError {
 }
 
 /// Absolute path of the live fragment Census owns for `role` under `dir`.
+/// Test-only convenience over [`sudoers_filename`] (production code joins the
+/// filename onto the sudoers dir directly).
+#[cfg(test)]
 pub fn sudoers_path(dir: &Path, role: &str) -> PathBuf {
     dir.join(sudoers_filename(role))
 }
@@ -148,7 +153,7 @@ fn write_fragment(
         Ok(h) => h,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Stale temp from a previous run: clear it and retry exactly once.
-            let _ = std::fs::remove_file(&tmp);
+            cleanup_temp(&tmp);
             open_excl(&tmp).map_err(|e| SudoersError::WriteTemp {
                 path: tmp.clone(),
                 reason: e.to_string(),
@@ -164,7 +169,7 @@ fn write_fragment(
     {
         use std::io::Write as _;
         if let Err(e) = handle.write_all(content.as_bytes()) {
-            let _ = std::fs::remove_file(&tmp);
+            cleanup_temp(&tmp);
             return Err(SudoersError::WriteTemp {
                 path: tmp.clone(),
                 reason: e.to_string(),
@@ -175,7 +180,7 @@ fn write_fragment(
 
     // sudoers fragments must be 0440 or visudo/sudo refuse them.
     if let Err(e) = set_mode_0440(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+        cleanup_temp(&tmp);
         return Err(e);
     }
 
@@ -188,29 +193,45 @@ fn write_fragment(
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
+            cleanup_temp(&tmp);
             return Err(SudoersError::VisudoSpawn {
                 reason: e.to_string(),
             });
         }
     };
     if !output.status.success() {
-        let _ = std::fs::remove_file(&tmp);
+        cleanup_temp(&tmp);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        tracing::warn!(subject, stderr = %stderr, "visudo rejected sudoers fragment");
         return Err(SudoersError::VisudoRejected {
             subject: subject.to_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            stderr,
         });
     }
 
     // Atomic activation: rename the validated temp over the canonical path.
     let dest = dir.join(filename);
     std::fs::rename(&tmp, &dest).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+        cleanup_temp(&tmp);
         SudoersError::Activate {
             dest: dest.clone(),
             reason: e.to_string(),
         }
-    })
+    })?;
+    tracing::info!(subject, path = %dest.display(), "activated sudoers fragment");
+    Ok(())
+}
+
+/// Best-effort removal of a leftover sudoers temp fragment. Never propagates —
+/// a cleanup failure must not mask the primary error. A `NotFound` is expected
+/// (already gone / consumed by the rename) and silent; any other failure is
+/// logged at warn so a leaked temp file is visible.
+fn cleanup_temp(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), error = %e, "failed to remove temp sudoers fragment");
+        }
+    }
 }
 
 /// Shared idempotent remove for any Census-owned sudoers fragment. An absent
@@ -259,21 +280,19 @@ fn set_mode_0440(_path: &Path) -> Result<(), SudoersError> {
 /// carries no sudo right (no file should exist).
 ///
 /// Two render paths:
-/// * **Concrete commands** (preferred, permission-expanded): when
-///   `acct.sudo_commands` is non-empty, emit a single per-user rule listing
-///   those exact commands comma-joined — `<user> ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli`.
-///   `NOPASSWD` because role accounts have locked passwords (§8): there is no
-///   password to prompt for, so without `NOPASSWD` sudo would be unusable.
-///   Commands come from the catalog, where each value is validated at parse to
-///   be a single-line absolute path (control chars — including the newline that
-///   would inject a second directive line — are rejected there). As a second
-///   layer, every command is run through `escape_sudoers_command`, which
-///   neutralises the sudoers metacharacters `, : = \ ( ) !` so each entry
-///   renders as exactly one literal Cmnd and cannot split the list or act as a
-///   runas/negation directive.
-/// * **Escape-hatch alias** (legacy): when there are no concrete commands but a
-///   raw `sudo_role` is set, defer the command set to a site-provisioned
-///   `Cmnd_Alias` (the prior behaviour, unchanged).
+/// * **Concrete commands** (preferred, permission-expanded): when `acct.sudo_commands` is
+///   non-empty, emit a single per-user rule listing those exact commands comma-joined — `<user>
+///   ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli`. `NOPASSWD` because role accounts have
+///   locked passwords (§8): there is no password to prompt for, so without `NOPASSWD` sudo would be
+///   unusable. Commands come from the catalog, where each value is validated at parse to be a
+///   single-line absolute path (control chars — including the newline that would inject a second
+///   directive line — are rejected there). As a second layer, every command is run through
+///   `escape_sudoers_command`, which neutralises the sudoers metacharacters `, : = \ ( ) !` so each
+///   entry renders as exactly one literal Cmnd and cannot split the list or act as a runas/negation
+///   directive.
+/// * **Escape-hatch alias** (legacy): when there are no concrete commands but a raw `sudo_role` is
+///   set, defer the command set to a site-provisioned `Cmnd_Alias` (the prior behaviour,
+///   unchanged).
 ///
 /// When both are empty → `None` (no fragment file).
 pub fn build_sudoers_content(acct: &ResolvedAccount) -> Option<String> {
@@ -388,7 +407,6 @@ fn sudo_role_alias(sudo_role: &str) -> String {
 mod tests {
     use super::*;
     use crate::rolestore::Limits;
-    use std::path::PathBuf;
 
     fn acct(name: &str, sudo_role: Option<&str>) -> ResolvedAccount {
         ResolvedAccount {
@@ -448,8 +466,9 @@ mod tests {
 
     #[test]
     fn concrete_commands_render_nopasswd_rule() {
-        let content = build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
-            .expect("concrete commands yield content");
+        let content =
+            build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+                .expect("concrete commands yield content");
         // Single per-user NOPASSWD rule with comma-joined commands.
         assert!(
             content.contains("oper ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli"),
@@ -459,7 +478,10 @@ mod tests {
         // NOPASSWD rationale documented (locked passwords).
         assert!(content.contains("NOPASSWD"));
         // No external Cmnd_Alias indirection on the concrete path.
-        assert!(!content.contains("CENSUS_"), "concrete path must not emit an alias: {content}");
+        assert!(
+            !content.contains("CENSUS_"),
+            "concrete path must not emit an alias: {content}"
+        );
     }
 
     #[test]
@@ -470,15 +492,22 @@ mod tests {
         a.sudo_role = Some("ops".to_owned());
         let content = build_sudoers_content(&a).unwrap();
         assert!(content.contains("NOPASSWD: /usr/sbin/ip"));
-        assert!(!content.contains("CENSUS_OPS"), "concrete commands take precedence");
+        assert!(
+            !content.contains("CENSUS_OPS"),
+            "concrete commands take precedence"
+        );
     }
 
     #[test]
     fn concrete_rule_has_valid_sudoers_shape() {
         // Every non-comment line is a single rule with the expected `ALL=(ALL)`
         // run-spec and a NOPASSWD tag; no stray separators that would break it.
-        let content = build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"])).unwrap();
-        let rule_lines: Vec<&str> = content.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();
+        let content =
+            build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"])).unwrap();
+        let rule_lines: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .collect();
         assert_eq!(rule_lines.len(), 1, "exactly one rule line: {content}");
         let line = rule_lines[0];
         assert!(line.starts_with("oper ALL=(ALL) NOPASSWD: "));
@@ -491,7 +520,10 @@ mod tests {
         // A (contrived) command containing a literal comma must be escaped as
         // `\,` so sudoers treats it as one Cmnd, not two.
         let content = build_sudoers_content(&acct_cmds("oper", &["/usr/bin/odd,name"])).unwrap();
-        assert!(content.contains(r"/usr/bin/odd\,name"), "comma must be escaped: {content}");
+        assert!(
+            content.contains(r"/usr/bin/odd\,name"),
+            "comma must be escaped: {content}"
+        );
     }
 
     #[test]
@@ -503,10 +535,19 @@ mod tests {
         // and assert each metacharacter is backslash-escaped (one literal Cmnd).
         let content =
             build_sudoers_content(&acct_cmds("oper", &["(root) /bin/sh", "/bin/x!y"])).unwrap();
-        assert!(content.contains(r"\(root\) /bin/sh"), "runas parens must be escaped: {content}");
-        assert!(content.contains(r"/bin/x\!y"), "negation bang must be escaped: {content}");
+        assert!(
+            content.contains(r"\(root\) /bin/sh"),
+            "runas parens must be escaped: {content}"
+        );
+        assert!(
+            content.contains(r"/bin/x\!y"),
+            "negation bang must be escaped: {content}"
+        );
         // No bare `(` / `)` / `!` survive on the rule line.
-        for line in content.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        for line in content
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
             assert!(
                 !line.contains("(root)") && !line.contains("x!y"),
                 "unescaped metacharacter leaked: {line}"
@@ -525,7 +566,9 @@ mod tests {
         let a = sudo_role_alias("ops-admin.2");
         assert_eq!(a, "CENSUS_OPS_ADMIN_2");
         assert!(a.chars().next().unwrap().is_ascii_uppercase());
-        assert!(a.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'));
     }
 
     #[test]
@@ -587,11 +630,15 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let content = build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
-            .expect("concrete commands yield content");
+        let content =
+            build_sudoers_content(&acct_cmds("oper", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+                .expect("concrete commands yield content");
         write_sudoers(dir.path(), "oper", &content).unwrap();
         let dest = sudoers_path(dir.path(), "oper");
-        assert!(dest.exists(), "validated concrete fragment must be activated");
+        assert!(
+            dest.exists(),
+            "validated concrete fragment must be activated"
+        );
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), content);
     }
 
@@ -631,24 +678,34 @@ mod tests {
             !sudoers_path(dir.path(), "oper").exists(),
             "invalid fragment must NOT be activated"
         );
-        assert!(!dir.path().join(".census-oper.tmp").exists(), "temp must be cleaned up");
+        assert!(
+            !dir.path().join(".census-oper.tmp").exists(),
+            "temp must be cleaned up"
+        );
     }
 
     // ---- group-grants slice 5b: %group sudoers fragment ----
 
     #[test]
     fn group_concrete_commands_render_nopasswd_percent_rule() {
-        let content = build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
-            .expect("non-empty sudo commands yield content");
+        let content =
+            build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+                .expect("non-empty sudo commands yield content");
         // Subject is the Unix group (`%`), comma-joined Cmnd list, NOPASSWD.
         assert!(
             content.contains("%wheel ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/bin/nmcli"),
             "got: {content}"
         );
-        assert!(content.contains("Managed by Census"), "must carry the managed header");
+        assert!(
+            content.contains("Managed by Census"),
+            "must carry the managed header"
+        );
         assert!(content.contains("NOPASSWD"));
         // Group fragments never emit a Cmnd_Alias indirection (no sudo_role path).
-        assert!(!content.contains("CENSUS_"), "group path must not emit an alias: {content}");
+        assert!(
+            !content.contains("CENSUS_"),
+            "group path must not emit an alias: {content}"
+        );
     }
 
     #[test]
@@ -660,7 +717,8 @@ mod tests {
     fn group_rule_has_valid_sudoers_shape() {
         // Exactly one rule line, subject is a single `%group` token, NOPASSWD tag.
         let content =
-            build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"])).unwrap();
+            build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+                .unwrap();
         let rule_lines: Vec<&str> = content
             .lines()
             .filter(|l| !l.starts_with('#') && !l.is_empty())
@@ -674,8 +732,12 @@ mod tests {
     #[test]
     fn group_command_metacharacters_are_escaped() {
         // The same escaper guards the group path: a comma must not split the list.
-        let content = build_group_sudoers_content(&group_cmds("wheel", &["/usr/bin/odd,name"])).unwrap();
-        assert!(content.contains(r"/usr/bin/odd\,name"), "comma must be escaped: {content}");
+        let content =
+            build_group_sudoers_content(&group_cmds("wheel", &["/usr/bin/odd,name"])).unwrap();
+        assert!(
+            content.contains(r"/usr/bin/odd\,name"),
+            "comma must be escaped: {content}"
+        );
     }
 
     #[test]
@@ -712,8 +774,9 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let content = build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
-            .expect("non-empty sudo commands yield content");
+        let content =
+            build_group_sudoers_content(&group_cmds("wheel", &["/usr/sbin/ip", "/usr/bin/nmcli"]))
+                .expect("non-empty sudo commands yield content");
         write_group_sudoers(dir.path(), "wheel", &content).unwrap();
         let dest = sudoers_group_path(dir.path(), "wheel");
         assert!(dest.exists(), "validated group fragment must be activated");

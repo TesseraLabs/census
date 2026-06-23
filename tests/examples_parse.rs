@@ -11,10 +11,22 @@
 //!
 //! Covered:
 //!   - `examples/declaration.toml`     → `Declaration::parse`
-//!   - `examples/roles/*.toml`         → `rolestore::read_composition` (the
-//!                                        real role-slice parser, `[payload]`)
-//!   - `share/permissions/<layer>/**`  → `LiveCatalog::read_layer` (parse +
-//!                                        `validate` + namespace/location check)
+//!   - `examples/roles/*.toml`         → `rolestore::read_composition` (the real role-slice parser,
+//!     `[payload]`)
+//!   - `share/permissions/<layer>/**`  → `LiveCatalog::read_layer` (parse + `validate` +
+//!     namespace/location check)
+
+// Integration tests are a separate crate, so the crate-root test exemption in
+// lib.rs does not reach them. In a test a panic on a broken fixture is the
+// intended failure mode, so the production-hazard restriction lints are allowed
+// here, mirroring lib.rs's `cfg_attr(test, ...)`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a panic on a broken fixture is the intended failure mode in tests"
+)]
 
 use std::path::{Path, PathBuf};
 
@@ -45,8 +57,8 @@ fn example_declaration_parses_through_real_parser() {
 fn example_role_slices_parse_through_real_parser() {
     let store = repo("examples/roles");
     let mut count = 0usize;
-    for entry in std::fs::read_dir(&store)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", store.display()))
+    for entry in
+        std::fs::read_dir(&store).unwrap_or_else(|e| panic!("cannot read {}: {e}", store.display()))
     {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -67,7 +79,11 @@ fn example_role_slices_parse_through_real_parser() {
         });
         count += 1;
     }
-    assert!(count > 0, "expected at least one example role slice under {}", store.display());
+    assert!(
+        count > 0,
+        "expected at least one example role slice under {}",
+        store.display()
+    );
 }
 
 #[test]
@@ -82,23 +98,33 @@ fn packaged_catalog_layers_parse_through_real_parser() {
     let catalog = LiveCatalog::new(vec![perms.clone()]);
     let mut layers = 0usize;
     let mut records = 0usize;
-    for entry in std::fs::read_dir(&perms)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", perms.display()))
+    for entry in
+        std::fs::read_dir(&perms).unwrap_or_else(|e| panic!("cannot read {}: {e}", perms.display()))
     {
         let path = entry.unwrap().path();
         if !path.is_dir() {
             continue;
         }
-        let layer = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let layer = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if layer == "l10n" {
             continue;
         }
-        let defs = catalog.read_layer(layer).unwrap_or_else(|e| {
-            panic!("packaged catalog layer {layer:?} no longer parses: {e}")
-        });
+        let defs = catalog
+            .read_layer(layer)
+            .unwrap_or_else(|e| panic!("packaged catalog layer {layer:?} no longer parses: {e}"));
         records += defs.len();
         layers += 1;
     }
-    assert!(layers > 0, "expected at least one packaged catalog layer under {}", perms.display());
-    assert!(records > 0, "expected at least one packaged permission record");
+    assert!(
+        layers > 0,
+        "expected at least one packaged catalog layer under {}",
+        perms.display()
+    );
+    assert!(
+        records > 0,
+        "expected at least one packaged permission record"
+    );
 }

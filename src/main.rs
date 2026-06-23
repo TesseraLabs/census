@@ -1,13 +1,32 @@
-use clap::Parser;
+#![forbid(unsafe_code)]
+
+use std::io::IsTerminal;
+
 use census::cli_def::{CatalogSub, Cli, Command, FrameworkSub};
 use census::coverage::SurfaceClass;
+use clap::Parser;
+
+/// Install the process-wide `tracing` subscriber. Diagnostics go to STDERR so
+/// they never contaminate the machine-readable STDOUT (`--json` output, the
+/// plan/coverage renders) or the program's exit code. The filter reads
+/// `CENSUS_LOG` first, then `RUST_LOG`, defaulting to `warn`; ANSI colour is
+/// enabled only when stderr is a terminal. `try_init` is used so a second call
+/// (e.g. from a test harness in the same process) is a no-op rather than a panic.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("CENSUS_LOG")
+        .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_env_filter(filter)
+        .try_init();
+}
 
 /// The default catalog roots plus any `--catalog-dir` overrides, in precedence
 /// order (lowest first). Overrides are appended so a site dir given on the CLI
 /// wins over the packaged defaults.
-fn catalog_roots_with_overrides(
-    overrides: Vec<std::path::PathBuf>,
-) -> Vec<std::path::PathBuf> {
+fn catalog_roots_with_overrides(overrides: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
     let mut roots = census::cli::default_catalog_roots();
     roots.extend(overrides);
     roots
@@ -24,6 +43,7 @@ fn framework_roots_with_overrides(overrides: Vec<std::path::PathBuf>) -> Vec<std
 }
 
 fn main() -> std::process::ExitCode {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command {
         Command::Plan {
@@ -57,10 +77,14 @@ fn main() -> std::process::ExitCode {
             catalog_roots: catalog_roots_with_overrides(catalog_dir),
             os_target,
         }),
-        Command::Doctor { declaration, managed } => {
-            census::cli::run_doctor(declaration.as_deref(), &managed)
-        }
-        Command::Status { declaration, managed } => census::cli::run_status(
+        Command::Doctor {
+            declaration,
+            managed,
+        } => census::cli::run_doctor(declaration.as_deref(), &managed),
+        Command::Status {
+            declaration,
+            managed,
+        } => census::cli::run_status(
             declaration.as_deref(),
             &managed,
             std::path::Path::new(census::trust::DEFAULT_PERSIST_DIR),
@@ -112,6 +136,21 @@ fn main() -> std::process::ExitCode {
                 include_low_priority,
                 cache,
             } => {
+                // Validate --min-coverage up front. The gate compares
+                // `overall_pct < threshold`; a non-finite threshold (NaN/inf) or
+                // one outside 0..=100 would make that comparison meaningless and
+                // could let a CI coverage gate silently pass (`x < NaN` is always
+                // false). Reject it before any scanning runs. This is a runtime
+                // check rather than a clap value_parser so the CLI help golden
+                // stays byte-stable.
+                if let Some(m) = min_coverage {
+                    if !m.is_finite() || !(0.0..=100.0).contains(&m) {
+                        eprintln!(
+                            "census: --min-coverage must be a finite percentage in 0..=100, got {m}"
+                        );
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
                 // Parse the optional --class filter up front so an unknown class is
                 // a clean error before any scanning runs.
                 let classes = match class {

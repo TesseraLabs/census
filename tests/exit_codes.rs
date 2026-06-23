@@ -13,6 +13,18 @@
 //! mutation, infeasible in a unit/integration environment. The exit-code mapping
 //! is unit-tested directly in `cli.rs` (`apply_exit_code_maps_deferrals`).
 
+// Integration tests are a separate crate, so the crate-root test exemption in
+// lib.rs does not reach them. In a test a panic on a broken fixture is the
+// intended failure mode, so the production-hazard restriction lints are allowed
+// here, mirroring lib.rs's `cfg_attr(test, ...)`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a panic on a broken fixture is the intended failure mode in tests"
+)]
+
 use std::io::Write;
 use std::process::Command;
 
@@ -106,5 +118,100 @@ fn coverage_min_coverage_gate_exits_nonzero_on_shortfall() {
         out.status.code(),
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn coverage_rejects_invalid_min_coverage() {
+    // `--min-coverage` is a percentage parsed as `f64` by clap; a non-numeric
+    // value is a usage error, not a coverage shortfall. clap rejects it before the
+    // command runs and exits with its usage-error code (2) — distinct from the
+    // gate code (4), so a misconfigured CI invocation cannot masquerade as a
+    // genuine coverage shortfall.
+    let out = Command::new(env!("CARGO_BIN_EXE_census"))
+        .args([
+            "catalog",
+            "coverage",
+            "--os-target",
+            "linux-debian-12",
+            "--class",
+            "group",
+            "--min-coverage",
+            "not-a-number",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an invalid --min-coverage must be a clap usage error (exit 2), not the \
+         coverage-gate code; got {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn coverage_rejects_out_of_range_min_coverage() {
+    // `NaN`, `inf`, a negative, and `>100` all PARSE as valid `f64`, so clap
+    // accepts them — but the runtime guard rejects them: the gate compares
+    // `overall_pct < threshold`, and a non-finite or out-of-range threshold would
+    // make that comparison meaningless (`x < NaN` is always false, silently
+    // passing a CI gate). Each must exit 1 (`ExitCode::FAILURE`) with the
+    // `census: --min-coverage` diagnostic, distinct from the gate code (4) and the
+    // clap usage code (2). The negative case uses `--min-coverage=-1` so clap reads
+    // `-1` as the value, not as a flag.
+    for value in ["NaN", "inf", "100.1"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_census"))
+            .args([
+                "catalog",
+                "coverage",
+                "--os-target",
+                "linux-debian-12",
+                "--class",
+                "group",
+                "--min-coverage",
+                value,
+            ])
+            .output()
+            .unwrap();
+        assert_out_of_range_rejected(value, &out);
+    }
+
+    // Negative value: glued `--flag=value` form so clap does not treat `-1` as a
+    // separate (unknown) flag.
+    let out = Command::new(env!("CARGO_BIN_EXE_census"))
+        .args([
+            "catalog",
+            "coverage",
+            "--os-target",
+            "linux-debian-12",
+            "--class",
+            "group",
+            "--min-coverage=-1",
+        ])
+        .output()
+        .unwrap();
+    assert_out_of_range_rejected("-1", &out);
+}
+
+/// Assert the binary rejected an out-of-range `--min-coverage` value via the
+/// runtime guard: exit code 1 and the `census: --min-coverage` diagnostic on
+/// stderr.
+fn assert_out_of_range_rejected(value: &str, out: &std::process::Output) {
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--min-coverage {value} must be rejected by the runtime guard (exit 1); \
+         got {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("census: --min-coverage"),
+        "--min-coverage {value} must report the runtime guard diagnostic; \
+         stderr: {stderr}"
     );
 }

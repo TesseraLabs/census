@@ -6,16 +6,17 @@
 //! repaired by `apply`.
 //!
 //! Severity:
-//! - [`Severity::Error`] — a security invariant is broken (§8 unreachability,
-//!   §4 registry integrity). `census doctor` exits non-zero.
-//! - [`Severity::Warn`] — advisory (potential lockout §7, drift). Printed but
-//!   does not fail the exit code.
+//! - [`Severity::Error`] — a security invariant is broken (§8 unreachability, §4 registry
+//!   integrity). `census doctor` exits non-zero.
+//! - [`Severity::Warn`] — advisory (potential lockout §7, drift). Printed but does not fail the
+//!   exit code.
+
+use std::collections::BTreeSet;
 
 use crate::inspect::SystemInspector;
 use crate::model::ResolvedAccount;
 use crate::plan;
 use crate::state::SystemState;
-use std::collections::BTreeSet;
 
 /// Severity of a doctor finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,11 @@ const CHECK_REGISTRY: &str = "registry-integrity";
 const CHECK_GROUP_REGISTRY: &str = "group-registry-integrity";
 const CHECK_UNREACHABLE: &str = "unreachability";
 const CHECK_ANTILOCKOUT: &str = "anti-lockout";
+/// Emitted when the shadow database cannot be read at all (a non-root run): we
+/// cannot evaluate password-lock state, so the §8 unreachability and §7
+/// anti-lockout checks degrade to this single advisory rather than firing a false
+/// "password unlocked" Error or a false "no rescue" Warn for every account.
+const CHECK_SHADOW_UNREADABLE: &str = "shadow-unreadable";
 const CHECK_DRIFT: &str = "drift";
 const CHECK_FILE_ACCESS_DRIFT: &str = "file-access-drift";
 const CHECK_ADOPTED_GROUP_DRIFT: &str = "adopted-group-drift";
@@ -85,9 +91,24 @@ pub fn run_doctor(
     let registry = managed.managed_accounts();
     let managed_names: BTreeSet<String> = registry.keys().cloned().collect();
 
+    // Fetch each registry account's live facts ONCE and share them across the §4
+    // and §8 loops. This avoids a second `getent passwd` per account and removes a
+    // TOCTOU window where the account could change between the two checks.
+    let account_facts: std::collections::BTreeMap<&String, Option<crate::inspect::AccountFacts>> =
+        registry
+            .keys()
+            .map(|name| (name, inspector.account(name)))
+            .collect();
+
+    // Read the WHOLE shadow database once. `None` means it could not be read at
+    // all (non-root) — a degraded read the §8 / §7 checks handle distinctly,
+    // rather than spawning `getent shadow` per account and mistaking the failure
+    // for "every account is unlocked / no rescue".
+    let shadow_locks = inspector.shadow_locks();
+
     // --- §4 registry integrity (Error) ---
     for (name, record) in &registry {
-        match inspector.account(name) {
+        match account_facts.get(name).and_then(Option::as_ref) {
             None => findings.push(Finding {
                 severity: Severity::Error,
                 check: CHECK_REGISTRY,
@@ -105,11 +126,18 @@ pub fn run_doctor(
                         facts.shell, record.shell
                     ));
                 }
-                let mut live_groups = facts.groups.clone();
-                let mut reg_groups = record.groups.clone();
-                live_groups.sort();
-                reg_groups.sort();
-                if live_groups != reg_groups {
+                // Set-equal (order-insensitive). Compare sorted borrowed `&str`:
+                // no group String is cloned, only two pointer vectors are sorted.
+                let groups_differ = facts.groups.len() != record.groups.len() || {
+                    let mut live_groups: Vec<&str> =
+                        facts.groups.iter().map(String::as_str).collect();
+                    let mut reg_groups: Vec<&str> =
+                        record.groups.iter().map(String::as_str).collect();
+                    live_groups.sort_unstable();
+                    reg_groups.sort_unstable();
+                    live_groups != reg_groups
+                };
+                if groups_differ {
                     diffs.push(format!(
                         "groups {:?} != registry {:?}",
                         facts.groups, record.groups
@@ -120,7 +148,10 @@ pub fn run_doctor(
                         severity: Severity::Error,
                         check: CHECK_REGISTRY,
                         target: name.clone(),
-                        message: format!("live account differs from registry: {}", diffs.join("; ")),
+                        message: format!(
+                            "live account differs from registry: {}",
+                            diffs.join("; ")
+                        ),
                     });
                 }
             }
@@ -160,17 +191,23 @@ pub fn run_doctor(
                 // invariant. An Adopted group's GID was observed, not assigned, so
                 // its drift is advisory and handled below against the baseline as a
                 // Warn — never double-reported here.
-                if facts.gid != record.gid && record.provenance == crate::model::Provenance::Created
-                {
-                    findings.push(Finding {
-                        severity: Severity::Error,
-                        check: CHECK_GROUP_REGISTRY,
-                        target: name.clone(),
-                        message: format!(
-                            "live gid {} != registry gid {} (managed group renumbered out of band)",
-                            facts.gid, record.gid
-                        ),
-                    });
+                // Compare only when the registry recorded a concrete GID. A `None`
+                // (GID unknown at apply time) is not drift — there is nothing to
+                // diverge from — so it is skipped rather than flagged.
+                if let Some(recorded_gid) = record.gid {
+                    if facts.gid != recorded_gid
+                        && record.provenance == crate::model::Provenance::Created
+                    {
+                        findings.push(Finding {
+                            severity: Severity::Error,
+                            check: CHECK_GROUP_REGISTRY,
+                            target: name.clone(),
+                            message: format!(
+                                "live gid {} != registry gid {recorded_gid} (managed group renumbered out of band)",
+                                facts.gid
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -191,16 +228,18 @@ pub fn run_doctor(
             continue;
         };
 
-        // GID drift vs the adopt-time baseline.
-        if let Some(facts) = inspector.group(name) {
-            if facts.gid != baseline.gid {
+        // GID drift vs the adopt-time baseline. Skip when the baseline GID is
+        // unknown (`None`) — Census never recorded a GID to drift against, so
+        // there is nothing to compare and a `None` must not be read as `0`.
+        if let (Some(facts), Some(baseline_gid)) = (inspector.group(name), baseline.gid) {
+            if facts.gid != baseline_gid {
                 findings.push(Finding {
                     severity: Severity::Warn,
                     check: CHECK_ADOPTED_GROUP_DRIFT,
                     target: name.clone(),
                     message: format!(
-                        "live gid {} != adopt baseline gid {} (adopted group renumbered out of band)",
-                        facts.gid, baseline.gid
+                        "live gid {} != adopt baseline gid {baseline_gid} (adopted group renumbered out of band)",
+                        facts.gid
                     ),
                 });
             }
@@ -269,36 +308,62 @@ pub fn run_doctor(
         }
     }
 
+    // The whole shadow database was unreadable (non-root). Emit ONE advisory and
+    // skip every per-account password verdict below: a degraded read is "cannot
+    // evaluate", not a fleet of false "shadow entry absent" Errors. The §7
+    // anti-lockout check is likewise degraded (see below).
+    let shadow_degraded = shadow_locks.is_none();
+    if shadow_degraded && !registry.is_empty() {
+        findings.push(Finding {
+            severity: Severity::Warn,
+            check: CHECK_SHADOW_UNREADABLE,
+            target: "<system>".to_owned(),
+            message: "shadow database is unreadable (run as root to evaluate password-lock \
+                      state); cannot confirm §8 unreachability for managed accounts"
+                .to_owned(),
+        });
+    }
+
     // --- §8 unreachability (Error) ---
     for (name, record) in &registry {
-        match inspector.account(name) {
+        match account_facts.get(name).and_then(Option::as_ref) {
             None => findings.push(Finding {
                 severity: Severity::Error,
                 check: CHECK_UNREACHABLE,
                 target: name.clone(),
-                message: "managed role account is missing (cannot verify unreachability)".to_owned(),
+                message: "managed role account is missing (cannot verify unreachability)"
+                    .to_owned(),
             }),
             Some(facts) => {
                 let _ = record; // registry record not needed here; live facts authoritative
-                match inspector.password_locked(name) {
-                    Some(true) => {}
-                    Some(false) => findings.push(Finding {
-                        severity: Severity::Error,
-                        check: CHECK_UNREACHABLE,
-                        target: name.clone(),
-                        message: "password is NOT locked (role account must be unreachable, §8)"
-                            .to_owned(),
-                    }),
-                    None => findings.push(Finding {
-                        severity: Severity::Error,
-                        check: CHECK_UNREACHABLE,
-                        target: name.clone(),
-                        message: "shadow entry is absent/unreadable; cannot confirm password lock"
-                            .to_owned(),
-                    }),
+                                // Use the batched shadow read. When shadow is readable, an account
+                                // present-and-unlocked is a §8 Error and an account ABSENT from the
+                                // map genuinely has no shadow row (still an Error — we read shadow
+                                // and the row is missing). When shadow is degraded we emitted the
+                                // single advisory above and make no per-account password claim.
+                if let Some(locks) = &shadow_locks {
+                    match locks.get(name).copied() {
+                        Some(true) => {}
+                        Some(false) => findings.push(Finding {
+                            severity: Severity::Error,
+                            check: CHECK_UNREACHABLE,
+                            target: name.clone(),
+                            message:
+                                "password is NOT locked (role account must be unreachable, §8)"
+                                    .to_owned(),
+                        }),
+                        None => findings.push(Finding {
+                            severity: Severity::Error,
+                            check: CHECK_UNREACHABLE,
+                            target: name.clone(),
+                            message: "shadow entry is absent; cannot confirm password lock"
+                                .to_owned(),
+                        }),
+                    }
                 }
                 // authorized_keys would be an alternative login path (§8). Use the
                 // live home (passwd field 6); the registry does not record home.
+                // Independent of shadow readability.
                 if inspector.has_authorized_keys(name, &facts.home) {
                     findings.push(Finding {
                         severity: Severity::Error,
@@ -313,7 +378,26 @@ pub fn run_doctor(
     }
 
     // --- §7 anti-lockout (Warn) ---
-    if inspector.login_capable_non_managed(&managed_names).is_empty() {
+    if shadow_degraded {
+        // We cannot evaluate which non-managed accounts can authenticate (their
+        // password state is unknown), so a "no rescue" Warn would be a false
+        // positive on every non-root run. Emit the distinct cannot-evaluate
+        // advisory instead — but only when we did not already emit it above for an
+        // empty registry's sake.
+        if registry.is_empty() {
+            findings.push(Finding {
+                severity: Severity::Warn,
+                check: CHECK_SHADOW_UNREADABLE,
+                target: "<system>".to_owned(),
+                message: "shadow database is unreadable (run as root to evaluate password-lock \
+                          state); cannot evaluate the §7 anti-lockout rescue set"
+                    .to_owned(),
+            });
+        }
+    } else if inspector
+        .login_capable_non_managed(&managed_names)
+        .is_empty()
+    {
         findings.push(Finding {
             severity: Severity::Warn,
             check: CHECK_ANTILOCKOUT,
@@ -381,11 +465,12 @@ pub fn framework_load_warning(message: &str) -> Finding {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::inspect::{AccountFacts, FakeInspector};
     use crate::rolestore::Limits;
     use crate::state::{FakeState, ManagedAccount};
-    use std::path::PathBuf;
 
     fn managed_acct(name: &str, uid: u32, shell: &str, groups: &[&str]) -> ManagedAccount {
         ManagedAccount {
@@ -421,7 +506,8 @@ mod tests {
     /// rescue account so anti-lockout does not fire.
     fn healthy_inspector() -> FakeInspector {
         let mut f = FakeInspector::default();
-        f.accounts.insert("oper".into(), facts(9010, "/bin/bash", &["wheel"]));
+        f.accounts
+            .insert("oper".into(), facts(9010, "/bin/bash", &["wheel"]));
         f.locked.insert("oper".into(), true);
         f.login_capable.insert("rescue".into());
         f
@@ -447,7 +533,11 @@ mod tests {
     fn clean_system_has_no_findings() {
         let st = state_of(vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])]);
         let report = run_doctor(&st, &healthy_inspector(), None);
-        assert!(report.findings.is_empty(), "clean system: {:?}", report.findings);
+        assert!(
+            report.findings.is_empty(),
+            "clean system: {:?}",
+            report.findings
+        );
         assert!(!report.has_errors());
     }
 
@@ -495,7 +585,8 @@ mod tests {
     fn uid_mismatch_is_error() {
         let st = state_of(vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])]);
         let mut insp = healthy_inspector();
-        insp.accounts.insert("oper".into(), facts(9999, "/bin/bash", &["wheel"]));
+        insp.accounts
+            .insert("oper".into(), facts(9999, "/bin/bash", &["wheel"]));
         let report = run_doctor(&st, &insp, None);
         assert!(report.has_errors());
         assert!(report
@@ -508,7 +599,8 @@ mod tests {
     fn shell_and_group_drift_is_error() {
         let st = state_of(vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])]);
         let mut insp = healthy_inspector();
-        insp.accounts.insert("oper".into(), facts(9010, "/bin/zsh", &["wheel", "docker"]));
+        insp.accounts
+            .insert("oper".into(), facts(9010, "/bin/zsh", &["wheel", "docker"]));
         let report = run_doctor(&st, &insp, None);
         let f = report
             .findings
@@ -521,9 +613,17 @@ mod tests {
 
     #[test]
     fn group_order_does_not_trigger_registry_drift() {
-        let st = state_of(vec![managed_acct("oper", 9010, "/bin/bash", &["wheel", "docker"])]);
+        let st = state_of(vec![managed_acct(
+            "oper",
+            9010,
+            "/bin/bash",
+            &["wheel", "docker"],
+        )]);
         let mut insp = healthy_inspector();
-        insp.accounts.insert("oper".into(), facts(9010, "/bin/bash", &["docker", "wheel"]));
+        insp.accounts.insert(
+            "oper".into(),
+            facts(9010, "/bin/bash", &["docker", "wheel"]),
+        );
         let report = run_doctor(&st, &insp, None);
         assert!(
             !report.findings.iter().any(|f| f.check == CHECK_REGISTRY),
@@ -547,7 +647,7 @@ mod tests {
     fn mgroup(name: &str, gid: u32) -> ManagedGroup {
         ManagedGroup {
             name: name.to_owned(),
-            gid,
+            gid: Some(gid),
             provenance: crate::model::Provenance::Created,
             members_added: Vec::new(),
             sudo_commands: Vec::new(),
@@ -564,10 +664,14 @@ mod tests {
             vec![mgroup("atm-operators", 8010)],
         );
         let mut insp = healthy_inspector();
-        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        insp.groups
+            .insert("atm-operators".into(), GroupFacts { gid: 8010 });
         let report = run_doctor(&st, &insp, None);
         assert!(
-            !report.findings.iter().any(|f| f.check == CHECK_GROUP_REGISTRY),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_GROUP_REGISTRY),
             "matching managed group must be clean: {:?}",
             report.findings
         );
@@ -598,7 +702,8 @@ mod tests {
             vec![mgroup("atm-operators", 8010)],
         );
         let mut insp = healthy_inspector();
-        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8099 });
+        insp.groups
+            .insert("atm-operators".into(), GroupFacts { gid: 8099 });
         let report = run_doctor(&st, &insp, None);
         assert!(report.has_errors());
         let f = report
@@ -622,13 +727,13 @@ mod tests {
     ) -> ManagedGroup {
         ManagedGroup {
             name: name.to_owned(),
-            gid,
+            gid: Some(gid),
             provenance: crate::model::Provenance::Adopted,
             members_added: members_added.iter().map(|m| m.to_string()).collect(),
             sudo_commands: sudo_commands.iter().map(|c| c.to_string()).collect(),
             file_grants: Vec::new(),
             adopt_baseline: Some(crate::state::GroupBaseline {
-                gid,
+                gid: Some(gid),
                 members: baseline_members.iter().map(|m| m.to_string()).collect(),
             }),
             from_version: 1,
@@ -639,7 +744,13 @@ mod tests {
     fn adopted_group_in_sync_has_no_drift_finding() {
         let st = state_with_group(
             vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
-            vec![adopted_mgroup("wheel", 10, &["root"], &["oper"], &["/usr/sbin/ip"])],
+            vec![adopted_mgroup(
+                "wheel",
+                10,
+                &["root"],
+                &["oper"],
+                &["/usr/sbin/ip"],
+            )],
         );
         let mut insp = healthy_inspector();
         insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
@@ -648,7 +759,10 @@ mod tests {
         insp.group_sudoers_fragments.insert("wheel".into(), true);
         let report = run_doctor(&st, &insp, None);
         assert!(
-            !report.findings.iter().any(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT),
             "in-sync adopted group must have no drift finding: {:?}",
             report.findings
         );
@@ -672,7 +786,8 @@ mod tests {
         let mut insp = healthy_inspector();
         // Live gid diverged from the adopt baseline (10 → 12).
         insp.groups.insert("wheel".into(), GroupFacts { gid: 12 });
-        insp.group_members.insert("wheel".into(), vec!["root".into()]);
+        insp.group_members
+            .insert("wheel".into(), vec!["root".into()]);
         let report = run_doctor(&st, &insp, None);
         let f = report
             .findings
@@ -683,9 +798,12 @@ mod tests {
         assert!(f.message.contains("gid"));
         // It must NOT also be reported as a Created-group integrity Error.
         assert!(
-            !report.findings.iter().any(|f| f.check == CHECK_GROUP_REGISTRY
-                && f.target == "wheel"
-                && f.severity == Severity::Error),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_GROUP_REGISTRY
+                    && f.target == "wheel"
+                    && f.severity == Severity::Error),
             "adopted gid drift must not double-report as a Created Error: {:?}",
             report.findings
         );
@@ -696,11 +814,18 @@ mod tests {
         let st = state_with_group(
             vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
             // Registry records group sudo commands, so a missing fragment is drift.
-            vec![adopted_mgroup("wheel", 10, &["root"], &[], &["/usr/sbin/ip"])],
+            vec![adopted_mgroup(
+                "wheel",
+                10,
+                &["root"],
+                &[],
+                &["/usr/sbin/ip"],
+            )],
         );
         let mut insp = healthy_inspector();
         insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
-        insp.group_members.insert("wheel".into(), vec!["root".into()]);
+        insp.group_members
+            .insert("wheel".into(), vec!["root".into()]);
         insp.group_sudoers_fragments.insert("wheel".into(), false); // removed out of band
         let report = run_doctor(&st, &insp, None);
         let f = report
@@ -722,7 +847,8 @@ mod tests {
         let mut insp = healthy_inspector();
         insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
         // Live group lists only the foreign member — our `oper` was dropped.
-        insp.group_members.insert("wheel".into(), vec!["root".into()]);
+        insp.group_members
+            .insert("wheel".into(), vec!["root".into()]);
         let report = run_doctor(&st, &insp, None);
         let f = report
             .findings
@@ -743,11 +869,16 @@ mod tests {
             vec![mgroup("atm-operators", 8010)],
         );
         let mut insp = healthy_inspector();
-        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
-        insp.group_sudoers_fragments.insert("atm-operators".into(), false);
+        insp.groups
+            .insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        insp.group_sudoers_fragments
+            .insert("atm-operators".into(), false);
         let report = run_doctor(&st, &insp, None);
         assert!(
-            !report.findings.iter().any(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_ADOPTED_GROUP_DRIFT),
             "created group must not produce adopted-drift findings: {:?}",
             report.findings
         );
@@ -823,6 +954,78 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_shadow_degrades_to_distinct_finding_not_false_warns() {
+        // Model a non-root run: shadow is unreadable. The managed account `oper`
+        // has a login shell and no authorized_keys. Doctor must NOT fire a false
+        // §7 "no rescue" Warn nor a §8 "shadow absent" Error per account; instead
+        // it emits the single distinct cannot-evaluate advisory.
+        let st = state_of(vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])]);
+        let mut insp = FakeInspector::default();
+        insp.accounts
+            .insert("oper".into(), facts(9010, "/bin/bash", &["wheel"]));
+        insp.shadow_unreadable = true; // getent shadow fails (non-root)
+                                       // A login-capable account exists but its lock state is unknowable.
+        insp.login_capable.insert("rescue".into());
+
+        let report = run_doctor(&st, &insp, None);
+
+        // The distinct degraded finding is present, as a Warn (never an Error).
+        let degraded = report
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_SHADOW_UNREADABLE)
+            .expect("degraded shadow-read advisory");
+        assert_eq!(degraded.severity, Severity::Warn);
+
+        // No false per-account §8 password Error (we could not evaluate it).
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_UNREACHABLE && f.message.contains("password")),
+            "degraded read must not produce a false password Error: {:?}",
+            report.findings
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_UNREACHABLE && f.message.contains("shadow")),
+            "degraded read must not produce a per-account shadow-absent Error: {:?}",
+            report.findings
+        );
+
+        // And the degraded read must NOT be a hard Error (doctor still exits 0 for
+        // this advisory alone — a non-root informational run).
+        assert!(
+            !report.has_errors(),
+            "degraded shadow read alone must not fail the exit code: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn unreadable_shadow_still_flags_authorized_keys() {
+        // authorized_keys detection does not depend on shadow, so a §8 keys Error
+        // must still fire even when shadow is unreadable.
+        let st = state_of(vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])]);
+        let mut insp = FakeInspector::default();
+        insp.accounts
+            .insert("oper".into(), facts(9010, "/bin/bash", &["wheel"]));
+        insp.shadow_unreadable = true;
+        insp.authorized_keys.insert("oper".into());
+        let report = run_doctor(&st, &insp, None);
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.check == CHECK_UNREACHABLE && f.message.contains("authorized_keys")));
+        assert!(
+            report.has_errors(),
+            "authorized_keys is a §8 Error regardless of shadow"
+        );
+    }
+
+    #[test]
     fn rescue_present_no_antilockout_warning() {
         let st = state_of(vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])]);
         let report = run_doctor(&st, &healthy_inspector(), None);
@@ -875,10 +1078,14 @@ mod tests {
         let st = state_of(vec![managed_acct_with_grant("oper", "/etc/ssh")]);
         let mut insp = healthy_inspector();
         // ACL entry present on the path for the account.
-        insp.file_acls.insert(("/etc/ssh".into(), "oper".into()), true);
+        insp.file_acls
+            .insert(("/etc/ssh".into(), "oper".into()), true);
         let report = run_doctor(&st, &insp, None);
         assert!(
-            !report.findings.iter().any(|f| f.check == CHECK_FILE_ACCESS_DRIFT),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_FILE_ACCESS_DRIFT),
             "present ACL must not drift: {:?}",
             report.findings
         );
@@ -889,7 +1096,8 @@ mod tests {
         let st = state_of(vec![managed_acct_with_grant("oper", "/etc/ssh")]);
         let mut insp = healthy_inspector();
         // Path readable but the account's ACL entry is gone → drift.
-        insp.file_acls.insert(("/etc/ssh".into(), "oper".into()), false);
+        insp.file_acls
+            .insert(("/etc/ssh".into(), "oper".into()), false);
         let report = run_doctor(&st, &insp, None);
         let f = report
             .findings
@@ -898,7 +1106,10 @@ mod tests {
             .expect("file-access drift warning");
         assert_eq!(f.severity, Severity::Warn);
         assert!(f.message.contains("/etc/ssh"));
-        assert!(!report.has_errors(), "file-access drift is a warning, never an error");
+        assert!(
+            !report.has_errors(),
+            "file-access drift is a warning, never an error"
+        );
     }
 
     #[test]
@@ -908,7 +1119,10 @@ mod tests {
         let st = state_of(vec![managed_acct_with_grant("oper", "/etc/ssh")]);
         let report = run_doctor(&st, &healthy_inspector(), None);
         assert!(
-            !report.findings.iter().any(|f| f.check == CHECK_FILE_ACCESS_DRIFT),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_FILE_ACCESS_DRIFT),
             "indeterminate ACL must not be a finding: {:?}",
             report.findings
         );
@@ -976,7 +1190,10 @@ mod tests {
         }];
         let mut report = DoctorReport::default();
         report.findings.extend(framework_findings(&lints));
-        assert!(!report.has_errors(), "framework findings are Warn, never errors");
+        assert!(
+            !report.has_errors(),
+            "framework findings are Warn, never errors"
+        );
     }
 
     #[test]

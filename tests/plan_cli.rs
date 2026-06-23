@@ -1,5 +1,17 @@
 //! End-to-end test of `census plan` against on-disk fixtures.
 
+// Integration tests are a separate crate, so the crate-root test exemption in
+// lib.rs does not reach them. In a test a panic on a broken fixture is the
+// intended failure mode, so the production-hazard restriction lints are allowed
+// here, mirroring lib.rs's `cfg_attr(test, ...)`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a panic on a broken fixture is the intended failure mode in tests"
+)]
+
 use std::io::Write;
 use std::process::Command;
 
@@ -39,7 +51,11 @@ fn plan_reports_create_for_new_role() {
         .output()
         .unwrap();
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("CREATE oper"), "got: {stdout}");
 }

@@ -1,0 +1,76 @@
+# cargo-deny configuration for census.
+#
+# Supply-chain policy: advisories (RUSTSEC), license allow-list, dependency
+# bans, and source restriction. This file is ENFORCED IN CI (`cargo deny check`)
+# — see .github/workflows/ci.yml. After the dedicated lint-cleanup pass the CI
+# job becomes a hard gate; until then it runs informationally.
+#
+# Run locally with: cargo deny check
+# (The cargo-deny binary is not part of the build; install via
+#  `cargo install cargo-deny` or the prebuilt release.)
+
+[graph]
+# Evaluate the dependency graph for all targets so a platform-specific advisory
+# or license is not silently skipped.
+all-features = true
+
+[advisories]
+# RUSTSEC vulnerability advisories are a hard failure by default in cargo-deny v2
+# (the `vulnerability` lint is `deny` and not configurable down), which is the
+# intended posture: a known-vulnerable dependency must block CI. Yanked crates
+# are denied. `unmaintained` advisories are scoped to first-party + direct deps
+# so a deeply transitive unmaintained crate stays visible without blocking.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+
+[advisories.ignore]
+# No advisories ignored. Add a RUSTSEC id with a justification comment here only
+# after triage; never blanket-ignore.
+
+[licenses]
+# Permissive licenses actually present in the census dependency tree, plus the
+# common permissive set so a routine dependency bump does not trip the gate.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+]
+# Census itself is AGPL-3.0-only (the first-party crate). cargo-deny evaluates
+# the crate's own license against this allow-list, so include it explicitly; the
+# AGPL obligation applies to census's own source, not to its permissive deps.
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# census's own source is AGPL-3.0-only by design; allow it for the workspace
+# member only, keeping the permissive allow-list above tight for dependencies.
+name = "census"
+allow = ["AGPL-3.0-only"]
+
+[bans]
+# A duplicated crate (two major versions in the tree) is a warning, not a hard
+# error — it is usually transitive and not always resolvable. Wildcard version
+# requirements (`*`) in a manifest are denied: they pin nothing and are a
+# supply-chain hazard.
+multiple-versions = "warn"
+wildcard = "deny"
+# `getrandom` legitimately appears at two majors (0.2 via rand, 0.4 transitively);
+# skip the duplicate-version warning for it specifically rather than globally.
+skip = []
+
+[sources]
+# Only crates.io is an allowed registry; an unknown registry or a git source not
+# listed here is denied. No git or alternative-registry dependencies are used.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

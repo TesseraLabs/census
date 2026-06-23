@@ -1,6 +1,18 @@
 //! End-to-end tests of `census compile` and `census show` against on-disk
 //! fixtures (real `--catalog-dir`, role-store, and l10n tree).
 
+// Integration tests are a separate crate, so the crate-root test exemption in
+// lib.rs does not reach them. In a test a panic on a broken fixture is the
+// intended failure mode, so the production-hazard restriction lints are allowed
+// here, mirroring lib.rs's `cfg_attr(test, ...)`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a panic on a broken fixture is the intended failure mode in tests"
+)]
+
 use std::io::Write;
 use std::process::Command;
 
@@ -58,12 +70,19 @@ fn compile_prints_primitives_with_provenance() {
         .output()
         .unwrap();
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("netdev"), "expected group: {stdout}");
     assert!(stdout.contains("/usr/sbin/ip"), "expected sudo: {stdout}");
     // Provenance: the source permission and layer are shown.
-    assert!(stdout.contains("perm net-admin"), "expected provenance: {stdout}");
+    assert!(
+        stdout.contains("perm net-admin"),
+        "expected provenance: {stdout}"
+    );
 }
 
 #[test]
@@ -84,7 +103,11 @@ fn compile_json_emits_machine_shape() {
         .output()
         .unwrap();
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("\"role\":\"oper\""), "{stdout}");
     assert!(stdout.contains("\"value\":\"netdev\""), "{stdout}");
@@ -108,7 +131,11 @@ fn compile_renders_file_grants_human_and_json() {
         .args(["--os-target", "linux-debian-12"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
         stdout.contains("/etc/ssh rw recursive via AclBackend (dir, rewrite-proof)"),
@@ -149,7 +176,10 @@ fn compile_lint_unknown_permission_exits_nonzero() {
         .output()
         .unwrap();
 
-    assert!(!out.status.success(), "lint over an unknown permission must fail");
+    assert!(
+        !out.status.success(),
+        "lint over an unknown permission must fail"
+    );
 }
 
 #[test]
@@ -175,10 +205,20 @@ fn show_renders_localized_tree() {
         .output()
         .unwrap();
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("Управление сетью"), "expected localized title: {stdout}");
-    assert!(stdout.contains("escalation-capable"), "expected risk class: {stdout}");
+    assert!(
+        stdout.contains("Управление сетью"),
+        "expected localized title: {stdout}"
+    );
+    assert!(
+        stdout.contains("escalation-capable"),
+        "expected risk class: {stdout}"
+    );
 }
 
 #[test]
@@ -200,8 +240,15 @@ fn show_falls_back_to_id_when_translation_missing() {
         .output()
         .unwrap();
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("net-admin"), "id fallback: {stdout}");
-    assert!(stdout.contains("untranslated"), "untranslated marker: {stdout}");
+    assert!(
+        stdout.contains("untranslated"),
+        "untranslated marker: {stdout}"
+    );
 }

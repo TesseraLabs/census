@@ -1,0 +1,81 @@
+# Census CI: formatting, lint, tests, and supply-chain checks.
+#
+# Gating status:
+#   - fmt   : HARD GATE (cargo fmt --check). The tree stays formatted.
+#   - clippy: HARD GATE on the DENY tier. Gating lives entirely in the Cargo.toml
+#             `[lints]` table: the rust lint set and the clippy correctness/
+#             suspicious/perf/complexity/style/cargo groups plus the high-signal
+#             restriction opt-ins are `deny`, so a regression in any of them fails
+#             the build. `pedantic`/`nursery` stay `warn` (advisory) — the clippy
+#             step deliberately does NOT pass `-D warnings`, so those print as
+#             warnings without breaking the build. Run for both feature sets.
+#   - test  : HARD GATE (default + `--features schema`).
+#   - deny  : INFORMATIONAL (cargo-deny advisory/license/source policy);
+#             cargo-deny is not installed locally, so it stays continue-on-error.
+#
+# `RUSTFLAGS: -D warnings` is intentionally NOT set globally: it would promote the
+# advisory pedantic/nursery clippy lints to hard errors and defeat the two-tier
+# policy. The `[lints]` table is the single source of truth for what gates.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Default build (schema feature OFF): the CLI-tree + version goldens and all
+      # unit/integration tests must pass without pulling in schemars.
+      - run: cargo test --locked
+      # Schema feature ON: additionally generate + enforce the JSON-schema goldens
+      # (the schema contract tests are gated behind `--features schema`).
+      - run: cargo test --features schema --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # HARD GATE on the DENY tier. No `-D warnings`: the Cargo.toml `[lints]`
+      # table already denies the gated lints, so a regression there fails the
+      # build while pedantic/nursery still print as advisory warnings. Run both
+      # feature sets so the schema-gated code is linted too.
+      - run: cargo clippy --all-targets --locked
+      - run: cargo clippy --all-targets --all-features --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Informational until the policy is confirmed against a clean tree. Flip to
+      # a hard gate by removing `continue-on-error` after the cleanup pass.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        continue-on-error: true
+        with:
+          command: check

@@ -2,12 +2,11 @@
 //!
 //! `census apply` must refuse a plan that would leave the device with zero
 //! working login paths. A "working path" after the plan is one of:
-//!   * a **rescue/break-glass** channel defined OUTSIDE Census (an emergency
-//!     account and/or sshd `UsePAM=no`). By design it is NOT in the managed
-//!     registry, so Census never touches it — its presence is asserted to the
-//!     gate, never inferred from managed state.
-//!   * at least one role account that survives the plan (created or kept, not
-//!     deleted) and is reachable via Tessera's cert path.
+//!   * a **rescue/break-glass** channel defined OUTSIDE Census (an emergency account and/or sshd
+//!     `UsePAM=no`). By design it is NOT in the managed registry, so Census never touches it — its
+//!     presence is asserted to the gate, never inferred from managed state.
+//!   * at least one role account that survives the plan (created or kept, not deleted) and is
+//!     reachable via Tessera's cert path.
 //!
 //! If no rescue is configured AND the plan leaves no surviving role account,
 //! apply must refuse — unless the operator passes the conscious-risk flag
@@ -29,8 +28,30 @@ pub struct LockoutContext {
     pub risk_acknowledged: bool,
 }
 
+/// Shells that disable interactive login. A managed account whose post-plan shell
+/// is one of these (or empty) is NOT a surviving login path: an operator who set
+/// the shell to a nologin/false stub cannot authenticate through it. The set
+/// mirrors the live inspector's login-shell heuristic so the gate and the doctor
+/// reachability check agree on what "login-capable" means.
+const NON_LOGIN_SHELLS: &[&str] = &[
+    "/usr/sbin/nologin",
+    "/sbin/nologin",
+    "/bin/false",
+    "/usr/bin/false",
+];
+
+/// Whether `shell` keeps an account login-capable. An empty shell or any shell in
+/// [`NON_LOGIN_SHELLS`] is not login-capable; anything else is. This is the same
+/// signal sysadmins use to disable login, evaluated on the shell the plan would
+/// leave in place (the resolved target for a Create/Update, the recorded shell for
+/// an untouched managed account).
+fn is_login_capable_shell(shell: &str) -> bool {
+    !shell.is_empty() && !NON_LOGIN_SHELLS.contains(&shell)
+}
+
 /// Why the gate refused.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LockoutError {
     /// The plan removes the last working login path and no rescue / risk-ack
     /// permits it.
@@ -42,23 +63,55 @@ pub enum LockoutError {
     WouldLockOut,
 }
 
-/// Count role accounts that remain reachable after the plan: any account that
-/// is Created or Updated (kept) and is NOT Deleted. Since a single account name
-/// cannot be both in this plan ordering, surviving == created or updated.
-fn surviving_login_accounts(plan: &Plan) -> usize {
-    plan.actions
+/// Count managed accounts that remain reachable AFTER the plan. A surviving
+/// login account is one that, once the plan runs, still has a login-capable shell
+/// (see [`is_login_capable_shell`]). Two sources contribute:
+///
+///   * a `Create`/`Update` action whose RESOLVED TARGET shell is login-capable — simply being
+///     touched is not enough, because an `Update` that sets the shell to `nologin` removes a login
+///     path rather than preserving one; and
+///   * an `untouched_login_shell` — a managed account the plan does not change at all (no
+///     Create/Update/Delete) and whose recorded shell is login-capable. These produce no `Action`,
+///     yet they are real surviving logins, so the caller passes their shells in. Counting them
+///     keeps the gate from refusing a plan that only deletes a redundant account while a working
+///     one remains.
+///
+/// A single account name cannot appear in more than one plan action, and an
+/// untouched account by definition has no action, so the two sources never double
+/// count the same name.
+fn surviving_login_accounts(plan: &Plan, untouched_login_shells: &[&str]) -> usize {
+    let from_plan = plan
+        .actions
         .iter()
-        .filter(|a| matches!(a, Action::Create(_) | Action::Update { .. }))
-        .count()
+        .filter(|a| match a {
+            Action::Create(acct) => is_login_capable_shell(&acct.shell),
+            Action::Update { account, .. } => is_login_capable_shell(&account.shell),
+            Action::Delete { .. } => false,
+        })
+        .count();
+    let from_untouched = untouched_login_shells
+        .iter()
+        .filter(|s| is_login_capable_shell(s))
+        .count();
+    from_plan + from_untouched
 }
 
-/// Gate the plan against lockout. Returns `Ok(())` if at least one working
-/// login path remains (rescue present, OR a surviving managed login account),
-/// OR the operator acknowledged the risk. Otherwise `Err(WouldLockOut)`.
+/// Gate the plan against lockout. Returns `Ok(())` if at least one working login
+/// path remains (rescue present, OR a surviving managed login account), OR the
+/// operator acknowledged the risk. Otherwise `Err(WouldLockOut)`.
 ///
-/// Note: this gate is conservative. An empty plan (no-op) is always allowed —
-/// it changes nothing and therefore cannot remove the last path.
-pub fn gate(plan: &Plan, ctx: LockoutContext) -> Result<(), LockoutError> {
+/// `untouched_login_shells` carries the recorded shells of managed accounts the
+/// plan leaves entirely unchanged — they survive as login paths even though they
+/// produce no `Action`. The caller (apply) derives them from the managed registry
+/// minus every name the plan touches.
+///
+/// Note: this gate is conservative. An empty plan (no-op) is always allowed — it
+/// changes nothing and therefore cannot remove the last path.
+pub fn gate(
+    plan: &Plan,
+    ctx: LockoutContext,
+    untouched_login_shells: &[&str],
+) -> Result<(), LockoutError> {
     if plan.is_empty() {
         return Ok(());
     }
@@ -71,7 +124,7 @@ pub fn gate(plan: &Plan, ctx: LockoutContext) -> Result<(), LockoutError> {
     if ctx.rescue_present {
         return Ok(());
     }
-    if surviving_login_accounts(plan) > 0 {
+    if surviving_login_accounts(plan, untouched_login_shells) > 0 {
         return Ok(());
     }
     if ctx.risk_acknowledged {
@@ -82,16 +135,17 @@ pub fn gate(plan: &Plan, ctx: LockoutContext) -> Result<(), LockoutError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::model::ResolvedAccount;
     use crate::rolestore::Limits;
-    use std::path::PathBuf;
 
-    fn acct(name: &str) -> ResolvedAccount {
+    fn acct_with_shell(name: &str, shell: &str) -> ResolvedAccount {
         ResolvedAccount {
             name: name.to_owned(),
             uid: 9010,
-            shell: "/bin/bash".to_owned(),
+            shell: shell.to_owned(),
             home: PathBuf::from("/var/lib/census/home/x"),
             groups: vec![],
             sudo_role: None,
@@ -103,17 +157,23 @@ mod tests {
         }
     }
 
+    fn acct(name: &str) -> ResolvedAccount {
+        acct_with_shell(name, "/bin/bash")
+    }
+
     fn delete_only_plan() -> Plan {
         Plan {
-            actions: vec![Action::Delete { name: "oper".into() }],
+            actions: vec![Action::Delete {
+                name: "oper".into(),
+            }],
             ..Default::default()
         }
     }
 
     #[test]
     fn plan_removing_last_path_is_refused() {
-        // Delete-only plan, no rescue, no risk-ack → refuse.
-        let err = gate(&delete_only_plan(), LockoutContext::default()).unwrap_err();
+        // Delete-only plan, no rescue, no risk-ack, no untouched login → refuse.
+        let err = gate(&delete_only_plan(), LockoutContext::default(), &[]).unwrap_err();
         assert!(matches!(err, LockoutError::WouldLockOut));
     }
 
@@ -121,8 +181,11 @@ mod tests {
     fn rescue_outside_managed_allows_plan() {
         // Rescue is asserted present (out of managed scope) → plan allowed,
         // and the rescue channel is not represented in the plan at all.
-        let ctx = LockoutContext { rescue_present: true, ..Default::default() };
-        assert!(gate(&delete_only_plan(), ctx).is_ok());
+        let ctx = LockoutContext {
+            rescue_present: true,
+            ..Default::default()
+        };
+        assert!(gate(&delete_only_plan(), ctx, &[]).is_ok());
     }
 
     #[test]
@@ -130,22 +193,27 @@ mod tests {
         let plan = Plan {
             actions: vec![
                 Action::Create(acct("admin")),
-                Action::Delete { name: "oper".into() },
+                Action::Delete {
+                    name: "oper".into(),
+                },
             ],
             ..Default::default()
         };
-        assert!(gate(&plan, LockoutContext::default()).is_ok());
+        assert!(gate(&plan, LockoutContext::default(), &[]).is_ok());
     }
 
     #[test]
     fn risk_acknowledged_allows_lockout_plan() {
-        let ctx = LockoutContext { risk_acknowledged: true, ..Default::default() };
-        assert!(gate(&delete_only_plan(), ctx).is_ok());
+        let ctx = LockoutContext {
+            risk_acknowledged: true,
+            ..Default::default()
+        };
+        assert!(gate(&delete_only_plan(), ctx, &[]).is_ok());
     }
 
     #[test]
     fn empty_plan_is_noop_and_allowed() {
-        assert!(gate(&Plan::default(), LockoutContext::default()).is_ok());
+        assert!(gate(&Plan::default(), LockoutContext::default(), &[]).is_ok());
     }
 
     #[test]
@@ -155,8 +223,81 @@ mod tests {
         // and no risk-ack.
         let plan = Plan {
             actions: vec![],
-            group_actions: vec![crate::plan::GroupAction::Delete { name: "orphan".into() }],
+            group_actions: vec![crate::plan::GroupAction::Delete {
+                name: "orphan".into(),
+            }],
         };
-        assert!(gate(&plan, LockoutContext::default()).is_ok());
+        assert!(gate(&plan, LockoutContext::default(), &[]).is_ok());
+    }
+
+    #[test]
+    fn update_to_nologin_with_deletes_is_refused() {
+        // [Update X->nologin, Delete Y, Delete Z]: the only touched account has
+        // its shell set to a login-disabling stub, the rest are deleted, no
+        // untouched login account and no rescue → the post-plan device has zero
+        // login paths, so the gate must REFUSE (the discriminant-only gate wrongly
+        // counted the Update as surviving).
+        let plan = Plan {
+            actions: vec![
+                Action::Update {
+                    account: acct_with_shell("x", "/usr/sbin/nologin"),
+                    changes: vec!["shell".to_owned()],
+                },
+                Action::Delete { name: "y".into() },
+                Action::Delete { name: "z".into() },
+            ],
+            ..Default::default()
+        };
+        let err = gate(&plan, LockoutContext::default(), &[]).unwrap_err();
+        assert!(matches!(err, LockoutError::WouldLockOut));
+    }
+
+    #[test]
+    fn update_keeping_login_shell_allows_plan() {
+        // The dual of the above: an Update that keeps a real login shell IS a
+        // surviving path, so the plan is allowed.
+        let plan = Plan {
+            actions: vec![Action::Update {
+                account: acct_with_shell("x", "/bin/bash"),
+                changes: vec!["groups".to_owned()],
+            }],
+            ..Default::default()
+        };
+        assert!(gate(&plan, LockoutContext::default(), &[]).is_ok());
+    }
+
+    #[test]
+    fn delete_with_untouched_login_account_is_allowed() {
+        // [Delete B] while an untouched in-sync managed account A still has a login
+        // shell → A is a surviving login path even though it produces no Action, so
+        // the gate must ALLOW the plan without rescue or risk-ack.
+        let plan = Plan {
+            actions: vec![Action::Delete { name: "b".into() }],
+            ..Default::default()
+        };
+        assert!(gate(&plan, LockoutContext::default(), &["/bin/bash"]).is_ok());
+    }
+
+    #[test]
+    fn delete_with_only_nologin_untouched_account_is_refused() {
+        // The untouched account survives but cannot log in (nologin shell), so it
+        // is NOT a surviving login path and the gate must still refuse.
+        let plan = Plan {
+            actions: vec![Action::Delete { name: "b".into() }],
+            ..Default::default()
+        };
+        let err = gate(&plan, LockoutContext::default(), &["/usr/sbin/nologin"]).unwrap_err();
+        assert!(matches!(err, LockoutError::WouldLockOut));
+    }
+
+    #[test]
+    fn login_capable_shell_predicate() {
+        assert!(is_login_capable_shell("/bin/bash"));
+        assert!(is_login_capable_shell("/bin/sh"));
+        assert!(!is_login_capable_shell("/usr/sbin/nologin"));
+        assert!(!is_login_capable_shell("/sbin/nologin"));
+        assert!(!is_login_capable_shell("/bin/false"));
+        assert!(!is_login_capable_shell("/usr/bin/false"));
+        assert!(!is_login_capable_shell(""));
     }
 }

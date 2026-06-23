@@ -29,13 +29,12 @@
 //! reason the catalog and l10n already adopt, *unknown* shapes are tolerated rather
 //! than rejected, because a framework set can legitimately lead or lag the catalog
 //! and the Census version reading it:
-//!   * an unknown `dimension` value → the framework is **skipped with a warning**
-//!     (a newer framework set may use a resolve dimension this Census predates);
-//!   * an unknown `provides` tag → the framework is **skipped with a warning**
-//!     (a newer set may advertise a capability this Census does not implement);
-//!   * an unknown *permission-id* in a mapping file → kept verbatim as a forward
-//!     reference (the catalog may add it later); it is just a map key, never an
-//!     error.
+//!   * an unknown `dimension` value → the framework is **skipped with a warning** (a newer
+//!     framework set may use a resolve dimension this Census predates);
+//!   * an unknown `provides` tag → the framework is **skipped with a warning** (a newer set may
+//!     advertise a capability this Census does not implement);
+//!   * an unknown *permission-id* in a mapping file → kept verbatim as a forward reference (the
+//!     catalog may add it later); it is just a map key, never an error.
 //!
 //! ## Why the *format* is still strict where it matters
 //!
@@ -48,10 +47,13 @@
 //! make the report depend on filesystem read order (non-deterministic). Hard errors
 //! are [`FrameworkError`]; tolerated skips are [`LoadedFrameworks::warnings`].
 
-use crate::catalog::OsTarget;
-use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::catalog::OsTarget;
 
 /// The resolve *dimension* of a framework: how its `mappings/` tree is laid out
 /// and walked.
@@ -61,7 +63,8 @@ use std::path::{Path, PathBuf};
 /// dimension must be tolerated (skip-with-warning), not error the whole manifest
 /// parse — serde would otherwise reject the entire file on an unrecognised enum
 /// value, which is exactly the forward-compat behaviour this layer must avoid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum Dimension {
     /// `mappings/*.toml` read directly — the control mapping does not vary by OS.
     Flat,
@@ -99,7 +102,8 @@ const KNOWN_PROVIDES: &[&str] = &["crossref", "controls"];
 /// ignore. The one deliberate exception is `dimension`, kept as a raw [`String`]
 /// (not a typed enum) so an unknown dimension *value* is tolerated post-parse —
 /// see [`Dimension`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct FrameworkManifest {
     /// Framework id (e.g. `pci-dss`). Used as the key in every index; a collision
@@ -135,8 +139,7 @@ pub fn parse_manifest(text: &str) -> Result<FrameworkManifest, toml::de::Error> 
 /// related? }`. Each of the three lists is the set of control ids the permission
 /// relates to under that polarity:
 ///   * `satisfies` — having this capability *addresses* the control;
-///   * `risk` — the capability *undermines* the control (e.g. log rotation vs.
-///     log-integrity);
+///   * `risk` — the capability *undermines* the control (e.g. log rotation vs. log-integrity);
 ///   * `related` — neutrally touches the control's area, without satisfying it.
 ///
 /// All three default to empty (a permission may carry any combination).
@@ -205,7 +208,10 @@ impl PolarControls {
 /// frameworks, several layers), each polarity's control list unions independently:
 /// a control already recorded under that polarity is not added again, and new
 /// controls append in the order first seen.
-fn merge_mappings(into: &mut BTreeMap<String, PolarControls>, file_map: BTreeMap<String, MappingEntry>) {
+fn merge_mappings(
+    into: &mut BTreeMap<String, PolarControls>,
+    file_map: BTreeMap<String, MappingEntry>,
+) {
     fn union_into(acc: &mut Vec<String>, incoming: Vec<String>) {
         for control in incoming {
             if !acc.iter().any(|c| c == &control) {
@@ -228,7 +234,8 @@ fn merge_mappings(into: &mut BTreeMap<String, PolarControls>, file_map: BTreeMap
 /// this control (vs. it being inherited from a provider) is a material compliance
 /// fact a reviewer must state explicitly, so an omitted `owned` is a parse error,
 /// not a silent `false`. `deny_unknown_fields` guards against field typos.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ControlDef {
     /// Human-readable control title.
@@ -255,6 +262,7 @@ pub fn parse_controls(text: &str) -> Result<BTreeMap<String, ControlDef>, toml::
 /// are recorded in [`LoadedFrameworks::warnings`]. Mirrors
 /// [`crate::catalog::CatalogError`] in shape and doc style.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FrameworkError {
     /// A framework file or directory could not be read.
     #[error("cannot read framework path {path}: {reason}")]
@@ -351,14 +359,17 @@ pub struct LoadedFrameworks {
 }
 
 impl LoadedFrameworks {
-    /// The merged [`PolarControls`] for permission `perm` in framework `fw`, or a
-    /// reference to an empty value if there is no such mapping.
-    pub fn controls_for(&self, perm: &str, fw: &str) -> PolarControls {
+    /// The merged [`PolarControls`] for permission `perm` in framework `fw`.
+    ///
+    /// Borrows the stored value on a hit (no allocation) and yields an owned
+    /// empty default on a miss, returned as a [`Cow`] so the common lookup-and-read
+    /// path stays allocation-free. Callers read fields/methods straight through
+    /// the `Cow`'s `Deref`.
+    pub fn controls_for(&self, perm: &str, fw: &str) -> Cow<'_, PolarControls> {
         self.forward
             .get(perm)
             .and_then(|by_fw| by_fw.get(fw))
-            .cloned()
-            .unwrap_or_default()
+            .map_or_else(|| Cow::Owned(PolarControls::default()), Cow::Borrowed)
     }
 
     /// Controls in framework `fw` that have at least one **satisfies** link — the
@@ -493,7 +504,11 @@ pub fn lint_loaded(
     }
 
     for id in loaded.frameworks.keys() {
-        let Some(defined) = loaded.controls.get(id).filter(|controls| !controls.is_empty()) else {
+        let Some(defined) = loaded
+            .controls
+            .get(id)
+            .filter(|controls| !controls.is_empty())
+        else {
             continue;
         };
         // Union of control ids referenced under ANY polarity for this framework.
@@ -647,7 +662,11 @@ fn parse_mapping_file(
 /// provenance `layer` (`None` for flat, `Some(layer)` for each os-layered layer
 /// bottom→top). Centralises the one place the two dimensions diverge so the rest
 /// of the loader is a single pass.
-fn mapping_dirs(fw_dir: &Path, dimension: Dimension, os: &OsTarget) -> Vec<(Option<String>, PathBuf)> {
+fn mapping_dirs(
+    fw_dir: &Path,
+    dimension: Dimension,
+    os: &OsTarget,
+) -> Vec<(Option<String>, PathBuf)> {
     let mappings_root = fw_dir.join("mappings");
     match dimension {
         // Flat: read mappings/*.toml directly; the OS target is ignored.
@@ -673,20 +692,22 @@ fn mapping_dirs(fw_dir: &Path, dimension: Dimension, os: &OsTarget) -> Vec<(Opti
 /// Each `<root>/<fw>/` subdir is one framework: its `framework.toml` manifest, a
 /// `mappings/` tree (flat or per-OS-layer per the manifest's `dimension`), and an
 /// optional `controls.toml`. The loader:
-///   * skips a framework whose dimension or `provides` tag is unknown, recording a
-///     warning (forward-compat — never an error);
+///   * skips a framework whose dimension or `provides` tag is unknown, recording a warning
+///     (forward-compat — never an error);
 ///   * rejects a duplicate `framework.id` across roots/subdirs as a hard
 ///     [`FrameworkError::IdCollision`] (determinism, not override);
-///   * emits one [`LoadedMapping`] per (framework, permission, source-file) so
-///     per-contribution provenance is exact, then builds the forward index by
-///     unioning+deduping the relevant contributions and inverts it for the reverse
-///     index.
+///   * emits one [`LoadedMapping`] per (framework, permission, source-file) so per-contribution
+///     provenance is exact, then builds the forward index by unioning+deduping the relevant
+///     contributions and inverts it for the reverse index.
 ///
 /// An absent root, or no frameworks at all, yields empty indices and no error.
 ///
 /// Read-only: this function imports nothing from compile/plan/apply/model — only
 /// [`OsTarget`] for the os-layered layer chain — and never mutates anything.
-pub fn load_frameworks(roots: &[PathBuf], os: &OsTarget) -> Result<LoadedFrameworks, FrameworkError> {
+pub fn load_frameworks(
+    roots: &[PathBuf],
+    os: &OsTarget,
+) -> Result<LoadedFrameworks, FrameworkError> {
     let mut out = LoadedFrameworks::default();
 
     for root in roots {
@@ -741,10 +762,11 @@ fn load_one_framework(
         // No manifest → not a framework; ignore (the dir may be unrelated).
         return Ok(());
     }
-    let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|e| FrameworkError::Io {
-        path: manifest_path.clone(),
-        reason: e.to_string(),
-    })?;
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).map_err(|e| FrameworkError::Io {
+            path: manifest_path.clone(),
+            reason: e.to_string(),
+        })?;
     let manifest = parse_manifest(&manifest_text).map_err(|e| FrameworkError::TomlParse {
         path: manifest_path.clone(),
         reason: e.to_string(),
@@ -834,10 +856,11 @@ fn load_one_framework(
     //     hard error (Census owns the format). ---
     let controls_path = fw_dir.join("controls.toml");
     if !controls_path.is_symlink() && controls_path.is_file() {
-        let controls_text = std::fs::read_to_string(&controls_path).map_err(|e| FrameworkError::Io {
-            path: controls_path.clone(),
-            reason: e.to_string(),
-        })?;
+        let controls_text =
+            std::fs::read_to_string(&controls_path).map_err(|e| FrameworkError::Io {
+                path: controls_path.clone(),
+                reason: e.to_string(),
+            })?;
         let defs = parse_controls(&controls_text).map_err(|e| FrameworkError::TomlParse {
             path: controls_path.clone(),
             reason: e.to_string(),
@@ -857,7 +880,8 @@ fn load_one_framework(
 fn invert_forward(
     forward: &BTreeMap<String, BTreeMap<String, PolarControls>>,
 ) -> BTreeMap<Polarity, BTreeMap<String, BTreeMap<String, Vec<String>>>> {
-    let mut reverse: BTreeMap<Polarity, BTreeMap<String, BTreeMap<String, Vec<String>>>> = BTreeMap::new();
+    let mut reverse: BTreeMap<Polarity, BTreeMap<String, BTreeMap<String, Vec<String>>>> =
+        BTreeMap::new();
     for (perm, by_fw) in forward {
         for (fw, polar) in by_fw {
             for (polarity, controls) in [
@@ -885,9 +909,9 @@ fn invert_forward(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
-    use std::path::Path;
+
+    use super::*;
 
     // --- helpers ---
 
@@ -1133,16 +1157,28 @@ owned = true
             loaded.forward["network-admin"]["pci-dss"].satisfies,
             vec!["1.1", "1.2", "2.1"]
         );
-        assert_eq!(loaded.forward["log-read"]["pci-dss"].satisfies, vec!["10.1"]);
+        assert_eq!(
+            loaded.forward["log-read"]["pci-dss"].satisfies,
+            vec!["10.1"]
+        );
         // Convenience accessor agrees.
         assert_eq!(
             loaded.controls_for("network-admin", "pci-dss").satisfies,
             vec!["1.1", "1.2", "2.1"]
         );
         // Reverse index: control → permissions.
-        assert_eq!(loaded.reverse[&Polarity::Satisfies]["pci-dss"]["1.1"], vec!["network-admin"]);
-        assert_eq!(loaded.reverse[&Polarity::Satisfies]["pci-dss"]["1.2"], vec!["network-admin"]);
-        assert_eq!(loaded.reverse[&Polarity::Satisfies]["pci-dss"]["10.1"], vec!["log-read"]);
+        assert_eq!(
+            loaded.reverse[&Polarity::Satisfies]["pci-dss"]["1.1"],
+            vec!["network-admin"]
+        );
+        assert_eq!(
+            loaded.reverse[&Polarity::Satisfies]["pci-dss"]["1.2"],
+            vec!["network-admin"]
+        );
+        assert_eq!(
+            loaded.reverse[&Polarity::Satisfies]["pci-dss"]["10.1"],
+            vec!["log-read"]
+        );
         // Controls loaded with owned flags.
         assert!(loaded.controls["pci-dss"]["1.1"].owned);
         assert!(!loaded.controls["pci-dss"]["2.1"].owned);
@@ -1180,7 +1216,10 @@ provides = ["crossref"]
         let loaded = load_frameworks(&[root.to_path_buf()], &os).unwrap();
 
         // Grants from BOTH layers merged (union across the layer chain).
-        assert_eq!(loaded.forward["network-admin"]["gost"].satisfies, vec!["A.1", "A.2"]);
+        assert_eq!(
+            loaded.forward["network-admin"]["gost"].satisfies,
+            vec!["A.1", "A.2"]
+        );
 
         // Provenance per contribution: one LoadedMapping for the base layer file
         // (layer None? no — os-layered carries the layer name) and one for the
@@ -1201,10 +1240,7 @@ provides = ["crossref"]
             .find(|m| m.provenance.layer.as_deref() == Some("linux-debian-12"))
             .expect("version-layer contribution present");
         assert_eq!(ver.satisfies, vec!["A.2"]);
-        assert!(ver
-            .provenance
-            .path
-            .ends_with("linux-debian-12/net.toml"));
+        assert!(ver.provenance.path.ends_with("linux-debian-12/net.toml"));
     }
 
     #[test]
@@ -1251,9 +1287,18 @@ provides = ["crossref"]
         assert_eq!(loaded.forward["sudo-config"]["fw"].satisfies, vec!["7.2.2"]);
         assert_eq!(loaded.forward["sudo-config"]["fw"].risk, vec!["X"]);
         assert_eq!(loaded.forward["sudo-config"]["fw"].related, vec!["Y"]);
-        assert_eq!(loaded.reverse[&Polarity::Satisfies]["fw"]["7.2.2"], vec!["sudo-config"]);
-        assert_eq!(loaded.reverse[&Polarity::Risk]["fw"]["X"], vec!["sudo-config"]);
-        assert_eq!(loaded.reverse[&Polarity::Related]["fw"]["Y"], vec!["sudo-config"]);
+        assert_eq!(
+            loaded.reverse[&Polarity::Satisfies]["fw"]["7.2.2"],
+            vec!["sudo-config"]
+        );
+        assert_eq!(
+            loaded.reverse[&Polarity::Risk]["fw"]["X"],
+            vec!["sudo-config"]
+        );
+        assert_eq!(
+            loaded.reverse[&Polarity::Related]["fw"]["Y"],
+            vec!["sudo-config"]
+        );
     }
 
     #[test]
@@ -1305,7 +1350,10 @@ provides = ["crossref"]
         assert!(loaded.warnings[0].contains("dimension"));
         // pci-dss still loaded.
         assert!(loaded.frameworks.contains_key("pci-dss"));
-        assert_eq!(loaded.forward["network-admin"]["pci-dss"].satisfies, vec!["1.1"]);
+        assert_eq!(
+            loaded.forward["network-admin"]["pci-dss"].satisfies,
+            vec!["1.1"]
+        );
     }
 
     #[test]
@@ -1364,7 +1412,11 @@ provides = ["crossref", "teleport"]
     fn malformed_manifest_is_hard_error() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write_file(root, "broken/framework.toml", "this is = not valid toml [[[\n");
+        write_file(
+            root,
+            "broken/framework.toml",
+            "this is = not valid toml [[[\n",
+        );
         let err = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap_err();
         assert!(matches!(err, FrameworkError::TomlParse { .. }));
     }
@@ -1399,7 +1451,10 @@ provides = ["crossref", "teleport"]
         let os = OsTarget::new("linux", "debian", Some("12".to_owned())).unwrap();
         let loaded = load_frameworks(&[root.to_path_buf()], &os).unwrap();
         // Only the base layer contributed; no error from the missing subdirs.
-        assert_eq!(loaded.forward["network-admin"]["gost"].satisfies, vec!["A.1"]);
+        assert_eq!(
+            loaded.forward["network-admin"]["gost"].satisfies,
+            vec!["A.1"]
+        );
         assert_eq!(loaded.mappings.len(), 1);
     }
 
@@ -1418,8 +1473,16 @@ dimension = "flat"
 provides = ["crossref", "controls"]
 "#,
         );
-        write_file(root, "pci-dss/mappings/a.toml", "[ghost-perm]\nsatisfies = [\"1.1\"]\n");
-        write_file(root, "pci-dss/controls.toml", "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n");
+        write_file(
+            root,
+            "pci-dss/mappings/a.toml",
+            "[ghost-perm]\nsatisfies = [\"1.1\"]\n",
+        );
+        write_file(
+            root,
+            "pci-dss/controls.toml",
+            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
+        );
 
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::new();
@@ -1453,7 +1516,11 @@ dimension = "flat"
 provides = ["controls"]
 "#,
         );
-        write_file(root, "fw-a/mappings/a.toml", "[perm-a]\nsatisfies = [\"1.1\"]\n");
+        write_file(
+            root,
+            "fw-a/mappings/a.toml",
+            "[perm-a]\nsatisfies = [\"1.1\"]\n",
+        );
         write_file(
             root,
             "fw-b/framework.toml",
@@ -1465,8 +1532,16 @@ dimension = "flat"
 provides = ["crossref"]
 "#,
         );
-        write_file(root, "fw-b/mappings/b.toml", "[perm-b]\nsatisfies = [\"1.1\"]\n");
-        write_file(root, "fw-b/controls.toml", "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n");
+        write_file(
+            root,
+            "fw-b/mappings/b.toml",
+            "[perm-b]\nsatisfies = [\"1.1\"]\n",
+        );
+        write_file(
+            root,
+            "fw-b/controls.toml",
+            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
+        );
         write_file(
             root,
             "fw-c/framework.toml",
@@ -1478,8 +1553,16 @@ dimension = "flat"
 provides = ["controls"]
 "#,
         );
-        write_file(root, "fw-c/mappings/c.toml", "[perm-c]\nsatisfies = [\"1.1\"]\n");
-        write_file(root, "fw-c/controls.toml", "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n");
+        write_file(
+            root,
+            "fw-c/mappings/c.toml",
+            "[perm-c]\nsatisfies = [\"1.1\"]\n",
+        );
+        write_file(
+            root,
+            "fw-c/controls.toml",
+            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
+        );
 
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::from([
@@ -1498,7 +1581,9 @@ provides = ["controls"]
                 .message
                 .contains("advertises provides=\"controls\" but ships no controls.toml")));
         assert!(desync.iter().any(|finding| finding.message.contains("fw-b")
-            && finding.message.contains("ships controls.toml but does not advertise")));
+            && finding
+                .message
+                .contains("ships controls.toml but does not advertise")));
         assert!(!desync
             .iter()
             .any(|finding| finding.message.contains("fw-c")));
@@ -1524,7 +1609,11 @@ provides = ["crossref", "controls"]
             "pci-dss/mappings/a.toml",
             "[network-admin]\nsatisfies = [\"9.9\", \"1.1\"]\n",
         );
-        write_file(root, "pci-dss/controls.toml", "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n");
+        write_file(
+            root,
+            "pci-dss/controls.toml",
+            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
+        );
 
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::from(["network-admin".to_owned()]);
@@ -1606,7 +1695,11 @@ provides = ["crossref", "controls"]
             "pci-dss/mappings/a.toml",
             "[network-admin]\nsatisfies = [\"1.1\"]\n",
         );
-        write_file(root, "pci-dss/controls.toml", "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n");
+        write_file(
+            root,
+            "pci-dss/controls.toml",
+            "[\"1.1\"]\ntitle = \"Control\"\nowned = true\n",
+        );
 
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::from(["network-admin".to_owned()]);
@@ -1628,7 +1721,11 @@ provides = ["crossref", "controls"]
             "pci-dss/mappings/a.toml",
             "[bad-perm]\nsatisfies = [\"C.1\"]\nrisk = [\"C.1\"]\n",
         );
-        write_file(root, "pci-dss/controls.toml", "[\"C.1\"]\ntitle = \"Control\"\nowned = true\n");
+        write_file(
+            root,
+            "pci-dss/controls.toml",
+            "[\"C.1\"]\ntitle = \"Control\"\nowned = true\n",
+        );
         let loaded = load_frameworks(&[root.to_path_buf()], &flat_os()).unwrap();
         let known_permission_ids = std::collections::BTreeSet::from(["bad-perm".to_owned()]);
         let findings = lint_loaded(&loaded, &known_permission_ids);
@@ -1661,7 +1758,15 @@ provides = ["crossref", "controls"]
             .iter()
             .filter(|f| f.code == "orphaned-mapping")
             .collect();
-        assert!(orphaned.iter().any(|f| f.message.contains("risk-only")), "{:?}", orphaned);
-        assert!(orphaned.iter().any(|f| f.message.contains("related-only")), "{:?}", orphaned);
+        assert!(
+            orphaned.iter().any(|f| f.message.contains("risk-only")),
+            "{:?}",
+            orphaned
+        );
+        assert!(
+            orphaned.iter().any(|f| f.message.contains("related-only")),
+            "{:?}",
+            orphaned
+        );
     }
 }

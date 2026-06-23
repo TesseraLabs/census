@@ -1,8 +1,8 @@
 {
   "control": {
-    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "A control definition from a framework's `controls.toml`, parsed strictly.\n\n`controls.toml` is a TOML table of `control-id → { title, owned, domain? }`. `owned` is **required** (no serde default): whether the *organisation* owns this control (vs. it being inherited from a provider) is a material compliance fact a reviewer must state explicitly, so an omitted `owned` is a parse error, not a silent `false`. `deny_unknown_fields` guards against field typos.",
+    "description": "A control definition from a framework's `controls.toml`, parsed strictly.\n\n`controls.toml` is a TOML table of `control-id → { title, owned, domain? }`.\n`owned` is **required** (no serde default): whether the *organisation* owns\nthis control (vs. it being inherited from a provider) is a material compliance\nfact a reviewer must state explicitly, so an omitted `owned` is a parse error,\nnot a silent `false`. `deny_unknown_fields` guards against field typos.",
     "properties": {
       "domain": {
         "default": null,
@@ -22,28 +22,28 @@
       }
     },
     "required": [
-      "owned",
-      "title"
+      "title",
+      "owned"
     ],
     "title": "ControlDef",
     "type": "object"
   },
   "manifest": {
-    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "A framework manifest (`<root>/<fw>/framework.toml`), parsed strictly.\n\nStrict (`deny_unknown_fields`) on the *known* fields: Census owns this format, so an unrecognised field is a typo or a stale file, not something to silently ignore. The one deliberate exception is `dimension`, kept as a raw [`String`] (not a typed enum) so an unknown dimension *value* is tolerated post-parse — see [`Dimension`].",
+    "description": "A framework manifest (`<root>/<fw>/framework.toml`), parsed strictly.\n\nStrict (`deny_unknown_fields`) on the *known* fields: Census owns this format,\nso an unrecognised field is a typo or a stale file, not something to silently\nignore. The one deliberate exception is `dimension`, kept as a raw [`String`]\n(not a typed enum) so an unknown dimension *value* is tolerated post-parse —\nsee [`Dimension`].",
     "properties": {
       "dimension": {
-        "description": "Resolve dimension as a raw string, validated post-parse by [`Dimension::parse`]. Raw (not a typed enum) so an unknown value can be tolerated with a warning instead of failing the manifest parse.",
+        "description": "Resolve dimension as a raw string, validated post-parse by\n[`Dimension::parse`]. Raw (not a typed enum) so an unknown value can be\ntolerated with a warning instead of failing the manifest parse.",
         "type": "string"
       },
       "id": {
-        "description": "Framework id (e.g. `pci-dss`). Used as the key in every index; a collision across roots is a hard [`FrameworkError::IdCollision`].",
+        "description": "Framework id (e.g. `pci-dss`). Used as the key in every index; a collision\nacross roots is a hard [`FrameworkError::IdCollision`].",
         "type": "string"
       },
       "provides": {
         "default": [],
-        "description": "Advertised capability tags (see [`KNOWN_PROVIDES`]). An unknown tag causes the framework to be skipped with a warning. Absent defaults to empty.",
+        "description": "Advertised capability tags (see [`KNOWN_PROVIDES`]). An unknown tag causes\nthe framework to be skipped with a warning. Absent defaults to empty.",
         "items": {
           "type": "string"
         },
@@ -59,10 +59,10 @@
       }
     },
     "required": [
-      "dimension",
       "id",
+      "version",
       "title",
-      "version"
+      "dimension"
     ],
     "title": "FrameworkManifest",
     "type": "object"

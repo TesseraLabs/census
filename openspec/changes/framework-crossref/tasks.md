@@ -62,11 +62,11 @@
 
 ## 9. Полярность связи (satisfies / risk / related) + framework risk
 
-- [ ] 9.1 Сменить `MappingEntry`: `controls` → три опц. списка `satisfies`/`risk`/`related` (default пусто, strict); мёрж по полярностям с dedup
-- [ ] 9.2 Forward/reverse индексы несут полярность; coverage считает покрытием ТОЛЬКО `satisfies`
-- [ ] 9.3 `show --framework` печатает полярность визуально (satisfies/risk/related) + json с полярностью каждой связи
-- [ ] 9.4 Команда `census framework risk <fw>` — контроли с `risk`-связью + угрожающие разрешения, независимо от `owned`; `--format json`
-- [ ] 9.5 Lint: осиротевший/неизвестный control-id охватывают все три полярности; один control-id в `satisfies` И `risk` одного разрешения → ошибка (противоречие)
-- [ ] 9.6 Мигрировать стартовые данные: `pci-dss`/`cis-controls` на `satisfies`; `log-admin→10.5.1` как `risk`; убрать мутные satisfies на owned=false
-- [ ] 9.7 Обновить/добавить тесты: полярность в парсинге/индексах/coverage/show/risk/lint; обновить README (`framework risk`, формат полярности)
-- [ ] 9.8 `cargo build`/`test`/`clippy` зелёные; `openspec validate --strict`; ревью master-code-reviewer
+- [x] 9.1 Сменить `MappingEntry`: `controls` → три опц. списка `satisfies`/`risk`/`related` (default пусто, strict); мёрж по полярностям с dedup
+- [x] 9.2 Forward/reverse индексы несут полярность; coverage считает покрытием ТОЛЬКО `satisfies`
+- [x] 9.3 `show --framework` печатает полярность визуально (satisfies/risk/related) + json с полярностью каждой связи
+- [x] 9.4 Команда `census framework risk <fw>` — контроли с `risk`-связью + угрожающие разрешения, независимо от `owned`; `--format json`
+- [x] 9.5 Lint: осиротевший/неизвестный control-id охватывают все три полярности; один control-id в `satisfies` И `risk` одного разрешения → ошибка (противоречие)
+- [x] 9.6 Мигрировать стартовые данные: `pci-dss`/`cis-controls` на `satisfies`; `log-admin→10.5.1` как `risk`; убрать мутные satisfies на owned=false
+- [x] 9.7 Обновить/добавить тесты: полярность в парсинге/индексах/coverage/show/risk/lint; обновить README (`framework risk`, формат полярности)
+- [x] 9.8 `cargo build`/`test`/`clippy` зелёные; `openspec validate --strict`; ревью master-code-reviewer

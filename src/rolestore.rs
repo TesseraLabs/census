@@ -8,6 +8,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::catalog::ParamValue;
+
 /// A permission reference as written in a role slice's `payload.permissions`.
 ///
 /// Two surface forms, per spec ("id-строка или таблица `{id, <параметры>}`"):
@@ -29,7 +31,11 @@ pub struct PermissionRef {
     /// Parameters from the table form (`units`, `path`, …). Empty for the bare
     /// string form. These fill the catalog record's `{placeholder}` templates
     /// during resolution, so a single record can be specialized per role.
-    pub params: BTreeMap<String, toml::Value>,
+    ///
+    /// Values are held in the census-owned [`ParamValue`] domain, converted from
+    /// the parsed TOML once at this slice-parse boundary so the resolve API never
+    /// exposes `toml::Value`.
+    pub params: BTreeMap<String, ParamValue>,
 }
 
 impl<'de> serde::Deserialize<'de> for PermissionRef {
@@ -64,12 +70,17 @@ impl<'de> serde::Deserialize<'de> for PermissionRef {
                         ));
                     }
                     None => {
-                        return Err(serde::de::Error::custom(
-                            "permission table is missing `id`",
-                        ));
+                        return Err(serde::de::Error::custom("permission table is missing `id`"));
                     }
                 };
-                Ok(PermissionRef { id, params: map })
+                // Convert the captured TOML params into the census-owned domain
+                // here, at the parse boundary, so `toml::Value` never reaches the
+                // resolve API.
+                let params = map
+                    .into_iter()
+                    .map(|(k, v)| (k, ParamValue::from_toml(v)))
+                    .collect();
+                Ok(PermissionRef { id, params })
             }
         }
     }
@@ -77,56 +88,39 @@ impl<'de> serde::Deserialize<'de> for PermissionRef {
 
 /// Hand-written schema for [`PermissionRef`]: the type has a custom
 /// `Deserialize` (a bare id string OR a `{ id = "...", <params> }` table) and
-/// holds a `toml::Value` map schemars cannot reflect, so the schema is written
-/// by hand to mirror the two accepted forms. The table arm stays tolerant
+/// holds a param map schemars cannot reflect, so the schema is written by hand
+/// to mirror the two accepted forms. The table arm stays tolerant
 /// (`additionalProperties: true`) — extra keys are captured as params, matching
-/// the tolerant role-store contract (§4.2).
+/// the tolerant role-store contract (§4.2). Behind the `schema` feature — schema
+/// generation is a CI/contract concern, not part of the default public API.
+#[cfg(feature = "schema")]
 impl schemars::JsonSchema for PermissionRef {
-    fn schema_name() -> String {
-        "PermissionRef".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PermissionRef".into()
     }
 
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{
-            InstanceType, ObjectValidation, Schema, SchemaObject, SubschemaValidation,
-        };
-
-        // Arm 1: a bare id string.
-        let bare = Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            ..Default::default()
-        });
-
-        // Arm 2: a table with a required `id` string plus free-form params
-        // (tolerant: additionalProperties left unset → true).
-        let mut table_obj = ObjectValidation::default();
-        table_obj.properties.insert(
-            "id".to_string(),
-            Schema::Object(SchemaObject {
-                instance_type: Some(InstanceType::String.into()),
-                ..Default::default()
-            }),
-        );
-        table_obj.required.insert("id".to_string());
-        let table = Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::Object.into()),
-            object: Some(Box::new(table_obj)),
-            ..Default::default()
-        });
-        let _ = gen;
-
-        Schema::Object(SchemaObject {
-            subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(vec![bare, table]),
-                ..Default::default()
-            })),
-            ..Default::default()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Arm 1: a bare id string. Arm 2: a table with a required `id` string
+        // plus free-form params (tolerant: additionalProperties left unset → the
+        // table accepts the extra keys that become params, matching §4.2).
+        schemars::json_schema!({
+            "oneOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string" },
+                    },
+                },
+            ],
         })
     }
 }
 
 /// systemd/rlimit composition subset Census consumes.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Limits {
     /// `RLIMIT_NOFILE`.
     #[serde(default)]
@@ -167,7 +161,8 @@ pub struct RoleComposition {
 /// The `[payload]` subset Census reads from a role slice. Tolerant: unknown
 /// keys are ignored (Census reads only the Linux/payload subset of a format
 /// Tessera owns). `pub` so the interface-contract test can schematize it.
-#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SlicePayload {
     #[serde(default)]
     groups: Option<Vec<String>>,
@@ -184,7 +179,8 @@ pub struct SlicePayload {
 /// Tolerant (no `deny_unknown_fields`) so foreign adapter fields are skipped.
 /// This is the schema root for `contract/role-store.schema.json`. `pub` so the
 /// interface-contract test can schematize it.
-#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Slice {
     #[serde(default)]
     payload: Option<SlicePayload>,
@@ -192,34 +188,44 @@ pub struct Slice {
 
 /// Errors reading a role-store slice.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RoleStoreError {
     /// Slice file is missing.
     #[error("role slice {0} not found")]
     NotFound(PathBuf),
     /// Slice file could not be read.
-    #[error("cannot read role slice {path}: {reason}")]
-    Io { path: PathBuf, reason: String },
+    #[error("cannot read role slice {path}: {source}")]
+    Io {
+        /// The slice path consulted.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// Slice TOML is malformed.
-    #[error("role slice {path} TOML is invalid: {reason}")]
-    TomlParse { path: PathBuf, reason: String },
+    #[error("role slice {path} TOML is invalid: {source}")]
+    TomlParse {
+        /// The slice path consulted.
+        path: PathBuf,
+        /// The underlying TOML deserialization error.
+        #[source]
+        source: toml::de::Error,
+    },
 }
 
 /// Read `<role_store>/<role>.toml` and extract the Linux composition subset.
-pub fn read_composition(
-    role_store: &Path,
-    role: &str,
-) -> Result<RoleComposition, RoleStoreError> {
+pub fn read_composition(role_store: &Path, role: &str) -> Result<RoleComposition, RoleStoreError> {
     let path = role_store.join(format!("{role}.toml"));
     if !path.exists() {
         return Err(RoleStoreError::NotFound(path));
     }
-    let text = std::fs::read_to_string(&path).map_err(|e| RoleStoreError::Io {
+    let text = std::fs::read_to_string(&path).map_err(|source| RoleStoreError::Io {
         path: path.clone(),
-        reason: e.to_string(),
+        source,
     })?;
-    let slice: Slice = toml::from_str(&text).map_err(|e| RoleStoreError::TomlParse {
+    let slice: Slice = toml::from_str(&text).map_err(|source| RoleStoreError::TomlParse {
         path: path.clone(),
-        reason: e.to_string(),
+        source,
     })?;
     let payload = slice.payload.unwrap_or(SlicePayload {
         groups: None,
@@ -237,8 +243,9 @@ pub fn read_composition(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     fn write_slice(dir: &Path, role: &str, body: &str) {
         let mut f = std::fs::File::create(dir.join(format!("{role}.toml"))).unwrap();
@@ -359,8 +366,14 @@ permissions = [
         assert_eq!(c.permissions[0].id, "network-admin");
         assert_eq!(c.permissions[1].id, "service-restart");
         // Params captured but inert.
-        let units = c.permissions[1].params.get("units").expect("units captured");
-        assert!(units.is_array(), "units param retained as a toml value");
+        let units = c.permissions[1]
+            .params
+            .get("units")
+            .expect("units captured");
+        assert!(
+            matches!(units, ParamValue::Array(_)),
+            "units param retained as a list param value"
+        );
     }
 
     #[test]

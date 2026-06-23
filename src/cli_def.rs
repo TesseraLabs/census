@@ -11,8 +11,12 @@
 use clap::{Parser, Subcommand};
 
 /// Top-level CLI: `census <command>`.
-#[derive(Parser)]
-#[command(name = "census", version, about = "Declarative Unix access provisioner")]
+#[derive(Debug, Parser)]
+#[command(
+    name = "census",
+    version,
+    about = "Declarative Unix access provisioner"
+)]
 pub struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
@@ -20,7 +24,7 @@ pub struct Cli {
 }
 
 /// The top-level commands.
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum Command {
     /// Show the create/update/delete plan without mutating anything.
     Plan {
@@ -155,7 +159,7 @@ pub enum Command {
 }
 
 /// Framework cross-reference subcommands.
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum FrameworkSub {
     /// List installed frameworks with their version and advertised capabilities.
     List {
@@ -234,7 +238,7 @@ pub enum FrameworkSub {
 }
 
 /// Catalog subcommands.
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum CatalogSub {
     /// Read-only audit: enumerate the device's live privileged surface and report
     /// what the installed catalog does NOT cover. Never mutates or runs binaries.

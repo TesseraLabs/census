@@ -1,13 +1,13 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Slice",
-  "description": "The on-disk role slice as Census reads it: the role-wide top level (whose keys Census ignores) plus the optional `[payload]` table it consumes. Tolerant (no `deny_unknown_fields`) so foreign adapter fields are skipped. This is the schema root for `contract/role-store.schema.json`. `pub` so the interface-contract test can schematize it.",
+  "description": "The on-disk role slice as Census reads it: the role-wide top level (whose\nkeys Census ignores) plus the optional `[payload]` table it consumes.\nTolerant (no `deny_unknown_fields`) so foreign adapter fields are skipped.\nThis is the schema root for `contract/role-store.schema.json`. `pub` so the\ninterface-contract test can schematize it.",
   "type": "object",
   "properties": {
     "payload": {
       "anyOf": [
         {
-          "$ref": "#/definitions/SlicePayload"
+          "$ref": "#/$defs/SlicePayload"
         },
         {
           "type": "null"
@@ -15,30 +15,30 @@
       ]
     }
   },
-  "definitions": {
+  "$defs": {
     "Limits": {
       "description": "systemd/rlimit composition subset Census consumes.",
       "type": "object",
       "properties": {
         "nofile": {
           "description": "`RLIMIT_NOFILE`.",
-          "default": null,
           "type": [
             "integer",
             "null"
           ],
           "format": "uint64",
-          "minimum": 0.0
+          "default": null,
+          "minimum": 0
         },
         "nproc": {
           "description": "`RLIMIT_NPROC`.",
-          "default": null,
           "type": [
             "integer",
             "null"
           ],
           "format": "uint64",
-          "minimum": 0.0
+          "default": null,
+          "minimum": 0
         }
       }
     },
@@ -49,27 +49,27 @@
         },
         {
           "type": "object",
-          "required": [
-            "id"
-          ],
           "properties": {
             "id": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "id"
+          ]
         }
       ]
     },
     "SlicePayload": {
-      "description": "The `[payload]` subset Census reads from a role slice. Tolerant: unknown keys are ignored (Census reads only the Linux/payload subset of a format Tessera owns). `pub` so the interface-contract test can schematize it.",
+      "description": "The `[payload]` subset Census reads from a role slice. Tolerant: unknown\nkeys are ignored (Census reads only the Linux/payload subset of a format\nTessera owns). `pub` so the interface-contract test can schematize it.",
       "type": "object",
       "properties": {
         "groups": {
-          "default": null,
           "type": [
             "array",
             "null"
           ],
+          "default": null,
           "items": {
             "type": "string"
           }
@@ -77,7 +77,7 @@
         "limits": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Limits"
+              "$ref": "#/$defs/Limits"
             },
             {
               "type": "null"
@@ -90,15 +90,15 @@
             "null"
           ],
           "items": {
-            "$ref": "#/definitions/PermissionRef"
+            "$ref": "#/$defs/PermissionRef"
           }
         },
         "sudo_role": {
-          "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         }
       }
     }

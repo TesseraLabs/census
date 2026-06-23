@@ -12,17 +12,19 @@
 //! directly), so it is fully unit-testable with a [`FakeProvisioner`]: happy
 //! path, phase-failure → restore + no registry write, and idempotent empty plan.
 
-use crate::declaration::Declaration;
-use crate::inspect::SystemInspector;
-use crate::mutate::{Provisioner, ProvisionError};
-use crate::plan::{self, Action, GroupAction};
-use crate::state::{ManagedAccount, ManagedFileGrant, ManagedGroup, SystemState};
-use crate::trust::{self, TrustMode, TrustOptions};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::declaration::Declaration;
+use crate::inspect::SystemInspector;
+use crate::mutate::{ProvisionError, Provisioner};
+use crate::plan::{self, Action, GroupAction};
+use crate::state::{ManagedAccount, ManagedFileGrant, ManagedGroup, SystemState};
+use crate::trust::{self, TrustMode, TrustOptions};
+
 /// Errors that abort apply (each maps to a non-zero exit upstream).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ApplyError {
     /// Declaration was not trusted (fail-closed); carries the reason.
     #[error("declaration not trusted: {0}")]
@@ -72,6 +74,18 @@ pub enum ApplyError {
     /// Census refuses an unenforceable grant rather than applying weaker access.
     #[error("file access: {0}")]
     FileAccess(#[from] crate::fileaccess::FileAccessError),
+    /// A group action references a group that resolve never produced — the plan
+    /// and the resolved set disagree, which can only happen if an internal
+    /// invariant was broken (a corrupt or externally-tampered plan). Detected
+    /// mid-apply, so rollback is attempted before the error surfaces; Census
+    /// never proceeds on an inconsistent plan.
+    #[error("corrupt plan: group action names {group:?} which resolve did not produce; rollback {rollback}")]
+    CorruptPlan {
+        /// The group name the plan action referenced.
+        group: String,
+        /// Outcome of the restore attempt.
+        rollback: RollbackOutcome,
+    },
 }
 
 /// A `userdel` that was deferred because the account has a live Tessera session.
@@ -107,7 +121,11 @@ impl std::fmt::Display for RollbackOutcome {
 pub type LogLine = String;
 
 /// Inputs to [`run`] beyond the trait object.
-pub struct ApplyInputs<'a> {
+///
+/// Generic over the catalog source `C` (carried by the embedded
+/// [`CompileInputs`]) so permission expansion dispatches statically — one apply
+/// runs against exactly one catalog source.
+pub struct ApplyInputs<'a, C: crate::catalog::CatalogSource> {
     /// Parsed, schema-valid declaration.
     pub declaration: &'a Declaration,
     /// Raw declaration bytes (for managed-mode signature canonicalization). The
@@ -135,7 +153,7 @@ pub struct ApplyInputs<'a> {
     /// Permission-expansion inputs (catalog source + OS target + resolve ctx).
     /// Threaded into [`crate::model::resolve`] so a role's `permissions` expand
     /// into concrete primitives before the plan is built.
-    pub compile: crate::model::CompileInputs<'a>,
+    pub compile: crate::model::CompileInputs<'a, C>,
     /// File-access enforcement backend (production wires
     /// [`crate::fileaccess::AclBackend::production`]; tests pass a
     /// [`crate::fileaccess::FakeBackend`]). This is a SEPARATE seam from
@@ -183,8 +201,8 @@ pub struct ApplyReport {
 /// On success returns the new managed set; the caller writes it to the registry
 /// atomically and last. On any phase failure the provisioner has already been
 /// asked to restore, and the error carries the rollback outcome.
-pub fn run(
-    inputs: ApplyInputs<'_>,
+pub fn run<C: crate::catalog::CatalogSource>(
+    inputs: ApplyInputs<'_, C>,
     provisioner: &mut dyn Provisioner,
 ) -> Result<ApplyReport, ApplyError> {
     let mut log = Vec::new();
@@ -204,9 +222,8 @@ pub fn run(
     // компиляции"). Resolve warnings (catalog lint + raw-primitive lint) flow
     // into the apply log. A failed expansion (unknown id, cycle) fails closed
     // here — before any snapshot or mutation.
-    let (targets, resolve_warnings) =
-        crate::model::resolve(inputs.declaration, &inputs.compile)
-            .map_err(|e| ApplyError::Resolve(e.to_string()))?;
+    let (targets, resolve_warnings) = crate::model::resolve(inputs.declaration, &inputs.compile)
+        .map_err(|e| ApplyError::Resolve(e.to_string()))?;
     for w in &resolve_warnings {
         log.push(format!("warning: {w}"));
     }
@@ -260,11 +277,8 @@ pub fn run(
     // drift aborts HERE — before lockout, snapshot, or any mutation (Census
     // never renumbers; design §Безопасность).
     let mut required_groups = crate::declaration::required_groups(inputs.declaration, &targets)?;
-    plan.group_actions = plan::diff_groups_via_inspector(
-        &required_groups,
-        &managed_groups_now,
-        inputs.inspector,
-    )?;
+    plan.group_actions =
+        plan::diff_groups_via_inspector(&required_groups, &managed_groups_now, inputs.inspector)?;
 
     // 5c. Group GRANT plan (declaration-driven, provenance-aware). This path is
     // the AUTHORITY for what Census materializes on a group — its `%group`
@@ -301,14 +315,50 @@ pub fn run(
         }
         Err(_) => crate::sessions::LiveSessions::default(),
     };
-    let deferred_deletes = reconcile_live_sessions(&mut plan, &managed_now, &live);
+    let deferred_deletes = reconcile_live_sessions(&mut plan, &managed_now, &live, &mut log);
     for d in &deferred_deletes {
+        tracing::info!(
+            account = %d.name,
+            uid = d.uid,
+            "deferred userdel: live session present"
+        );
         log.push(format!(
             "deferred delete of {} (uid {}): live session present (registry {})",
             d.name,
             d.uid,
             inputs.sessions_file.display()
         ));
+        // A deferred account keeps its FULL prior privilege until the session ends
+        // (see build_managed_set). The declaration dropped it entirely, so every
+        // grant it held is now "retained-but-revoked" — live until the next apply.
+        // Surface that delta as a structured warning so an operator can see which
+        // sudo / file-access privilege is still standing on a session we did not
+        // tear down, rather than the retention being silent.
+        if let Some(record) = managed_now.get(&d.name) {
+            let mut retained: Vec<String> = Vec::new();
+            if let Some(role) = &record.sudo_role {
+                retained.push(format!("sudo-role={role}"));
+            }
+            for cmd in &record.sudo_commands {
+                retained.push(format!("sudo-command={cmd}"));
+            }
+            for grant in &record.file_grants {
+                retained.push(format!("file-grant={}", grant.path));
+            }
+            if !retained.is_empty() {
+                tracing::warn!(
+                    account = %d.name,
+                    retained = %retained.join(", "),
+                    "deferred account retains revoked grants until its session ends"
+                );
+                log.push(format!(
+                    "warning: deferred account {} retains revoked grants until its \
+                     session ends: {}",
+                    d.name,
+                    retained.join(", ")
+                ));
+            }
+        }
     }
 
     // Deferring a `userdel` is not enough: when the declaration drops a role, its
@@ -346,7 +396,26 @@ pub fn run(
     if inputs.lockout.risk_acknowledged {
         log.push("anti-lockout: proceeding under --i-understand-no-rescue".to_owned());
     }
-    crate::lockout::gate(&plan, inputs.lockout)?;
+    // Managed accounts the plan leaves entirely unchanged still hold login paths,
+    // even though they produce no Action. Pass their recorded shells so the gate
+    // counts them as surviving logins (otherwise it would over-refuse a plan that
+    // only deletes a redundant account while a working one remains). Touched =
+    // every name in any account action; an untouched name keeps its prior shell.
+    let touched_account_names: std::collections::HashSet<&str> = plan
+        .actions
+        .iter()
+        .map(|a| match a {
+            Action::Create(acct) => acct.name.as_str(),
+            Action::Update { account, .. } => account.name.as_str(),
+            Action::Delete { name } => name.as_str(),
+        })
+        .collect();
+    let untouched_login_shells: Vec<&str> = managed_now
+        .iter()
+        .filter(|(name, _)| !touched_account_names.contains(name.as_str()))
+        .map(|(_, record)| record.shell.as_str())
+        .collect();
+    crate::lockout::gate(&plan, inputs.lockout, &untouched_login_shells)?;
 
     // Idempotence: empty plan (no account AND no group actions AND no group-grant
     // actions) → zero mutations, no snapshot, no registry churn (registry still
@@ -406,13 +475,11 @@ pub fn run(
     }
 
     // 7b. Snapshot before any mutation.
-    provisioner
-        .snapshot()
-        .map_err(|e| ApplyError::Phase {
-            phase: "snapshot",
-            source: e,
-            rollback: RollbackOutcome::Restored, // nothing mutated yet
-        })?;
+    provisioner.snapshot().map_err(|e| ApplyError::Phase {
+        phase: "snapshot",
+        source: e,
+        rollback: RollbackOutcome::Restored, // nothing mutated yet
+    })?;
 
     // 7c. Snapshot the file-access state of every path the file-access phase will
     // touch (grants materialized for created/updated accounts + grants revoked
@@ -427,7 +494,8 @@ pub fn run(
     // group ACL back together with the account ACLs (dual-seam restore). Touched =
     // every resolved group's grant paths (materialized) + every prior recorded
     // grant path of a released/deleted group (revoked).
-    for p in group_file_access_touched_paths(&rgroup_actions, &resolved_groups, &managed_groups_now) {
+    for p in group_file_access_touched_paths(&rgroup_actions, &resolved_groups, &managed_groups_now)
+    {
         if !file_access_paths.contains(&p) {
             file_access_paths.push(p);
         }
@@ -459,12 +527,27 @@ pub fn run(
             match provisioner.create_group(name, *gid) {
                 Ok(()) => {
                     mutations += 1;
-                    created_groups.push((name.clone(), *gid));
-                    let pin = gid.map(|g| g.to_string()).unwrap_or_else(|| "auto".to_owned());
+                    // For an unpinned group the OS assigned the GID; read it back
+                    // through the SAME provisioner seam that just created it, so
+                    // the registry records the real assigned GID rather than a
+                    // value sampled from the pre-mutation snapshot inspector (which
+                    // could not see a group that did not exist yet). A pin is kept
+                    // verbatim — no read-back needed.
+                    let assigned = gid.or_else(|| provisioner.group_gid(name));
+                    created_groups.push((name.clone(), assigned));
+                    let pin = gid
+                        .map(|g| g.to_string())
+                        .unwrap_or_else(|| "auto".to_owned());
+                    tracing::info!(group = %name, gid = %pin, "created group");
                     log.push(format!("create-group: {name} (gid {pin})"));
                 }
                 Err(source) => {
-                    return Err(phase_failure(provisioner, inputs.file_access, "create-group", source));
+                    return Err(phase_failure(
+                        provisioner,
+                        inputs.file_access,
+                        "create-group",
+                        source,
+                    ));
                 }
             }
         }
@@ -497,10 +580,16 @@ pub fn run(
         match result {
             Ok(()) => {
                 mutations += 1;
+                tracing::info!(phase, account = %action_label(action), "applied account action");
                 log.push(format!("{phase}: {}", action_label(action)));
             }
             Err(source) => {
-                return Err(phase_failure(provisioner, inputs.file_access, phase, source));
+                return Err(phase_failure(
+                    provisioner,
+                    inputs.file_access,
+                    phase,
+                    source,
+                ));
             }
         }
     }
@@ -524,15 +613,26 @@ pub fn run(
         // recorded managed grants), so a dropped grant's ACL does not leak.
         for removed in removed_grants(&acct.name, &acct.file_grants, &managed_now) {
             if let Err(e) = revoke_one(inputs.file_access, &acct.name, &removed) {
-                return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                return Err(phase_failure_file_access(
+                    provisioner,
+                    inputs.file_access,
+                    e,
+                ));
             }
         }
         if acct.file_grants.is_empty() {
             continue;
         }
         let principal = crate::fileaccess::Principal::User(acct.name.clone());
-        if let Err(e) = inputs.file_access.materialize(&principal, &acct.file_grants) {
-            return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+        if let Err(e) = inputs
+            .file_access
+            .materialize(&principal, &acct.file_grants)
+        {
+            return Err(phase_failure_file_access(
+                provisioner,
+                inputs.file_access,
+                e,
+            ));
         }
         log.push(format!(
             "file-access: materialized {} grant(s) for {}",
@@ -546,7 +646,11 @@ pub fn run(
         if let Action::Delete { name } = action {
             for removed in removed_grants(name, &[], &managed_now) {
                 if let Err(e) = revoke_one(inputs.file_access, name, &removed) {
-                    return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                    return Err(phase_failure_file_access(
+                        provisioner,
+                        inputs.file_access,
+                        e,
+                    ));
                 }
             }
         }
@@ -566,41 +670,74 @@ pub fn run(
             GroupAction::Create { name, .. }
             | GroupAction::Adopt { name }
             | GroupAction::Update { name, .. } => {
-                let group = resolved_group_by_name(&resolved_groups, name)
-                    .expect("resolved-path action names a resolved group");
+                // A group action must name a group resolve produced. If it does
+                // not, the plan disagrees with the resolved set — a corrupt or
+                // tampered plan. We are past the snapshot, so roll both seams back
+                // and fail closed rather than mutate on an inconsistent plan.
+                let Some(group) = resolved_group_by_name(&resolved_groups, name) else {
+                    let rollback = abort_with_rollback(provisioner, inputs.file_access);
+                    tracing::warn!(
+                        group = %name,
+                        rollback = %rollback,
+                        "corrupt plan: group action names a group resolve did not produce; rolled back"
+                    );
+                    return Err(ApplyError::CorruptPlan {
+                        group: name.clone(),
+                        rollback,
+                    });
+                };
                 // Adopt: the group comes under management for the first time —
                 // snapshot its live baseline (GID + pre-existing members) BEFORE
                 // layering Census's grants, so a later release returns it to
                 // exactly this state without ever deleting the group.
-                if matches!(ga, GroupAction::Adopt { .. })
-                    && !managed_groups_now.contains_key(name)
+                if matches!(ga, GroupAction::Adopt { .. }) && !managed_groups_now.contains_key(name)
                 {
-                    let gid = inputs.inspector.group(name).map(|f| f.gid).unwrap_or(0);
+                    // `None` here means the OS could not report the GID (group not
+                    // yet visible / getent failure); it is preserved as "unknown"
+                    // and never coerced to 0, which is a real GID (root).
+                    let gid = inputs.inspector.group(name).map(|f| f.gid);
                     let members = inputs.inspector.group_members(name);
-                    adopt_baselines.insert(
-                        name.clone(),
-                        crate::state::GroupBaseline { gid, members },
-                    );
-                    log.push(format!("adopt-group: {name} (baseline gid {gid})"));
+                    adopt_baselines
+                        .insert(name.clone(), crate::state::GroupBaseline { gid, members });
+                    tracing::info!(group = %name, ?gid, "adopt-group: captured baseline");
+                    log.push(format!("adopt-group: {name} (baseline gid {gid:?})"));
                 }
 
                 // (a) %group sudoers fragment (write when sudo commands present,
                 // else ensure absent).
                 if let Err(source) = provisioner.apply_group_sudoers(group) {
-                    return Err(phase_failure(provisioner, inputs.file_access, "group-sudoers", source));
+                    return Err(phase_failure(
+                        provisioner,
+                        inputs.file_access,
+                        "group-sudoers",
+                        source,
+                    ));
                 }
                 // (b) g:group ACL — materialize the group's file grants.
                 if !group.file_grants.is_empty() {
                     let principal = crate::fileaccess::Principal::Group(name.clone());
-                    if let Err(e) = inputs.file_access.materialize(&principal, &group.file_grants) {
-                        return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                    if let Err(e) = inputs
+                        .file_access
+                        .materialize(&principal, &group.file_grants)
+                    {
+                        return Err(phase_failure_file_access(
+                            provisioner,
+                            inputs.file_access,
+                            e,
+                        ));
                     }
                     // A revoked group grant (recorded but no longer targeted) must
                     // drop its ACL entry too — same set-difference the account path
                     // does, so a removed group grant cannot leak.
-                    for removed in removed_group_grants(name, &group.file_grants, &managed_groups_now) {
+                    for removed in
+                        removed_group_grants(name, &group.file_grants, &managed_groups_now)
+                    {
                         if let Err(e) = revoke_one_group(inputs.file_access, name, &removed) {
-                            return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                            return Err(phase_failure_file_access(
+                                provisioner,
+                                inputs.file_access,
+                                e,
+                            ));
                         }
                     }
                     log.push(format!(
@@ -612,7 +749,11 @@ pub fn run(
                     // No target grants: revoke every grant Census previously recorded.
                     for removed in removed_group_grants(name, &[], &managed_groups_now) {
                         if let Err(e) = revoke_one_group(inputs.file_access, name, &removed) {
-                            return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                            return Err(phase_failure_file_access(
+                                provisioner,
+                                inputs.file_access,
+                                e,
+                            ));
                         }
                     }
                 }
@@ -623,7 +764,12 @@ pub fn run(
                 for m in &group.members {
                     if !current.contains(m) {
                         if let Err(source) = provisioner.add_group_member(name, m) {
-                            return Err(phase_failure(provisioner, inputs.file_access, "group-member", source));
+                            return Err(phase_failure(
+                                provisioner,
+                                inputs.file_access,
+                                "group-member",
+                                source,
+                            ));
                         }
                         mutations += 1;
                     }
@@ -631,7 +777,12 @@ pub fn run(
                 for m in &current {
                     if !group.members.contains(m) {
                         if let Err(source) = provisioner.remove_group_member(name, m) {
-                            return Err(phase_failure(provisioner, inputs.file_access, "group-member", source));
+                            return Err(phase_failure(
+                                provisioner,
+                                inputs.file_access,
+                                "group-member",
+                                source,
+                            ));
                         }
                         mutations += 1;
                     }
@@ -644,21 +795,40 @@ pub fn run(
                 // is Adopted (left alive, returned to baseline); for Delete the
                 // group is Created and its empty shell is groupdel'd in Phase 4
                 // AFTER this teardown. Both do the identical grant cleanup here.
-                if let Err(source) = provisioner.remove_group_sudoers_for(name) {
-                    return Err(phase_failure(provisioner, inputs.file_access, "group-sudoers", source));
+                if let Err(source) = provisioner.remove_group_sudoers(name) {
+                    return Err(phase_failure(
+                        provisioner,
+                        inputs.file_access,
+                        "group-sudoers",
+                        source,
+                    ));
                 }
                 for removed in removed_group_grants(name, &[], &managed_groups_now) {
                     if let Err(e) = revoke_one_group(inputs.file_access, name, &removed) {
-                        return Err(phase_failure_file_access(provisioner, inputs.file_access, e));
+                        return Err(phase_failure_file_access(
+                            provisioner,
+                            inputs.file_access,
+                            e,
+                        ));
                     }
                 }
                 for m in &members_added_of(name, &managed_groups_now) {
                     if let Err(source) = provisioner.remove_group_member(name, m) {
-                        return Err(phase_failure(provisioner, inputs.file_access, "group-member", source));
+                        return Err(phase_failure(
+                            provisioner,
+                            inputs.file_access,
+                            "group-member",
+                            source,
+                        ));
                     }
                     mutations += 1;
                 }
-                let verb = if matches!(ga, GroupAction::Release { .. }) { "release" } else { "teardown" };
+                let verb = if matches!(ga, GroupAction::Release { .. }) {
+                    "release"
+                } else {
+                    "teardown"
+                };
+                tracing::info!(group = %name, action = verb, "group grant teardown");
                 log.push(format!("group-{verb}: {name}"));
             }
         }
@@ -673,10 +843,16 @@ pub fn run(
             match provisioner.delete_group(name) {
                 Ok(()) => {
                     mutations += 1;
+                    tracing::info!(group = %name, "deleted group");
                     log.push(format!("delete-group: {name}"));
                 }
                 Err(source) => {
-                    return Err(phase_failure(provisioner, inputs.file_access, "delete-group", source));
+                    return Err(phase_failure(
+                        provisioner,
+                        inputs.file_access,
+                        "delete-group",
+                        source,
+                    ));
                 }
             }
         }
@@ -718,6 +894,7 @@ fn reconcile_live_sessions(
     plan: &mut plan::Plan,
     managed_now: &BTreeMap<String, ManagedAccount>,
     live: &crate::sessions::LiveSessions,
+    log: &mut Vec<String>,
 ) -> Vec<DeferredDelete> {
     let mut deferred = Vec::new();
     plan.actions.retain(|action| {
@@ -726,11 +903,16 @@ fn reconcile_live_sessions(
         };
         // Every account `Delete` is produced by diffing the managed registry, so
         // its record (and thus its uid) is always present in `managed_now`. A
-        // record with no managed entry could not be retained anyway
-        // (`build_managed_set` carries deferrals forward via `current.get(name)`),
-        // so a missing entry simply falls through as a normal delete.
+        // record with no managed entry must not be silently swallowed: surface it
+        // as a warning in EVERY build (a bare `debug_assert!` would vanish in
+        // release, hiding a real invariant break) and fall through as a normal
+        // delete — the safe outcome, since a record we cannot find cannot be
+        // retained or matched against a live session anyway.
         let Some(record) = managed_now.get(name) else {
-            debug_assert!(false, "account Delete {name:?} has no managed record");
+            log.push(format!(
+                "warning: account delete {name:?} has no managed registry record; \
+                 cannot check for a live session, proceeding as a normal delete"
+            ));
             return true;
         };
         if live.matches(name, record.uid) {
@@ -798,14 +980,25 @@ fn phase_failure(
     phase: &'static str,
     source: ProvisionError,
 ) -> ApplyError {
+    tracing::warn!(phase, error = %source, "apply phase failed; rolling back");
     let prov = provisioner.restore();
     let acl = file_access.restore();
+    if let Err(e) = &prov {
+        tracing::warn!(phase, error = %e, "rollback: provisioner restore failed");
+    }
+    if let Err(e) = &acl {
+        tracing::warn!(phase, error = %e, "rollback: file-access restore failed");
+    }
     let rollback = match (prov, acl) {
         (Ok(()), Ok(())) => RollbackOutcome::Restored,
         (Err(e), _) => RollbackOutcome::Failed(e.to_string()),
         (_, Err(e)) => RollbackOutcome::Failed(format!("file-access restore: {e}")),
     };
-    ApplyError::Phase { phase, source, rollback }
+    ApplyError::Phase {
+        phase,
+        source,
+        rollback,
+    }
 }
 
 /// Roll back BOTH seams after a file-access phase failure (the symmetric case of
@@ -821,9 +1014,38 @@ fn phase_failure_file_access(
     // Undo the auth-DB/sudoers mutations of earlier phases and any ACL entries
     // this phase managed to apply before failing. Best-effort: the snapshots are
     // retained on a restore failure, and the originating error is what surfaces.
-    let _ = provisioner.restore();
-    let _ = file_access.restore();
+    tracing::warn!(error = %source, "file-access phase failed; rolling back");
+    if let Err(e) = provisioner.restore() {
+        tracing::warn!(error = %e, "rollback: provisioner restore failed");
+    }
+    if let Err(e) = file_access.restore() {
+        tracing::warn!(error = %e, "rollback: file-access restore failed");
+    }
     ApplyError::FileAccess(source)
+}
+
+/// Roll back BOTH seams best-effort and report the restore outcome, for an abort
+/// that is not tied to a provisioner phase error (e.g. a corrupt-plan invariant
+/// breach detected mid-apply). Mirrors [`phase_failure`]'s restore handling: the
+/// provisioner undoes its auth-DB + sudoers backup and the backend undoes its ACL
+/// snapshot, and the outcome reports success only if both restores succeed.
+fn abort_with_rollback(
+    provisioner: &mut dyn Provisioner,
+    file_access: &mut dyn crate::fileaccess::FileAccessBackend,
+) -> RollbackOutcome {
+    let prov = provisioner.restore();
+    let acl = file_access.restore();
+    if let Err(e) = &prov {
+        tracing::warn!(error = %e, "rollback: provisioner restore failed");
+    }
+    if let Err(e) = &acl {
+        tracing::warn!(error = %e, "rollback: file-access restore failed");
+    }
+    match (prov, acl) {
+        (Ok(()), Ok(())) => RollbackOutcome::Restored,
+        (Err(e), _) => RollbackOutcome::Failed(e.to_string()),
+        (_, Err(e)) => RollbackOutcome::Failed(format!("file-access restore: {e}")),
+    }
 }
 
 /// Re-hydrate a recorded [`ManagedFileGrant`] into a [`crate::catalog::ResolvedFileGrant`]
@@ -848,6 +1070,13 @@ fn resolved_from_managed(g: &ManagedFileGrant) -> crate::catalog::ResolvedFileGr
 /// The recorded managed grants for `name` whose path is NOT in `keep` — the set
 /// to revoke. `keep` is the account's target grant set (empty for a deleted
 /// account, so every recorded grant is revoked).
+///
+/// The path-based `keep` membership test is sound because both the recorded
+/// grants and `keep` carry one entry per path: resolve unions every account's
+/// grants through [`crate::catalog::union_resolved_file_grants`], which collapses
+/// duplicate paths into a single widened entry. So a recorded grant is matched by
+/// at most one `keep` entry, and "no `keep` entry for this path" unambiguously
+/// means the path was dropped.
 fn removed_grants(
     name: &str,
     keep: &[crate::catalog::ResolvedFileGrant],
@@ -930,10 +1159,7 @@ fn file_access_touched_paths(
 /// Update write or clear its `%group` fragment; Release/Delete remove it. Backing
 /// up an absent fragment is a no-op that restores "absent" on rollback.
 /// Deduplicated, order-stable.
-fn touched_group_sudoers_paths(
-    rgroup_actions: &[GroupAction],
-    sudoers_dir: &Path,
-) -> Vec<PathBuf> {
+fn touched_group_sudoers_paths(rgroup_actions: &[GroupAction], sudoers_dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     for ga in rgroup_actions {
         let name = match ga {
@@ -1054,8 +1280,8 @@ fn members_added_of(
 ///
 /// A fragment is touched when:
 /// * a created/updated role carries a sudo right (its fragment is written), OR
-/// * a created/updated role does NOT carry sudo (its fragment, if any, is
-///   removed — drop-to-none must also roll back), OR
+/// * a created/updated role does NOT carry sudo (its fragment, if any, is removed — drop-to-none
+///   must also roll back), OR
 /// * a role is deleted (its `census-<role>` fragment is removed).
 ///
 /// We back up the path for every created/updated/deleted role unconditionally:
@@ -1110,7 +1336,8 @@ fn build_managed_set(
         .iter()
         .map(|t| {
             let from_version = match current.get(&t.name) {
-                Some(existing) if existing.uid == t.uid
+                Some(existing)
+                    if existing.uid == t.uid
                     && existing.shell == t.shell
                     && groups_equal(&existing.groups, &t.groups)
                     && existing.sudo_role == t.sudo_role
@@ -1148,6 +1375,15 @@ fn build_managed_set(
     // Retain deferred-delete accounts with their original record (prior
     // from_version preserved). They are absent from `targets`, so there is no
     // overlap to deduplicate.
+    //
+    // SECURITY NOTE: the carried-forward record is the account's FULL prior
+    // privilege — every group, sudo grant, and file-access grant it held before
+    // the declaration dropped it. Census deliberately does NOT tear that access
+    // down while a session is live (killing access mid-session is the larger
+    // operational hazard), so any grant the new declaration revoked stays LIVE
+    // until the session ends and the next apply completes the delete. The
+    // orchestrator emits a `warning:` line naming each such account and the
+    // grants it retains, so an operator can see what privilege is still standing.
     for d in deferred {
         if let Some(existing) = current.get(&d.name) {
             out.push(existing.clone());
@@ -1190,13 +1426,13 @@ fn build_managed_groups(
         if by_name.contains_key(name) {
             continue;
         }
-        // Prefer the pin; otherwise read the OS-assigned GID back from the live
-        // system. If the read-back fails (should not happen right after a
-        // successful groupadd), fall back to 0 rather than panicking — doctor
-        // will flag a divergence on the next run.
-        let gid = pin
-            .or_else(|| inspector.group(name).map(|f| f.gid))
-            .unwrap_or(0);
+        // `pin` already carries the GID the OS assigned: Phase 1 read it back
+        // through the provisioner immediately after groupadd. Fall back to the
+        // pre-mutation snapshot inspector only if that read-back was also empty.
+        // If both are empty the GID is genuinely unknown — recorded as `None`,
+        // distinct from a real GID `0` (root group), so a later drift check skips
+        // an unknown GID rather than spuriously flagging it.
+        let gid = pin.or_else(|| inspector.group(name).map(|f| f.gid));
         by_name.insert(
             name.clone(),
             ManagedGroup {
@@ -1222,13 +1458,13 @@ fn build_managed_groups(
     for rg in resolved_groups {
         let prior_record = prior.get(&rg.name);
         // GID: a Created pin wins; otherwise carry the prior recorded GID; else
-        // read the live GID back (adopted groups observe, never assign). Fall
-        // back to 0 only if nothing is known (doctor flags divergence).
+        // read the live GID back (adopted groups observe, never assign). If none
+        // of those yields a GID it is genuinely unknown — recorded as `None`,
+        // distinct from a real GID `0` (root group).
         let gid = rg
             .gid
-            .or_else(|| prior_record.map(|p| p.gid))
-            .or_else(|| inspector.group(&rg.name).map(|f| f.gid))
-            .unwrap_or(0);
+            .or_else(|| prior_record.and_then(|p| p.gid))
+            .or_else(|| inspector.group(&rg.name).map(|f| f.gid));
 
         // Adopt baseline: the one captured this run wins (first adoption);
         // otherwise carry the prior record's baseline forward across applies.
@@ -1240,8 +1476,11 @@ fn build_managed_groups(
                 .or_else(|| prior_record.and_then(|p| p.adopt_baseline.clone())),
         };
 
-        let file_grants: Vec<ManagedFileGrant> =
-            rg.file_grants.iter().map(ManagedFileGrant::from_resolved).collect();
+        let file_grants: Vec<ManagedFileGrant> = rg
+            .file_grants
+            .iter()
+            .map(ManagedFileGrant::from_resolved)
+            .collect();
 
         // Preserve from_version when the recorded grants/members/provenance are
         // unchanged (mirrors the account record); a real change bumps to the
@@ -1281,10 +1520,16 @@ fn build_managed_groups(
 }
 
 fn groups_equal(a: &[String], b: &[String]) -> bool {
-    let mut a = a.to_vec();
-    let mut b = b.to_vec();
-    a.sort();
-    b.sort();
+    // Set-equal (order-insensitive). Short-circuit on length, then compare sorted
+    // borrowed `&str` so neither side's String allocations are cloned — only two
+    // pointer vectors are sorted.
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<&str> = a.iter().map(String::as_str).collect();
+    let mut b: Vec<&str> = b.iter().map(String::as_str).collect();
+    a.sort_unstable();
+    b.sort_unstable();
     a == b
 }
 
@@ -1330,14 +1575,15 @@ struct RegistryDoc {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
     use crate::catalog::{FakeCatalog, OsTarget, ResolveCtx};
     use crate::fileaccess::{acl_capabilities, FakeBackend, FileAccessBackend};
     use crate::inspect::{FakeInspector, GroupFacts};
     use crate::lockout::LockoutContext;
     use crate::model::{CompileInputs, ResolvedAccount};
-    use crate::state::{FakeState, ManagedGroup};
-    use std::sync::OnceLock;
+    use crate::state::FakeState;
 
     /// A fresh dir-only (ACL-equivalent) backend for tests whose roles carry no
     /// per-file/pattern grants — the common case.
@@ -1351,7 +1597,7 @@ mod tests {
     /// `ApplyInputs` literal without a per-test local. Roles with no
     /// `permissions` never touch the catalog, so an empty one is exercised
     /// exactly as before permission expansion existed.
-    fn empty_compile() -> CompileInputs<'static> {
+    fn empty_compile() -> CompileInputs<'static, FakeCatalog> {
         static CAT: OnceLock<FakeCatalog> = OnceLock::new();
         static OS: OnceLock<OsTarget> = OnceLock::new();
         static CTX: OnceLock<ResolveCtx> = OnceLock::new();
@@ -1372,16 +1618,24 @@ mod tests {
         tracked_backups: Vec<std::path::PathBuf>,
         /// Phase name on which a mutating call should fail.
         fail_on: Option<&'static str>,
+        /// GIDs to report from `group_gid` (the post-create read-back seam),
+        /// keyed by group name. Absent ⇒ `None` (read-back failed).
+        group_gids: std::collections::BTreeMap<String, u32>,
     }
 
     impl FakeProvisioner {
         fn failing(phase: &'static str) -> Self {
-            FakeProvisioner { fail_on: Some(phase), ..Default::default() }
+            FakeProvisioner {
+                fail_on: Some(phase),
+                ..Default::default()
+            }
         }
         fn maybe_fail(&mut self, phase: &'static str, name: &str) -> Result<(), ProvisionError> {
             self.calls.push(format!("{phase}:{name}"));
             if self.fail_on == Some(phase) {
-                Err(ProvisionError::Sudoers(format!("injected failure at {phase}")))
+                Err(ProvisionError::Sudoers(format!(
+                    "injected failure at {phase}"
+                )))
             } else {
                 Ok(())
             }
@@ -1401,6 +1655,9 @@ mod tests {
         fn create_group(&mut self, name: &str, _gid: Option<u32>) -> Result<(), ProvisionError> {
             self.maybe_fail("create_group", name)
         }
+        fn group_gid(&self, name: &str) -> Option<u32> {
+            self.group_gids.get(name).copied()
+        }
         fn delete_group(&mut self, name: &str) -> Result<(), ProvisionError> {
             self.maybe_fail("delete_group", name)
         }
@@ -1416,17 +1673,13 @@ mod tests {
         ) -> Result<(), ProvisionError> {
             self.maybe_fail("apply_group_sudoers", &group.name)
         }
-        fn remove_group_sudoers_for(&mut self, group: &str) -> Result<(), ProvisionError> {
+        fn remove_group_sudoers(&mut self, group: &str) -> Result<(), ProvisionError> {
             self.maybe_fail("remove_group_sudoers", group)
         }
         fn add_group_member(&mut self, group: &str, member: &str) -> Result<(), ProvisionError> {
             self.maybe_fail("add_member", &format!("{group}:{member}"))
         }
-        fn remove_group_member(
-            &mut self,
-            group: &str,
-            member: &str,
-        ) -> Result<(), ProvisionError> {
+        fn remove_group_member(&mut self, group: &str, member: &str) -> Result<(), ProvisionError> {
             self.maybe_fail("del_member", &format!("{group}:{member}"))
         }
         fn track_sudoers_backup(&mut self, path: std::path::PathBuf) {
@@ -1504,7 +1757,10 @@ mod tests {
                 state: &st,
                 inspector: &insp,
                 trust: TrustOptions::default(), // no --trust-fs
-                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                lockout: LockoutContext {
+                    rescue_present: true,
+                    ..Default::default()
+                },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -1539,7 +1795,10 @@ mod tests {
                 declaration_bytes: b"",
                 state: &st,
                 inspector: &insp,
-                trust: TrustOptions { trust_fs: true, ..Default::default() },
+                trust: TrustOptions {
+                    trust_fs: true,
+                    ..Default::default()
+                },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
@@ -1553,7 +1812,10 @@ mod tests {
         assert!(p.snapshotted);
         assert!(!p.restored, "no restore on success");
         assert_eq!(report.mutations, 1);
-        assert!(report.registry_written, "mutating plan must persist the registry");
+        assert!(
+            report.registry_written,
+            "mutating plan must persist the registry"
+        );
         assert_eq!(report.managed.len(), 1);
         assert_eq!(report.managed[0].name, "oper");
         assert_eq!(report.managed[0].from_version, 5);
@@ -1572,7 +1834,10 @@ mod tests {
                 declaration_bytes: b"",
                 state: &st,
                 inspector: &insp,
-                trust: TrustOptions { trust_fs: true, ..Default::default() },
+                trust: TrustOptions {
+                    trust_fs: true,
+                    ..Default::default()
+                },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
@@ -1584,7 +1849,9 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ApplyError::Phase { phase, rollback, .. } => {
+            ApplyError::Phase {
+                phase, rollback, ..
+            } => {
                 assert_eq!(phase, "create");
                 assert_eq!(rollback, RollbackOutcome::Restored);
             }
@@ -1606,7 +1873,10 @@ mod tests {
                 declaration_bytes: b"",
                 state: &st,
                 inspector: &insp,
-                trust: TrustOptions { trust_fs: true, ..Default::default() },
+                trust: TrustOptions {
+                    trust_fs: true,
+                    ..Default::default()
+                },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
@@ -1618,7 +1888,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.mutations, 0);
-        assert!(!report.registry_written, "empty plan must not request a registry write");
+        assert!(
+            !report.registry_written,
+            "empty plan must not request a registry write"
+        );
         assert!(!p.snapshotted, "empty plan must not snapshot");
         assert!(p.calls.is_empty(), "empty plan must not mutate");
         // registry still reflects the in-sync account, preserving from_version.
@@ -1643,7 +1916,10 @@ mod tests {
                 declaration_bytes: b"",
                 state: &st,
                 inspector: &insp,
-                trust: TrustOptions { trust_fs: true, ..Default::default() },
+                trust: TrustOptions {
+                    trust_fs: true,
+                    ..Default::default()
+                },
                 lockout: LockoutContext::default(), // no rescue, no risk-ack
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
@@ -1687,7 +1963,10 @@ mod tests {
                 declaration_bytes: b"",
                 state: &st,
                 inspector: &insp,
-                trust: TrustOptions { trust_fs: true, ..Default::default() },
+                trust: TrustOptions {
+                    trust_fs: true,
+                    ..Default::default()
+                },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
@@ -1710,8 +1989,15 @@ mod tests {
             .iter()
             .position(|c| c == "track_backup:/etc/sudoers.d/census-oper")
             .expect("track_backup recorded");
-        let snap_idx = p.calls.iter().position(|c| c == "snapshot").expect("snapshot recorded");
-        assert!(track_idx < snap_idx, "backup must be registered before snapshot");
+        let snap_idx = p
+            .calls
+            .iter()
+            .position(|c| c == "snapshot")
+            .expect("snapshot recorded");
+        assert!(
+            track_idx < snap_idx,
+            "backup must be registered before snapshot"
+        );
         // … and the sudoers fragment was materialized for the created role.
         assert!(p.calls.contains(&"create:oper".to_owned()));
         assert!(p.calls.contains(&"apply_sudoers:oper".to_owned()));
@@ -1735,9 +2021,15 @@ mod tests {
                 declaration_bytes: b"",
                 state: &st,
                 inspector: &insp,
-                trust: TrustOptions { trust_fs: true, ..Default::default() },
+                trust: TrustOptions {
+                    trust_fs: true,
+                    ..Default::default()
+                },
                 // Rescue present so the delete-only plan passes the lockout gate.
-                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                lockout: LockoutContext {
+                    rescue_present: true,
+                    ..Default::default()
+                },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -1751,7 +2043,11 @@ mod tests {
         assert!(p.calls.contains(&"remove_sudoers:oper".to_owned()));
         assert!(p.calls.contains(&"delete:oper".to_owned()));
         // sudoers removal precedes userdel.
-        let rm_idx = p.calls.iter().position(|c| c == "remove_sudoers:oper").unwrap();
+        let rm_idx = p
+            .calls
+            .iter()
+            .position(|c| c == "remove_sudoers:oper")
+            .unwrap();
         let del_idx = p.calls.iter().position(|c| c == "delete:oper").unwrap();
         assert!(rm_idx < del_idx, "sudoers removal must precede userdel");
         // Deleted role's fragment was tracked for backup.
@@ -1774,7 +2070,10 @@ mod tests {
                 declaration_bytes: b"",
                 state: &st,
                 inspector: &insp,
-                trust: TrustOptions { trust_fs: true, ..Default::default() },
+                trust: TrustOptions {
+                    trust_fs: true,
+                    ..Default::default()
+                },
                 lockout: LockoutContext::default(),
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
@@ -1786,7 +2085,11 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ApplyError::Phase { phase, rollback, source } => {
+            ApplyError::Phase {
+                phase,
+                rollback,
+                source,
+            } => {
                 assert_eq!(phase, "create", "sudoers is part of the create phase");
                 assert_eq!(rollback, RollbackOutcome::Restored);
                 assert!(matches!(source, ProvisionError::Sudoers(_)));
@@ -1813,7 +2116,7 @@ mod tests {
         let set = vec![sudo_acct, managed("plain", 9011, &[], 5)];
         let groups = vec![ManagedGroup {
             name: "atm-operators".to_owned(),
-            gid: 8010,
+            gid: Some(8010),
             provenance: crate::model::Provenance::Created,
             members_added: Vec::new(),
             sudo_commands: Vec::new(),
@@ -1831,7 +2134,7 @@ mod tests {
         assert_eq!(accts["plain"].sudo_role, None);
         // managed groups round-trip alongside accounts.
         let grps = reloaded.managed_groups();
-        assert_eq!(grps["atm-operators"].gid, 8010);
+        assert_eq!(grps["atm-operators"].gid, Some(8010));
         assert_eq!(grps["atm-operators"].from_version, 5);
     }
 
@@ -1870,7 +2173,11 @@ mod tests {
     }
 
     fn managed_opts(anchor: PathBuf, persist: PathBuf) -> TrustOptions {
-        TrustOptions { trust_fs: false, trust_anchor_path: anchor, persist_dir: persist }
+        TrustOptions {
+            trust_fs: false,
+            trust_anchor_path: anchor,
+            persist_dir: persist,
+        }
     }
 
     #[test]
@@ -1887,8 +2194,14 @@ mod tests {
                 declaration_bytes: b"version = 5\n", // no signature line
                 state: &st,
                 inspector: &insp,
-                trust: managed_opts(PathBuf::from("/nonexistent.pub"), persist.path().to_path_buf()),
-                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                trust: managed_opts(
+                    PathBuf::from("/nonexistent.pub"),
+                    persist.path().to_path_buf(),
+                ),
+                lockout: LockoutContext {
+                    rescue_present: true,
+                    ..Default::default()
+                },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -1898,8 +2211,14 @@ mod tests {
             &mut p,
         )
         .unwrap_err();
-        assert!(matches!(err, ApplyError::Trust(trust::TrustError::MissingSignature)));
-        assert!(!p.snapshotted, "managed-no-signature must refuse before snapshot");
+        assert!(matches!(
+            err,
+            ApplyError::Trust(trust::TrustError::MissingSignature)
+        ));
+        assert!(
+            !p.snapshotted,
+            "managed-no-signature must refuse before snapshot"
+        );
         assert!(p.calls.is_empty(), "no mutations");
     }
 
@@ -1918,7 +2237,10 @@ mod tests {
                 state: &st,
                 inspector: &insp,
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
-                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                lockout: LockoutContext {
+                    rescue_present: true,
+                    ..Default::default()
+                },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -1950,7 +2272,10 @@ mod tests {
                 state: &st,
                 inspector: &insp,
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
-                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                lockout: LockoutContext {
+                    rescue_present: true,
+                    ..Default::default()
+                },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -1985,7 +2310,10 @@ mod tests {
                 state: &st,
                 inspector: &insp,
                 trust: managed_opts(anchor, persist.path().to_path_buf()),
-                lockout: LockoutContext { rescue_present: true, ..Default::default() },
+                lockout: LockoutContext {
+                    rescue_present: true,
+                    ..Default::default()
+                },
                 sudoers_dir: PathBuf::from("/etc/sudoers.d"),
                 session_source: &crate::sessions::FakeSessionSource::empty(),
                 sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -2033,14 +2361,20 @@ mod tests {
         st: &'a FakeState,
         insp: &'a FakeInspector,
         sessions: &'a dyn crate::sessions::SessionSource,
-    ) -> ApplyInputs<'a> {
+    ) -> ApplyInputs<'a, FakeCatalog> {
         ApplyInputs {
             declaration: d,
             declaration_bytes: b"",
             state: st,
             inspector: insp,
-            trust: TrustOptions { trust_fs: true, ..Default::default() },
-            lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            trust: TrustOptions {
+                trust_fs: true,
+                ..Default::default()
+            },
+            lockout: LockoutContext {
+                rescue_present: true,
+                ..Default::default()
+            },
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             session_source: sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -2056,7 +2390,7 @@ mod tests {
     fn managed_group(name: &str, gid: u32, v: u32) -> ManagedGroup {
         ManagedGroup {
             name: name.to_owned(),
-            gid,
+            gid: Some(gid),
             provenance: crate::model::Provenance::Created,
             members_added: Vec::new(),
             sudo_commands: Vec::new(),
@@ -2066,10 +2400,7 @@ mod tests {
         }
     }
 
-    fn fake_state_with_groups(
-        accts: Vec<ManagedAccount>,
-        groups: Vec<ManagedGroup>,
-    ) -> FakeState {
+    fn fake_state_with_groups(accts: Vec<ManagedAccount>, groups: Vec<ManagedGroup>) -> FakeState {
         FakeState {
             accounts: accts.into_iter().map(|a| (a.name.clone(), a)).collect(),
             groups: groups.into_iter().map(|g| (g.name.clone(), g)).collect(),
@@ -2084,15 +2415,87 @@ mod tests {
         let st = FakeState::default();
         let insp = FakeInspector::default();
         let mut p = FakeProvisioner::default();
-        let report = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap();
-        let cg = p.calls.iter().position(|c| c == "create_group:atm-operators").expect("group create");
-        let ca = p.calls.iter().position(|c| c == "create:oper").expect("account create");
-        assert!(cg < ca, "group create must precede account create: {:?}", p.calls);
+        let report = run(
+            trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()),
+            &mut p,
+        )
+        .unwrap();
+        let cg = p
+            .calls
+            .iter()
+            .position(|c| c == "create_group:atm-operators")
+            .expect("group create");
+        let ca = p
+            .calls
+            .iter()
+            .position(|c| c == "create:oper")
+            .expect("account create");
+        assert!(
+            cg < ca,
+            "group create must precede account create: {:?}",
+            p.calls
+        );
         // Registry records the created group with its pinned GID.
         assert_eq!(report.managed_group_records.len(), 1);
         assert_eq!(report.managed_group_records[0].name, "atm-operators");
-        assert_eq!(report.managed_group_records[0].gid, 8010);
+        assert_eq!(report.managed_group_records[0].gid, Some(8010));
         assert_eq!(report.managed_group_records[0].from_version, 5);
+    }
+
+    #[test]
+    fn unpinned_created_group_records_provisioner_readback_gid() {
+        // An unpinned group is created with an OS-assigned GID. The registry must
+        // record the GID read back THROUGH THE PROVISIONER (the seam that created
+        // it), not 0 and not a value from the pre-mutation snapshot inspector
+        // (which could not see a group that did not exist yet).
+        let (_t, d) = decl_with_group("oper", 9010, "atm-operators", None);
+        let st = FakeState::default();
+        // Snapshot inspector has NO group — only the post-create provisioner
+        // read-back knows the assigned GID.
+        let insp = FakeInspector::default();
+        let mut p = FakeProvisioner::default();
+        p.group_gids.insert("atm-operators".into(), 8042);
+        let report = run(
+            trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()),
+            &mut p,
+        )
+        .unwrap();
+        let g = report
+            .managed_group_records
+            .iter()
+            .find(|g| g.name == "atm-operators")
+            .expect("created group recorded");
+        assert_eq!(
+            g.gid,
+            Some(8042),
+            "registry must record the provisioner read-back GID"
+        );
+    }
+
+    #[test]
+    fn unpinned_created_group_records_none_gid_when_readback_fails() {
+        // If neither the provisioner read-back nor the snapshot inspector can
+        // resolve the GID, the record carries `None` ("GID unknown") rather than
+        // overloading the root group's GID `0` — and never panics. A later doctor
+        // run skips the drift check for an unknown GID instead of false-flagging.
+        let (_t, d) = decl_with_group("oper", 9010, "atm-operators", None);
+        let st = FakeState::default();
+        let insp = FakeInspector::default(); // no group facts
+        let mut p = FakeProvisioner::default(); // no group_gids entry → read-back None
+        let report = run(
+            trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()),
+            &mut p,
+        )
+        .unwrap();
+        let g = report
+            .managed_group_records
+            .iter()
+            .find(|g| g.name == "atm-operators")
+            .expect("created group recorded");
+        assert_eq!(
+            g.gid, None,
+            "unknown GID recorded as None, no panic, no 0 sentinel"
+        );
     }
 
     #[test]
@@ -2111,14 +2514,34 @@ mod tests {
         );
         // Group still live (so drift check passes) at its recorded gid.
         let mut insp = FakeInspector::default();
-        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        insp.groups
+            .insert("atm-operators".into(), GroupFacts { gid: 8010 });
         let mut p = FakeProvisioner::default();
-        let report = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap();
-        let da = p.calls.iter().position(|c| c == "delete:oper").expect("account delete");
-        let dg = p.calls.iter().position(|c| c == "delete_group:atm-operators").expect("group delete");
-        assert!(da < dg, "account delete must precede group delete: {:?}", p.calls);
+        let report = run(
+            trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()),
+            &mut p,
+        )
+        .unwrap();
+        let da = p
+            .calls
+            .iter()
+            .position(|c| c == "delete:oper")
+            .expect("account delete");
+        let dg = p
+            .calls
+            .iter()
+            .position(|c| c == "delete_group:atm-operators")
+            .expect("group delete");
+        assert!(
+            da < dg,
+            "account delete must precede group delete: {:?}",
+            p.calls
+        );
         // The orphan group is dropped from the registry.
-        assert!(report.managed_group_records.is_empty(), "orphan group must leave the registry");
+        assert!(
+            report.managed_group_records.is_empty(),
+            "orphan group must leave the registry"
+        );
     }
 
     #[test]
@@ -2130,10 +2553,20 @@ mod tests {
         let mut insp = FakeInspector::default();
         insp.groups.insert("other".into(), GroupFacts { gid: 8010 });
         let mut p = FakeProvisioner::default();
-        let err = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap_err();
-        assert!(matches!(err, ApplyError::GroupPlan(_)), "expected GroupPlan error, got {err:?}");
+        let err = run(
+            trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()),
+            &mut p,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::GroupPlan(_)),
+            "expected GroupPlan error, got {err:?}"
+        );
         assert!(!p.snapshotted, "pin conflict must abort before snapshot");
-        assert!(p.calls.is_empty(), "pin conflict must abort before any mutation");
+        assert!(
+            p.calls.is_empty(),
+            "pin conflict must abort before any mutation"
+        );
     }
 
     #[test]
@@ -2145,16 +2578,25 @@ mod tests {
         let mut insp = FakeInspector::default();
         insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
         let mut p = FakeProvisioner::default();
-        let report = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap();
+        let report = run(
+            trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()),
+            &mut p,
+        )
+        .unwrap();
         assert!(
             !p.calls.iter().any(|c| c.starts_with("create_group")),
-            "foreign group must not be created: {:?}", p.calls
+            "foreign group must not be created: {:?}",
+            p.calls
         );
         assert!(
             !p.calls.iter().any(|c| c.starts_with("delete_group")),
-            "foreign group must not be deleted: {:?}", p.calls
+            "foreign group must not be deleted: {:?}",
+            p.calls
         );
-        assert!(report.managed_group_records.is_empty(), "foreign group must not enter the registry");
+        assert!(
+            report.managed_group_records.is_empty(),
+            "foreign group must not enter the registry"
+        );
     }
 
     #[test]
@@ -2163,9 +2605,15 @@ mod tests {
         let st = FakeState::default();
         let insp = FakeInspector::default();
         let mut p = FakeProvisioner::failing("create_group");
-        let err = run(trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()), &mut p).unwrap_err();
+        let err = run(
+            trust_fs_inputs(&d, &st, &insp, &crate::sessions::FakeSessionSource::empty()),
+            &mut p,
+        )
+        .unwrap_err();
         match err {
-            ApplyError::Phase { phase, rollback, .. } => {
+            ApplyError::Phase {
+                phase, rollback, ..
+            } => {
                 assert_eq!(phase, "create-group");
                 assert_eq!(rollback, RollbackOutcome::Restored);
             }
@@ -2199,14 +2647,20 @@ mod tests {
         st: &'a FakeState,
         insp: &'a FakeInspector,
         sessions: &'a dyn SessionSource,
-    ) -> ApplyInputs<'a> {
+    ) -> ApplyInputs<'a, FakeCatalog> {
         ApplyInputs {
             declaration: d,
             declaration_bytes: b"",
             state: st,
             inspector: insp,
-            trust: TrustOptions { trust_fs: true, ..Default::default() },
-            lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            trust: TrustOptions {
+                trust_fs: true,
+                ..Default::default()
+            },
+            lockout: LockoutContext {
+                rescue_present: true,
+                ..Default::default()
+            },
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             session_source: sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -2238,15 +2692,62 @@ mod tests {
         let mut p = FakeProvisioner::default();
         let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
 
-        assert!(!p.calls.iter().any(|c| c == "delete:oper"), "userdel must be deferred: {:?}", p.calls);
+        assert!(
+            !p.calls.iter().any(|c| c == "delete:oper"),
+            "userdel must be deferred: {:?}",
+            p.calls
+        );
         assert_eq!(report.mutations, 0, "a deferred delete is not a mutation");
         // Account retained in the managed set with its PRIOR from_version.
-        let oper = report.managed.iter().find(|m| m.name == "oper").expect("oper retained in managed");
-        assert_eq!(oper.from_version, 4, "deferred account keeps its prior from_version");
+        let oper = report
+            .managed
+            .iter()
+            .find(|m| m.name == "oper")
+            .expect("oper retained in managed");
+        assert_eq!(
+            oper.from_version, 4,
+            "deferred account keeps its prior from_version"
+        );
         // Reported as a deferred delete (name + uid).
         assert_eq!(report.deferred_deletes.len(), 1);
         assert_eq!(report.deferred_deletes[0].name, "oper");
         assert_eq!(report.deferred_deletes[0].uid, 9010);
+    }
+
+    #[test]
+    fn deferred_account_with_grants_emits_retained_grant_warning() {
+        // A deferred account keeps its full prior privilege until its session ends.
+        // When that record carries grants the declaration revoked, apply must emit
+        // a structured `warning:` line naming the account and the retained grants,
+        // so the retention is visible rather than silent.
+        let (_t, d) = empty_decl();
+        let mut rec = managed("oper", 9010, &["wheel"], 4);
+        rec.sudo_commands = vec!["/usr/sbin/ip".to_owned()];
+        rec.file_grants = vec![ManagedFileGrant {
+            path: "/etc/ssh".to_owned(),
+            access: crate::catalog::Access::Rw,
+            recursive: true,
+        }];
+        let st = fake_state(vec![rec]);
+        let insp = FakeInspector::default();
+        let sessions = live_by_name("oper");
+        let mut p = FakeProvisioner::default();
+        let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
+
+        let warn = report
+            .log
+            .iter()
+            .find(|l| l.starts_with("warning:") && l.contains("retains revoked grants"))
+            .expect("retained-grant warning line");
+        assert!(warn.contains("oper"), "warning names the account: {warn}");
+        assert!(
+            warn.contains("/usr/sbin/ip"),
+            "warning lists retained sudo command: {warn}"
+        );
+        assert!(
+            warn.contains("/etc/ssh"),
+            "warning lists retained file grant: {warn}"
+        );
     }
 
     #[test]
@@ -2260,10 +2761,16 @@ mod tests {
         let mut p = FakeProvisioner::default();
         let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
 
-        assert!(!p.calls.iter().any(|c| c == "delete:oper"), "uid match must defer userdel");
+        assert!(
+            !p.calls.iter().any(|c| c == "delete:oper"),
+            "uid match must defer userdel"
+        );
         assert_eq!(report.deferred_deletes.len(), 1);
         assert_eq!(report.deferred_deletes[0].uid, 9010);
-        assert!(report.managed.iter().any(|m| m.name == "oper"), "uid-deferred account retained");
+        assert!(
+            report.managed.iter().any(|m| m.name == "oper"),
+            "uid-deferred account retained"
+        );
     }
 
     #[test]
@@ -2276,17 +2783,26 @@ mod tests {
         let mut p = FakeProvisioner::default();
         let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
 
-        assert!(p.calls.iter().any(|c| c == "delete:oper"), "no session → userdel runs");
+        assert!(
+            p.calls.iter().any(|c| c == "delete:oper"),
+            "no session → userdel runs"
+        );
         assert_eq!(report.mutations, 1);
         assert!(report.deferred_deletes.is_empty());
-        assert!(!report.managed.iter().any(|m| m.name == "oper"), "deleted account leaves the registry");
+        assert!(
+            !report.managed.iter().any(|m| m.name == "oper"),
+            "deleted account leaves the registry"
+        );
     }
 
     #[test]
     fn empty_live_set_executes_all_deletes() {
         // Two managed accounts, both dropped, empty live set → both delete.
         let (_t, d) = empty_decl();
-        let st = fake_state(vec![managed("oper", 9010, &[], 4), managed("serv", 9011, &[], 4)]);
+        let st = fake_state(vec![
+            managed("oper", 9010, &[], 4),
+            managed("serv", 9011, &[], 4),
+        ]);
         let insp = FakeInspector::default();
         let sessions = FakeSessionSource::empty();
         let mut p = FakeProvisioner::default();
@@ -2296,7 +2812,10 @@ mod tests {
         assert!(p.calls.iter().any(|c| c == "delete:serv"));
         assert_eq!(report.mutations, 2);
         assert!(report.deferred_deletes.is_empty());
-        assert!(report.managed.is_empty(), "both accounts removed from the registry");
+        assert!(
+            report.managed.is_empty(),
+            "both accounts removed from the registry"
+        );
     }
 
     #[test]
@@ -2312,11 +2831,24 @@ mod tests {
         let mut p = FakeProvisioner::default();
         let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
 
-        assert!(!p.snapshotted, "no snapshot when the only change was deferred");
-        assert!(p.calls.is_empty(), "no phase calls when the only change was deferred");
+        assert!(
+            !p.snapshotted,
+            "no snapshot when the only change was deferred"
+        );
+        assert!(
+            p.calls.is_empty(),
+            "no phase calls when the only change was deferred"
+        );
         assert_eq!(report.mutations, 0);
-        assert!(report.registry_written, "retention of the deferred account must be persisted");
-        let oper = report.managed.iter().find(|m| m.name == "oper").expect("oper retained");
+        assert!(
+            report.registry_written,
+            "retention of the deferred account must be persisted"
+        );
+        let oper = report
+            .managed
+            .iter()
+            .find(|m| m.name == "oper")
+            .expect("oper retained");
         assert_eq!(oper.from_version, 4);
         assert_eq!(report.deferred_deletes.len(), 1);
     }
@@ -2333,7 +2865,10 @@ mod tests {
         let mut p = FakeProvisioner::default();
         let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
 
-        assert!(p.calls.iter().any(|c| c == "create:oper"), "create runs despite registry read error");
+        assert!(
+            p.calls.iter().any(|c| c == "create:oper"),
+            "create runs despite registry read error"
+        );
         assert_eq!(report.mutations, 1);
         assert!(report.deferred_deletes.is_empty());
     }
@@ -2349,7 +2884,10 @@ mod tests {
         let mut p = FakeProvisioner::default();
         let err = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap_err();
 
-        assert!(matches!(err, ApplyError::SessionRegistry(_)), "expected fail-closed, got {err:?}");
+        assert!(
+            matches!(err, ApplyError::SessionRegistry(_)),
+            "expected fail-closed, got {err:?}"
+        );
         assert!(!p.snapshotted, "fail-closed must precede snapshot");
         assert!(p.calls.is_empty(), "fail-closed must precede any mutation");
     }
@@ -2370,7 +2908,10 @@ mod tests {
             declaration_bytes: b"",
             state: &st,
             inspector: &insp,
-            trust: TrustOptions { trust_fs: true, ..Default::default() },
+            trust: TrustOptions {
+                trust_fs: true,
+                ..Default::default()
+            },
             lockout: LockoutContext::default(), // no rescue, no risk-ack
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             session_source: &sessions,
@@ -2379,8 +2920,15 @@ mod tests {
             file_access: Box::leak(Box::new(dir_backend())),
         };
         let report = run(inputs, &mut p).unwrap();
-        assert_eq!(report.deferred_deletes.len(), 1, "delete deferred before the gate");
-        assert!(report.managed.iter().any(|m| m.name == "oper"), "account kept");
+        assert_eq!(
+            report.deferred_deletes.len(),
+            1,
+            "delete deferred before the gate"
+        );
+        assert!(
+            report.managed.iter().any(|m| m.name == "oper"),
+            "account kept"
+        );
     }
 
     #[test]
@@ -2396,7 +2944,8 @@ mod tests {
         );
         // Group live at its recorded gid so the drift check passes.
         let mut insp = FakeInspector::default();
-        insp.groups.insert("atm-operators".into(), GroupFacts { gid: 8010 });
+        insp.groups
+            .insert("atm-operators".into(), GroupFacts { gid: 8010 });
         let sessions = live_by_name("oper");
         let mut p = FakeProvisioner::default();
         let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
@@ -2406,14 +2955,17 @@ mod tests {
             "deferred account's group must not be deleted: {:?}",
             p.calls
         );
-        assert!(!p.calls.iter().any(|c| c == "delete:oper"), "userdel deferred");
+        assert!(
+            !p.calls.iter().any(|c| c == "delete:oper"),
+            "userdel deferred"
+        );
         // Group retained in the registry with its PRIOR gid + from_version.
         let g = report
             .managed_group_records
             .iter()
             .find(|g| g.name == "atm-operators")
             .expect("group retained in registry");
-        assert_eq!(g.gid, 8010, "retained group keeps prior GID");
+        assert_eq!(g.gid, Some(8010), "retained group keeps prior GID");
         assert_eq!(g.from_version, 4, "retained group keeps prior from_version");
     }
 
@@ -2440,7 +2992,10 @@ mod tests {
             p.calls
         );
         assert!(
-            report.managed_group_records.iter().any(|g| g.name == "oper"),
+            report
+                .managed_group_records
+                .iter()
+                .any(|g| g.name == "oper"),
             "primary group retained"
         );
     }
@@ -2466,12 +3021,24 @@ mod tests {
         let report = run(reconcile_inputs(&d, &st, &insp, &sessions), &mut p).unwrap();
 
         // oper deferred, ga retained; serv deleted, gb deleted.
-        assert!(!p.calls.iter().any(|c| c == "delete:oper"), "oper userdel deferred");
-        assert!(!p.calls.iter().any(|c| c == "delete_group:ga"), "ga retained");
+        assert!(
+            !p.calls.iter().any(|c| c == "delete:oper"),
+            "oper userdel deferred"
+        );
+        assert!(
+            !p.calls.iter().any(|c| c == "delete_group:ga"),
+            "ga retained"
+        );
         assert!(p.calls.iter().any(|c| c == "delete:serv"), "serv deleted");
         assert!(p.calls.iter().any(|c| c == "delete_group:gb"), "gb deleted");
-        assert!(report.managed_group_records.iter().any(|g| g.name == "ga"), "ga retained in registry");
-        assert!(!report.managed_group_records.iter().any(|g| g.name == "gb"), "gb dropped from registry");
+        assert!(
+            report.managed_group_records.iter().any(|g| g.name == "ga"),
+            "ga retained in registry"
+        );
+        assert!(
+            !report.managed_group_records.iter().any(|g| g.name == "gb"),
+            "gb dropped from registry"
+        );
     }
 
     // ---- file-access phase ----
@@ -2482,7 +3049,11 @@ mod tests {
     /// A catalog (leaked, so the borrowed `CompileInputs` is `'static`) with one
     /// permission `fs-edit` carrying a single `[[file]]` grant of the given path/
     /// access/recursive, on the `linux` base layer.
-    fn compile_with_file_perm(path: &str, access: Access, recursive: bool) -> CompileInputs<'static> {
+    fn compile_with_file_perm(
+        path: &str,
+        access: Access,
+        recursive: bool,
+    ) -> CompileInputs<'static, FakeCatalog> {
         let cat = FakeCatalog::new().with(
             "linux",
             PermissionDef {
@@ -2534,16 +3105,22 @@ mod tests {
         st: &'a FakeState,
         insp: &'a FakeInspector,
         sessions: &'a dyn SessionSource,
-        compile: CompileInputs<'a>,
+        compile: CompileInputs<'a, FakeCatalog>,
         file_access: &'a mut dyn FileAccessBackend,
-    ) -> ApplyInputs<'a> {
+    ) -> ApplyInputs<'a, FakeCatalog> {
         ApplyInputs {
             declaration: d,
             declaration_bytes: b"",
             state: st,
             inspector: insp,
-            trust: TrustOptions { trust_fs: true, ..Default::default() },
-            lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            trust: TrustOptions {
+                trust_fs: true,
+                ..Default::default()
+            },
+            lockout: LockoutContext {
+                rescue_present: true,
+                ..Default::default()
+            },
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             session_source: sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -2564,7 +3141,11 @@ mod tests {
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
         let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
-        run(fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+        run(
+            fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
         // snapshot recorded with the grant path …
         let snap_idx = fa
@@ -2576,11 +3157,17 @@ mod tests {
         let mat_idx = fa
             .calls
             .iter()
-            .position(|c| matches!(c, FakeCall::Materialize { principal, paths }
+            .position(|c| {
+                matches!(c, FakeCall::Materialize { principal, paths }
                 if principal == &crate::fileaccess::Principal::User("oper".to_owned())
-                    && paths == &vec!["/etc/ssh".to_owned()]))
+                    && paths == &vec!["/etc/ssh".to_owned()])
+            })
             .expect("materialize of the grant");
-        assert!(snap_idx < mat_idx, "snapshot must precede materialize: {:?}", fa.calls);
+        assert!(
+            snap_idx < mat_idx,
+            "snapshot must precede materialize: {:?}",
+            fa.calls
+        );
     }
 
     #[test]
@@ -2601,17 +3188,25 @@ mod tests {
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
         let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
-        run(fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+        run(
+            fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
         assert!(
-            fa.calls.iter().any(|c| matches!(c, FakeCall::Revoke { principal, path }
+            fa.calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::Revoke { principal, path }
                 if principal == &crate::fileaccess::Principal::User("oper".to_owned())
                     && path == "/etc/old")),
             "the dropped grant must be revoked: {:?}",
             fa.calls
         );
         assert!(
-            fa.calls.iter().any(|c| matches!(c, FakeCall::Materialize { paths, .. }
+            fa.calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::Materialize { paths, .. }
                 if paths == &vec!["/etc/ssh".to_owned()])),
             "the new grant must be materialized: {:?}",
             fa.calls
@@ -2640,7 +3235,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            fa.calls.iter().any(|c| matches!(c, FakeCall::Revoke { principal, path }
+            fa.calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::Revoke { principal, path }
                 if principal == &crate::fileaccess::Principal::User("oper".to_owned())
                     && path == "/etc/ssh")),
             "the deleted account's grant must be revoked: {:?}",
@@ -2660,16 +3257,28 @@ mod tests {
         let mut fa = dir_backend(); // dir-only capability
         let mut p = FakeProvisioner::default();
         let compile = compile_with_file_perm("/etc/ssh/sshd_config", Access::Rw, false);
-        let err = run(fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap_err();
+        let err = run(
+            fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ApplyError::FileAccess(crate::fileaccess::FileAccessError::Unsupported { ref shape, .. }) if *shape == Shape::File),
             "per-file grant without a capable backend must fail closed: {err:?}"
         );
         // No provisioner mutation and no snapshot of either seam.
-        assert!(!p.snapshotted, "gating must precede the provisioner snapshot");
-        assert!(p.calls.is_empty(), "gating must precede any provisioner mutation");
         assert!(
-            !fa.calls.iter().any(|c| matches!(c, FakeCall::Snapshot { .. } | FakeCall::Materialize { .. })),
+            !p.snapshotted,
+            "gating must precede the provisioner snapshot"
+        );
+        assert!(
+            p.calls.is_empty(),
+            "gating must precede any provisioner mutation"
+        );
+        assert!(
+            !fa.calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::Snapshot { .. } | FakeCall::Materialize { .. })),
             "gating must precede any backend snapshot/materialize: {:?}",
             fa.calls
         );
@@ -2687,8 +3296,21 @@ mod tests {
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::failing("create");
         let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
-        let err = run(fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap_err();
-        assert!(matches!(err, ApplyError::Phase { phase: "create", .. }), "got {err:?}");
+        let err = run(
+            fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApplyError::Phase {
+                    phase: "create",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
         assert!(p.restored, "provisioner must restore");
         assert!(
             fa.calls.iter().any(|c| matches!(c, FakeCall::Restore)),
@@ -2702,7 +3324,10 @@ mod tests {
     /// A leaked catalog defining one permission `grp-perm` on `linux` carrying a
     /// `%group`-projectable sudo command + an optional dir file grant. Returned as
     /// `'static` so the borrowed `CompileInputs` drops into an `ApplyInputs`.
-    fn compile_with_group_perm(sudo: &[&str], file: Option<&str>) -> CompileInputs<'static> {
+    fn compile_with_group_perm(
+        sudo: &[&str],
+        file: Option<&str>,
+    ) -> CompileInputs<'static, FakeCatalog> {
         let files = file
             .map(|p| {
                 vec![FileGrant {
@@ -2772,7 +3397,9 @@ mod tests {
             text.push_str("gid = 8050\n");
         }
         text.push_str(&format!("members = [{members_lit}]\n"));
-        text.push_str(&format!("[[role_group]]\nrole = \"{role}\"\ngroup = \"{group}\"\n"));
+        text.push_str(&format!(
+            "[[role_group]]\nrole = \"{role}\"\ngroup = \"{group}\"\n"
+        ));
         let d = Declaration::parse(&text).unwrap();
         (tmp, d)
     }
@@ -2782,16 +3409,22 @@ mod tests {
         st: &'a FakeState,
         insp: &'a FakeInspector,
         sessions: &'a dyn SessionSource,
-        compile: CompileInputs<'a>,
+        compile: CompileInputs<'a, FakeCatalog>,
         file_access: &'a mut dyn FileAccessBackend,
-    ) -> ApplyInputs<'a> {
+    ) -> ApplyInputs<'a, FakeCatalog> {
         ApplyInputs {
             declaration: d,
             declaration_bytes: b"",
             state: st,
             inspector: insp,
-            trust: TrustOptions { trust_fs: true, ..Default::default() },
-            lockout: LockoutContext { rescue_present: true, ..Default::default() },
+            trust: TrustOptions {
+                trust_fs: true,
+                ..Default::default()
+            },
+            lockout: LockoutContext {
+                rescue_present: true,
+                ..Default::default()
+            },
             sudoers_dir: PathBuf::from("/etc/sudoers.d"),
             session_source: sessions,
             sessions_file: PathBuf::from("/run/tessera/sessions.json"),
@@ -2812,26 +3445,49 @@ mod tests {
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
         let compile = compile_with_group_perm(&["/usr/sbin/ip"], Some("/etc/net"));
-        let report = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+        let report = run(
+            ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
         // Entity create (membership path) then %group sudoers (resolved path).
-        assert!(p.calls.iter().any(|c| c == "create_group:ops"), "groupadd: {:?}", p.calls);
-        assert!(p.calls.iter().any(|c| c == "apply_group_sudoers:ops"), "%group sudoers: {:?}", p.calls);
-        assert!(p.calls.iter().any(|c| c == "add_member:ops:netops"), "gpasswd add: {:?}", p.calls);
+        assert!(
+            p.calls.iter().any(|c| c == "create_group:ops"),
+            "groupadd: {:?}",
+            p.calls
+        );
+        assert!(
+            p.calls.iter().any(|c| c == "apply_group_sudoers:ops"),
+            "%group sudoers: {:?}",
+            p.calls
+        );
+        assert!(
+            p.calls.iter().any(|c| c == "add_member:ops:netops"),
+            "gpasswd add: {:?}",
+            p.calls
+        );
         // g:group ACL materialized.
         assert!(
-            fa.calls.iter().any(|c| matches!(c, FakeCall::Materialize { principal, paths }
+            fa.calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::Materialize { principal, paths }
                 if principal == &crate::fileaccess::Principal::Group("ops".to_owned())
                     && paths == &vec!["/etc/net".to_owned()])),
-            "group ACL must materialize: {:?}", fa.calls
+            "group ACL must materialize: {:?}",
+            fa.calls
         );
         // Registry record carries the grants/members/provenance.
-        let g = report.managed_group_records.iter().find(|g| g.name == "ops").expect("ops recorded");
+        let g = report
+            .managed_group_records
+            .iter()
+            .find(|g| g.name == "ops")
+            .expect("ops recorded");
         assert_eq!(g.provenance, crate::model::Provenance::Created);
         assert_eq!(g.sudo_commands, vec!["/usr/sbin/ip"]);
         assert_eq!(g.members_added, vec!["netops"]);
         assert_eq!(g.file_grants.len(), 1);
-        assert_eq!(g.gid, 8050);
+        assert_eq!(g.gid, Some(8050));
         assert!(g.adopt_baseline.is_none());
     }
 
@@ -2844,23 +3500,48 @@ mod tests {
         let st = FakeState::default();
         let mut insp = FakeInspector::default();
         insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
-        insp.group_members.insert("wheel".into(), vec!["root".into(), "admin".into()]);
+        insp.group_members
+            .insert("wheel".into(), vec!["root".into(), "admin".into()]);
         let sessions = FakeSessionSource::empty();
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
         let compile = compile_with_group_perm(&["/usr/sbin/ip"], None);
-        let report = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+        let report = run(
+            ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
-        assert!(!p.calls.iter().any(|c| c.starts_with("create_group")), "adopt must not groupadd: {:?}", p.calls);
-        assert!(p.calls.iter().any(|c| c == "apply_group_sudoers:wheel"), "grants applied: {:?}", p.calls);
-        assert!(p.calls.iter().any(|c| c == "add_member:wheel:netops"), "our member added: {:?}", p.calls);
-        let g = report.managed_group_records.iter().find(|g| g.name == "wheel").expect("wheel recorded");
+        assert!(
+            !p.calls.iter().any(|c| c.starts_with("create_group")),
+            "adopt must not groupadd: {:?}",
+            p.calls
+        );
+        assert!(
+            p.calls.iter().any(|c| c == "apply_group_sudoers:wheel"),
+            "grants applied: {:?}",
+            p.calls
+        );
+        assert!(
+            p.calls.iter().any(|c| c == "add_member:wheel:netops"),
+            "our member added: {:?}",
+            p.calls
+        );
+        let g = report
+            .managed_group_records
+            .iter()
+            .find(|g| g.name == "wheel")
+            .expect("wheel recorded");
         assert_eq!(g.provenance, crate::model::Provenance::Adopted);
         let baseline = g.adopt_baseline.as_ref().expect("adopt baseline recorded");
-        assert_eq!(baseline.gid, 10, "baseline gid read from inspector");
-        assert_eq!(baseline.members, vec!["root", "admin"], "baseline members read from inspector");
+        assert_eq!(baseline.gid, Some(10), "baseline gid read from inspector");
+        assert_eq!(
+            baseline.members,
+            vec!["root", "admin"],
+            "baseline members read from inspector"
+        );
         // Adopted group records the observed GID, not a pin.
-        assert_eq!(g.gid, 10);
+        assert_eq!(g.gid, Some(10));
     }
 
     #[test]
@@ -2872,7 +3553,7 @@ mod tests {
         let (_t, d) = empty_decl();
         let prior_group = ManagedGroup {
             name: "wheel".to_owned(),
-            gid: 10,
+            gid: Some(10),
             provenance: crate::model::Provenance::Adopted,
             members_added: vec!["netops".to_owned()],
             sudo_commands: vec!["/usr/sbin/ip".to_owned()],
@@ -2882,7 +3563,7 @@ mod tests {
                 recursive: true,
             }],
             adopt_baseline: Some(crate::state::GroupBaseline {
-                gid: 10,
+                gid: Some(10),
                 members: vec!["root".to_owned()],
             }),
             from_version: 4,
@@ -2893,11 +3574,27 @@ mod tests {
         let sessions = FakeSessionSource::empty();
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
-        let report = run(ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa), &mut p).unwrap();
+        let report = run(
+            ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
-        assert!(p.calls.iter().any(|c| c == "remove_group_sudoers:wheel"), "%group sudoers stripped: {:?}", p.calls);
-        assert!(p.calls.iter().any(|c| c == "del_member:wheel:netops"), "our member removed: {:?}", p.calls);
-        assert!(!p.calls.iter().any(|c| c.starts_with("delete_group")), "release must NOT groupdel: {:?}", p.calls);
+        assert!(
+            p.calls.iter().any(|c| c == "remove_group_sudoers:wheel"),
+            "%group sudoers stripped: {:?}",
+            p.calls
+        );
+        assert!(
+            p.calls.iter().any(|c| c == "del_member:wheel:netops"),
+            "our member removed: {:?}",
+            p.calls
+        );
+        assert!(
+            !p.calls.iter().any(|c| c.starts_with("delete_group")),
+            "release must NOT groupdel: {:?}",
+            p.calls
+        );
         assert!(
             fa.calls.iter().any(|c| matches!(c, FakeCall::Revoke { principal, path }
                 if principal == &crate::fileaccess::Principal::Group("wheel".to_owned()) && path == "/etc/net")),
@@ -2905,8 +3602,18 @@ mod tests {
         );
         // The released group leaves the registry; its live group + baseline
         // members (root) are untouched (no del_member for root).
-        assert!(!report.managed_group_records.iter().any(|g| g.name == "wheel"), "released group dropped from registry");
-        assert!(!p.calls.iter().any(|c| c == "del_member:wheel:root"), "baseline member must be untouched: {:?}", p.calls);
+        assert!(
+            !report
+                .managed_group_records
+                .iter()
+                .any(|g| g.name == "wheel"),
+            "released group dropped from registry"
+        );
+        assert!(
+            !p.calls.iter().any(|c| c == "del_member:wheel:root"),
+            "baseline member must be untouched: {:?}",
+            p.calls
+        );
     }
 
     #[test]
@@ -2916,7 +3623,7 @@ mod tests {
         let (_t, d) = empty_decl();
         let prior_group = ManagedGroup {
             name: "ops".to_owned(),
-            gid: 8050,
+            gid: Some(8050),
             provenance: crate::model::Provenance::Created,
             members_added: vec!["netops".to_owned()],
             sudo_commands: vec!["/usr/sbin/ip".to_owned()],
@@ -2934,18 +3641,41 @@ mod tests {
         let sessions = FakeSessionSource::empty();
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
-        let report = run(ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa), &mut p).unwrap();
+        let report = run(
+            ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
-        let rm_sudo = p.calls.iter().position(|c| c == "remove_group_sudoers:ops").expect("grant teardown");
-        let groupdel = p.calls.iter().position(|c| c == "delete_group:ops").expect("entity groupdel");
-        assert!(rm_sudo < groupdel, "grant teardown must precede groupdel: {:?}", p.calls);
-        assert!(p.calls.iter().any(|c| c == "del_member:ops:netops"), "our member removed: {:?}", p.calls);
+        let rm_sudo = p
+            .calls
+            .iter()
+            .position(|c| c == "remove_group_sudoers:ops")
+            .expect("grant teardown");
+        let groupdel = p
+            .calls
+            .iter()
+            .position(|c| c == "delete_group:ops")
+            .expect("entity groupdel");
+        assert!(
+            rm_sudo < groupdel,
+            "grant teardown must precede groupdel: {:?}",
+            p.calls
+        );
+        assert!(
+            p.calls.iter().any(|c| c == "del_member:ops:netops"),
+            "our member removed: {:?}",
+            p.calls
+        );
         assert!(
             fa.calls.iter().any(|c| matches!(c, FakeCall::Revoke { principal, path }
                 if principal == &crate::fileaccess::Principal::Group("ops".to_owned()) && path == "/etc/net")),
             "group ACL revoked before groupdel: {:?}", fa.calls
         );
-        assert!(!report.managed_group_records.iter().any(|g| g.name == "ops"), "deleted group dropped from registry");
+        assert!(
+            !report.managed_group_records.iter().any(|g| g.name == "ops"),
+            "deleted group dropped from registry"
+        );
     }
 
     #[test]
@@ -2956,18 +3686,26 @@ mod tests {
         let (_t, d) = empty_decl();
         let mut prior_group = managed_group("wheel", 10, 4);
         prior_group.provenance = crate::model::Provenance::Adopted;
-        prior_group.adopt_baseline = Some(crate::state::GroupBaseline { gid: 10, members: vec![] });
+        prior_group.adopt_baseline = Some(crate::state::GroupBaseline {
+            gid: Some(10),
+            members: vec![],
+        });
         let st = fake_state_with_groups(vec![], vec![prior_group]);
         let mut insp = FakeInspector::default();
         insp.groups.insert("wheel".into(), GroupFacts { gid: 10 });
         let sessions = FakeSessionSource::empty();
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
-        run(ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa), &mut p).unwrap();
+        run(
+            ag_inputs(&d, &st, &insp, &sessions, empty_compile(), &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
         assert!(
             !p.calls.iter().any(|c| c.starts_with("delete_group")),
-            "adopted group must never be groupdel'd on teardown: {:?}", p.calls
+            "adopted group must never be groupdel'd on teardown: {:?}",
+            p.calls
         );
     }
 
@@ -2981,7 +3719,7 @@ mod tests {
         let (_t, d) = decl_group_grant("netops", "ops", false, &["b"], &[("netops", 9010)]);
         let prior_group = ManagedGroup {
             name: "ops".to_owned(),
-            gid: 8050,
+            gid: Some(8050),
             provenance: crate::model::Provenance::Created,
             members_added: vec!["a".to_owned()],
             sudo_commands: vec!["/usr/sbin/ip".to_owned()],
@@ -2996,12 +3734,32 @@ mod tests {
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
         let compile = compile_with_group_perm(&["/usr/sbin/ip"], None);
-        let report = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+        let report = run(
+            ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
-        assert!(p.calls.iter().any(|c| c == "add_member:ops:b"), "new member added: {:?}", p.calls);
-        assert!(p.calls.iter().any(|c| c == "del_member:ops:a"), "dropped own member removed: {:?}", p.calls);
-        let g = report.managed_group_records.iter().find(|g| g.name == "ops").unwrap();
-        assert_eq!(g.members_added, vec!["b"], "registry records the new membership");
+        assert!(
+            p.calls.iter().any(|c| c == "add_member:ops:b"),
+            "new member added: {:?}",
+            p.calls
+        );
+        assert!(
+            p.calls.iter().any(|c| c == "del_member:ops:a"),
+            "dropped own member removed: {:?}",
+            p.calls
+        );
+        let g = report
+            .managed_group_records
+            .iter()
+            .find(|g| g.name == "ops")
+            .unwrap();
+        assert_eq!(
+            g.members_added,
+            vec!["b"],
+            "registry records the new membership"
+        );
     }
 
     #[test]
@@ -3015,10 +3773,30 @@ mod tests {
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::failing("apply_group_sudoers");
         let compile = compile_with_group_perm(&["/usr/sbin/ip"], Some("/etc/net"));
-        let err = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap_err();
-        assert!(matches!(err, ApplyError::Phase { phase: "group-sudoers", .. }), "got {err:?}");
-        assert!(p.restored, "provisioner must restore on group-grant failure");
-        assert!(fa.calls.iter().any(|c| matches!(c, FakeCall::Restore)), "file-access restores too: {:?}", fa.calls);
+        let err = run(
+            ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApplyError::Phase {
+                    phase: "group-sudoers",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            p.restored,
+            "provisioner must restore on group-grant failure"
+        );
+        assert!(
+            fa.calls.iter().any(|c| matches!(c, FakeCall::Restore)),
+            "file-access restores too: {:?}",
+            fa.calls
+        );
     }
 
     #[test]
@@ -3031,7 +3809,7 @@ mod tests {
         // Registry already reflects the applied state (group + account in sync).
         let applied_group = ManagedGroup {
             name: "ops".to_owned(),
-            gid: 8050,
+            gid: Some(8050),
             provenance: crate::model::Provenance::Created,
             members_added: vec!["netops".to_owned()],
             sudo_commands: vec!["/usr/sbin/ip".to_owned()],
@@ -3054,10 +3832,22 @@ mod tests {
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
         let compile = compile_with_group_perm(&["/usr/sbin/ip"], None);
-        let report = run(ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa), &mut p).unwrap();
+        let report = run(
+            ag_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
+            &mut p,
+        )
+        .unwrap();
 
-        assert_eq!(report.mutations, 0, "in-sync re-apply is a no-op: {:?}", p.calls);
+        assert_eq!(
+            report.mutations, 0,
+            "in-sync re-apply is a no-op: {:?}",
+            p.calls
+        );
         assert!(!p.snapshotted, "no snapshot on an empty plan");
-        assert!(p.calls.is_empty(), "no group mutations on a synced re-apply: {:?}", p.calls);
+        assert!(
+            p.calls.is_empty(),
+            "no group mutations on a synced re-apply: {:?}",
+            p.calls
+        );
     }
 }

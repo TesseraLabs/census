@@ -37,9 +37,10 @@
 //! silently drop the translator's text, so the inner struct is
 //! `deny_unknown_fields` (fail-closed on structure, tolerant on membership).
 
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use serde::Deserialize;
 
 /// One permission's texts for one locale. Every field is optional because a
 /// translation may be partial (a translator filled `title` but not yet
@@ -101,6 +102,7 @@ pub struct L10nWarning {
 /// [`crate::catalog::CatalogError`] and leave room for future hard cases without
 /// changing the trait signature.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum L10nError {
     /// A locale code is not usable as a path component (e.g. contains a
     /// separator or `..`). Locale codes reach the filesystem as
@@ -295,8 +297,7 @@ impl FakeL10n {
         {
             existing.2.overlay(desc);
         } else {
-            self.entries
-                .push((locale.to_owned(), id.to_owned(), desc));
+            self.entries.push((locale.to_owned(), id.to_owned(), desc));
         }
         self
     }
@@ -507,9 +508,10 @@ pub fn orphan_translations(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
     use std::path::Path;
+
+    use super::*;
 
     // --- helpers ---
 
