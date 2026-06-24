@@ -684,7 +684,7 @@ pub fn render_which_grants_human(arg: &str, matches: &[coverage::GrantMatch]) ->
                 ));
             }
             coverage::GrantKind::File => {
-                let access = m.access.map(access_token).unwrap_or("");
+                let access = m.access.map(access_token).unwrap_or_default();
                 let recursive = if m.recursive == Some(true) {
                     ", recursive"
                 } else {
@@ -735,7 +735,7 @@ pub fn render_which_grants_json(matches: &[coverage::GrantMatch]) -> String {
                 group,
                 json_str(m.kind.as_str()),
                 json_str(&m.detail),
-                m.access.map(|a| json_str(access_token(a))).unwrap_or_else(|| "null".to_owned()),
+                m.access.map(|a| json_str(&access_token(a))).unwrap_or_else(|| "null".to_owned()),
                 m.recursive.map(|r| r.to_string()).unwrap_or_else(|| "null".to_owned()),
                 m.backend.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
                 json_str(risk_label(m.risk)),

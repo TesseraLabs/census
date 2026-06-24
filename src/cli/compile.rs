@@ -91,7 +91,7 @@ impl CompiledRole {
     }
 
     /// The flat union of every file grant across all permissions, keyed by path
-    /// (access widens to the max, `recursive` ORs, shape recomputed) — the same
+    /// (access is the bit-union, `recursive` ORs, shape recomputed) — the same
     /// rule `model::resolve` applies. Each carries the permission that pulled it in
     /// (first-seen). File grants only ever come from permissions (no raw escape
     /// hatch), so there is no raw seed here.
@@ -486,7 +486,7 @@ fn flat_file_grants_json(grants: &[FlatFileGrant]) -> String {
             format!(
                 "{{\"path\":{},\"access\":{},\"recursive\":{},\"shape\":{},\"backend\":{},\"permission\":{}}}",
                 json_str(&f.grant.path),
-                json_str(access_token(f.grant.access)),
+                json_str(&access_token(f.grant.access)),
                 f.grant.recursive,
                 json_str(shape),
                 json_str(backend_for_shape(f.grant.shape)),

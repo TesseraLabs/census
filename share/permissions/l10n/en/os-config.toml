@@ -13,9 +13,19 @@ title     = "Hostname configuration"
 summary   = "Set the system hostname (hostnamectl)."
 risk_note = "Contained: identity label only, no privilege impact."
 
+[service-observe]
+title     = "Service observe (scoped)"
+summary   = "Query status of named systemd units, read-only (status, is-active; parameter: units)."
+risk_note = "Contained: read-only status queries on the named units, no state change."
+
+[service-control]
+title     = "Service control (scoped)"
+summary   = "Start/stop/restart/reset-failed named systemd units (parameter: units)."
+risk_note = "Contained to the named units only; sudoers matches argv exactly, so scope cannot widen."
+
 [service-restart]
 title     = "Service restart (scoped)"
-summary   = "Start/stop/restart/query named systemd units (parameter: units)."
+summary   = "Observe and control named systemd units — bundles service-observe and service-control (parameter: units)."
 risk_note = "Contained to the named units only; sudoers matches argv exactly, so scope cannot widen."
 
 [service-admin]

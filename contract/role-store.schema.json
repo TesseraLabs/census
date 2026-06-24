@@ -17,17 +17,34 @@
   },
   "$defs": {
     "Access": {
-      "description": "File-access mode a grant requests.\n\n`ro` maps to POSIX ACL `r-X` (read + traverse-only on directories — the `X`\nis execute *only* on dirs, so a reader can walk into a tree without gaining\nexecute on regular files); `rw` maps to `rwX`. The two values form an ordered\nlattice for the resolve-time union (`Ro` < `Rw`): two grants on the same path\nmerge to the wider access.",
+      "description": "A set of file-access bits. Either a compact perm string (letters r/w/x plus the legacy aliases \"ro\"/\"rw\") or an array of bit names drawn from read/write/execute/traverse.",
       "oneOf": [
         {
-          "description": "Read + directory-traverse (`r-X`).",
           "type": "string",
-          "const": "ro"
+          "enum": [
+            "ro",
+            "rw",
+            "r",
+            "w",
+            "x",
+            "rx",
+            "wx",
+            "rwx"
+          ]
         },
         {
-          "description": "Read + write + directory-traverse (`rwX`).",
-          "type": "string",
-          "const": "rw"
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write",
+              "execute",
+              "traverse"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
         }
       ]
     },
@@ -36,7 +53,7 @@
       "type": "object",
       "properties": {
         "access": {
-          "description": "Read-only or read-write.",
+          "description": "The set of access bits this grant requests (read/write/execute/traverse).",
           "$ref": "#/$defs/Access"
         },
         "path": {

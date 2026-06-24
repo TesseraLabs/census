@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 pub struct ManagedFileGrant {
     /// Absolute path the grant targets.
     pub path: String,
-    /// Read-only or read-write.
+    /// The set of access bits the grant carried (read/write/execute/traverse).
     pub access: crate::catalog::Access,
     /// Whether the grant applied recursively (directory grant).
     pub recursive: bool,
@@ -453,7 +453,7 @@ recursive = true
         let oper = &st.managed_accounts()["oper"];
         assert_eq!(oper.file_grants.len(), 1);
         assert_eq!(oper.file_grants[0].path, "/etc/ssh");
-        assert_eq!(oper.file_grants[0].access, crate::catalog::Access::Rw);
+        assert_eq!(oper.file_grants[0].access, crate::catalog::Access::RW);
         assert!(oper.file_grants[0].recursive);
     }
 
@@ -484,7 +484,7 @@ recursive = true
             sudo_commands: vec![],
             file_grants: vec![ManagedFileGrant {
                 path: "/etc/ssh".to_owned(),
-                access: crate::catalog::Access::Ro,
+                access: crate::catalog::Access::RO,
                 recursive: true,
             }],
             provenance: crate::model::Provenance::Created,
@@ -598,7 +598,7 @@ bogus = "nope"
             sudo_commands: vec![crate::model::SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![ManagedFileGrant {
                 path: "/etc/net".to_owned(),
-                access: crate::catalog::Access::Rw,
+                access: crate::catalog::Access::RW,
                 recursive: true,
             }],
             adopt_baseline: Some(GroupBaseline {

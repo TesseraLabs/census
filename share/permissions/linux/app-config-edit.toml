@@ -1,6 +1,24 @@
 id       = "app-config-edit"
-risk     = "contained"
+# Escalation-capable, NOT contained: `sensible-editor` runs an interactive editor
+# as root, and every common editor can spawn a shell (vi `:!sh`, nano ^R^X, …).
+# So a path to root exists regardless of WHICH file is edited — the `allow_prefix`
+# guard rail below confines the target file, not the editor's shell escape. Honest
+# labelling per the catalog doctrine: no "restricted sudo" illusion where root is
+# one keystroke away.
+risk     = "escalation-capable"
 category = "app"
 # Parametrized site-config editor: the role supplies `path = "..."` (or a list).
 # Census renders one sudoers Cmnd per concrete path via the editor wrapper.
 sudo     = ["/usr/bin/sensible-editor {path}"]
+
+# Guard rail for the {path} placeholder. Without it a role could point this
+# root editor at `/etc/shadow` or `/etc/sudoers` — the same fail-open class the
+# raw file-grant gate closes. Confine the editable path to the application's own
+# config tree, so a path outside it (anything directly under /etc, /root, broad
+# trees like /srv or /opt, …) fails closed at resolve, ahead of the static sudo
+# gate. `deny_glob` is the default (true): a glob in an editor target is never
+# intended here. This starter prefix is deliberately narrow — widen
+# `allow_prefix` per deployment to the exact config trees a site actually uses.
+[params.path]
+kind = "path"
+allow_prefix = ["/etc/myapp/"]

@@ -479,7 +479,7 @@ access = "rw"
         let c = read_composition(tmp.path(), "cal").unwrap();
         assert_eq!(c.files.len(), 1);
         assert_eq!(c.files[0].path, "/etc/X11/xorg.conf.d/99-calibration.conf");
-        assert_eq!(c.files[0].access, Access::Rw);
+        assert_eq!(c.files[0].access, Access::RW);
         // `recursive` defaults to false when omitted.
         assert!(!c.files[0].recursive);
     }
@@ -511,7 +511,7 @@ access = "ro"
         assert_eq!(c.files.len(), 2);
         assert_eq!(c.files[0].path, "/etc/app/conf.d");
         assert!(c.files[0].recursive);
-        assert_eq!(c.files[1].access, Access::Ro);
+        assert_eq!(c.files[1].access, Access::RO);
     }
 
     #[test]

@@ -383,16 +383,13 @@ fn push_managed_file_grant_revocations(out: &mut String, before: &[ManagedFileGr
     }
 }
 
-/// A short `ro|rw[, recursive]` access descriptor for a grant delta line.
+/// A short `<access>[, recursive]` descriptor for a grant delta line, where
+/// `<access>` is the grant's canonical token (`ro`/`rw` or sorted perm letters).
 fn access_recursive(access: Access, recursive: bool) -> String {
-    let acc = match access {
-        Access::Ro => "ro",
-        Access::Rw => "rw",
-    };
     if recursive {
-        format!("{acc}, recursive")
+        format!("{access}, recursive")
     } else {
-        acc.to_owned()
+        access.to_string()
     }
 }
 
@@ -552,11 +549,11 @@ mod tests {
         let mut m = managed("svc", 9100);
         m.file_grants = vec![ManagedFileGrant {
             path: "/old/path".to_owned(),
-            access: Access::Ro,
+            access: Access::RO,
             recursive: false,
         }];
         let mut t = target("svc", 9100);
-        t.file_grants = vec![rgrant("/etc/ssh", Access::Rw, true)];
+        t.file_grants = vec![rgrant("/etc/ssh", Access::RW, true)];
         let plan = Plan {
             actions: vec![Action::Update {
                 account: t,
@@ -582,11 +579,11 @@ mod tests {
         let mut m = managed("svc", 9100);
         m.file_grants = vec![ManagedFileGrant {
             path: "/etc/ssh".to_owned(),
-            access: Access::Ro,
+            access: Access::RO,
             recursive: true,
         }];
         let mut t = target("svc", 9100);
-        t.file_grants = vec![rgrant("/etc/ssh", Access::Rw, true)];
+        t.file_grants = vec![rgrant("/etc/ssh", Access::RW, true)];
         let plan = Plan {
             actions: vec![Action::Update {
                 account: t,

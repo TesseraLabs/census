@@ -14,7 +14,7 @@
 
 | Файл | Назначение | Чувствительность |
 |---|---|---|
-| **role-store** `<dir>/<role>.toml` | *состав* роли: какие ОС-примитивы несёт роль (группы, sudo, лимиты) | не секретно |
+| **role-store** `<dir>/<role>.toml` | *состав* роли: разрешения каталога (`permissions`) и/или инлайн-примитивы (группы, sudo, лимиты, file-гранты) | не секретно |
 | **declaration.toml** | *учётко-слой*: какие роль-учётки создать (uid/shell/home), ссылка на role-store, `version`, подпись | не секретно |
 | **trust.pub** `/etc/census/trust.pub` | публичный ключ, которым подписана декларация (managed-режим) | публичный ключ |
 
@@ -39,9 +39,18 @@ Census для каждой `[[role_account]]` декларации читает 
 ## 3. role-store: `<role>.toml` (состав роли)
 
 Формат — срез роли Tessera (`os = "linux"`). Census читает **подмножество** для Linux
-(`groups`, `sudo_role`, `limits`), прочие поля (`mac_mask` Astra, `selinux`, `session`)
-игнорирует толерантно (их валидирует Tessera). Имя файла = `<role>.toml`, `role` внутри =
-имя файла.
+(`permissions`, `groups`, `sudo_role`, `limits`, `[[files]]`), прочие поля (`mac_mask` Astra,
+`selinux`, `session`) игнорирует толерантно (их валидирует Tessera). Имя файла = `<role>.toml`,
+`role` внутри = имя файла.
+
+Состав задаётся двумя путями (можно совмещать):
+
+1. **`permissions`** — ссылки на именованные разрешения каталога (**предпочтительно**:
+   переиспользование, risk-класс, l10n, cross-ref на фреймворки). См.
+   **`catalog-authoring.md`**.
+2. **Инлайн-примитивы** (escape-hatch) — `groups` / `sudo_role` / `limits` / `[[files]]`
+   прямо в роли. Паритет возможностей, но без переиспользования; при наличии `permissions`
+   инлайн помечается lint'ом «prefer permissions». Инлайн file-путь не параметризуется.
 
 ```toml
 # /var/lib/tessera/roles/oper.toml
@@ -52,8 +61,19 @@ name = "Оператор банкомата"
 level = 5                # для UI-выбора у Tessera; Census не использует
 
 [payload]
-groups = ["atm-operators", "log-readers"]   # доп-группы роль-учётки
-sudo_role = "atm-ops"                        # имя sudo-правила (см. §5)
+# Предпочтительно — разрешения каталога:
+permissions = [
+    "log-read",
+    { id = "service-control", units = ["app"] },   # параметризованная форма
+]
+
+# Инлайн-примитивы (escape-hatch), при необходимости:
+groups    = ["atm-operators"]                  # доп-группы роль-учётки
+sudo_role = "atm-ops"                          # имя sudo-правила (см. §5)
+
+[[payload.files]]                              # инлайн file-грант (ACL), без sudo
+path   = "/etc/myapp/oper.conf"
+access = "rw"
 
 [payload.limits]
 nofile = 4096           # RLIMIT_NOFILE
@@ -61,10 +81,15 @@ nproc  = 512            # RLIMIT_NPROC
 ```
 
 - `role` — ключ; матчит `[[role_account]].role` в декларации.
+- `permissions` — список id-строк или таблиц `{ id, <params> }`; раскрываются каталогом в
+  примитивы под `os-target` устройства (см. `catalog-authoring.md`).
 - `groups` — **доп-группы** роль-учётки. Отсутствующие Census создаёт сам (`groupadd`) и
   управляет ими; пред-существующие/чужие — только назначает членство, не трогает. Для
   стабильного GID по парку — пин в декларации (`[[group]]`, §4).
 - `sudo_role` — логическое имя sudo-права; Census кладёт `sudoers.d/census-<role>` (см. §5).
+- `[[files]]` — file-грант (`path`/`access`/`recursive`), материализуется в POSIX ACL под
+  root. Путь валидируется fail-closed (absolute, без `..`). Уровни access — см.
+  `catalog-authoring.md` §5.
 - `limits` — необязательно.
 
 ## 4. declaration.toml (учётко-слой)

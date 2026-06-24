@@ -231,42 +231,534 @@ impl ParamValue {
     }
 }
 
-/// File-access mode a grant requests.
+/// The maximum length a `token`/`enum`/`path`-kind constraint accepts when no
+/// explicit `max_len` is given. A systemd unit name, a Unix login, and an
+/// interface name all fit well under this; the ceiling exists so an
+/// unconstrained-length token cannot balloon a rendered sudoers line. 256 is
+/// generous for any real identifier yet still bounds the rendered Cmnd.
+const PARAM_DEFAULT_MAX_LEN: usize = 256;
+
+/// The default `kind = "path"` glob policy: reject glob metacharacters (`*?[`)
+/// in a substituted path unless the record opts in with `deny_glob = false`. A
+/// glob in a file-grant path widens the ACL target from one tree to a pattern,
+/// so the safe default is to refuse it.
+const PARAM_PATH_DENY_GLOB_DEFAULT: bool = true;
+
+/// A per-parameter constraint a catalog record places on the value a role may
+/// substitute into one of its `{placeholder}`s.
 ///
-/// `ro` maps to POSIX ACL `r-X` (read + traverse-only on directories — the `X`
-/// is execute *only* on dirs, so a reader can walk into a tree without gaining
-/// execute on regular files); `rw` maps to `rwX`. The two values form an ordered
-/// lattice for the resolve-time union (`Ro` < `Rw`): two grants on the same path
-/// merge to the wider access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+/// Templating fills `{name}` in a sudo command, group name, or file-grant path
+/// with a role-supplied value; without a constraint that value is unbounded, so
+/// a role could point a parametrized file permission at `/etc/shadow` or splice
+/// an unexpected unit into a `systemctl` rule. Every placeholder in a record
+/// MUST carry a matching `[params.<name>]` (enforced at parse, fail-closed), and
+/// the substituted value is checked against it at resolve time, *before* the
+/// existing sudo/path static gates — defence in depth, not instead of them.
+///
+/// Tagged on the TOML `kind` key (externally distinct kinds, one set of
+/// per-kind fields each), so a record writes e.g. `kind = "token"` /
+/// `kind = "path"` / `kind = "enum"` and only that kind's fields are accepted
+/// (`deny_unknown_fields`, like the rest of the catalog).
+///
+/// # Examples
+///
+/// ```toml
+/// [params.units]
+/// kind = "token"          # systemd unit name; safe charset, bounded length
+///
+/// [params.path]
+/// kind = "path"
+/// allow_prefix = ["/etc/app/"]   # substituted path must sit under one of these
+///
+/// [params.verb]
+/// kind = "enum"
+/// values = ["start", "stop"]     # substituted value must be one of these
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub enum Access {
-    /// Read + directory-traverse (`r-X`).
-    #[serde(rename = "ro")]
-    Ro,
-    /// Read + write + directory-traverse (`rwX`).
-    #[serde(rename = "rw")]
-    Rw,
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum ParamConstraint {
+    /// A portable identifier (a systemd unit, an interface, a login name). The
+    /// substituted value must be non-empty, within the length bound, and drawn
+    /// from a safe identifier charset (ASCII alphanumerics plus the documented
+    /// `-_.@:\/` set systemd unit names use). Sudoers/path/shell metacharacters
+    /// are rejected — the param-value gate already blocks the worst of them, and
+    /// this narrows further to a real identifier shape.
+    #[serde(rename = "token")]
+    Token {
+        /// Maximum accepted length; defaults to [`PARAM_DEFAULT_MAX_LEN`].
+        #[serde(default)]
+        max_len: Option<usize>,
+    },
+    /// A filesystem path. The substituted value must sit under one of
+    /// `allow_prefix` (so a parametrized file grant cannot be steered outside its
+    /// intended trees), pass the existing post-substitution path gate (absolute,
+    /// no `..`, no control char), stay within the length bound, and — unless
+    /// `deny_glob = false` — contain no glob metacharacter (`*?[`).
+    #[serde(rename = "path")]
+    Path {
+        /// Allowed path prefixes; the substituted path must start with one of
+        /// them. At least one prefix is required (an empty list would allow any
+        /// absolute path, defeating the constraint) — enforced at parse.
+        allow_prefix: Vec<String>,
+        /// Reject glob metacharacters (`*?[`) in the substituted path unless set
+        /// to `false`. Defaults to [`PARAM_PATH_DENY_GLOB_DEFAULT`] (true).
+        #[serde(default)]
+        deny_glob: Option<bool>,
+        /// Maximum accepted length; defaults to [`PARAM_DEFAULT_MAX_LEN`].
+        #[serde(default)]
+        max_len: Option<usize>,
+    },
+    /// A closed set of allowed values. The substituted value must equal one of
+    /// `values` exactly.
+    #[serde(rename = "enum")]
+    Enum {
+        /// The exact set of accepted values; must be non-empty (enforced at
+        /// parse — an empty set would reject every value).
+        values: Vec<String>,
+    },
 }
 
-impl Access {
-    /// Severity rank for the union: `Ro` < `Rw`. An explicit method (not derived
-    /// `Ord`) so the widening order is a documented domain decision rather than an
-    /// accident of variant declaration order.
-    fn rank(self) -> u8 {
+/// The safe punctuation a `kind = "token"` value may use beyond ASCII
+/// alphanumerics: the characters systemd unit names and similar identifiers
+/// rely on. Deliberately excludes every sudoers/shell metacharacter (comma,
+/// semicolon, the redirection and quoting set, and so on) and whitespace, so a
+/// token cannot smuggle one past this gate. The `@` and `:` appear in
+/// instance/slice unit names (such as wg-quick@wg0 and system-getty.slice);
+/// the slash and dot appear in path-like unit names; the hyphen and underscore
+/// are ubiquitous in identifiers.
+const TOKEN_EXTRA_CHARS: &[char] = &['-', '_', '.', '@', ':', '\\', '/'];
+
+impl ParamConstraint {
+    /// Validate the constraint declaration itself (independent of any value).
+    ///
+    /// A `path` constraint with no `allow_prefix`, or an `enum` with no
+    /// `values`, would accept anything (or nothing) and is almost certainly an
+    /// authoring mistake; reject it at parse so the record fails closed rather
+    /// than silently widening. Returns the rejection reason, or `None` if the
+    /// declaration is well-formed.
+    fn declaration_defect(&self) -> Option<&'static str> {
         match self {
-            Access::Ro => 0,
-            Access::Rw => 1,
+            ParamConstraint::Token { .. } => None,
+            ParamConstraint::Path { allow_prefix, .. } => {
+                if allow_prefix.is_empty() {
+                    Some("path constraint requires a non-empty allow_prefix")
+                } else if allow_prefix.iter().any(|p| !p.starts_with('/')) {
+                    Some("every allow_prefix must be an absolute path (start with '/')")
+                } else {
+                    None
+                }
+            }
+            ParamConstraint::Enum { values } => {
+                if values.is_empty() {
+                    Some("enum constraint requires a non-empty values list")
+                } else {
+                    None
+                }
+            }
         }
     }
 
-    /// The wider of two accesses (used when unioning grants on the same path).
-    fn max(self, other: Access) -> Access {
-        if other.rank() > self.rank() {
-            other
-        } else {
-            self
+    /// The constraint with its defaulted-optional fields resolved to the effective
+    /// values resolve actually enforces (`max_len` → [`PARAM_DEFAULT_MAX_LEN`],
+    /// `deny_glob` → [`PARAM_PATH_DENY_GLOB_DEFAULT`]). Used to compare two
+    /// constraints by *meaning* rather than by surface syntax, so e.g.
+    /// `max_len = None` and `max_len = 256` (the default) are recognised as the
+    /// same constraint instead of a spurious conflict.
+    fn normalized(&self) -> ParamConstraint {
+        match self {
+            ParamConstraint::Token { max_len } => ParamConstraint::Token {
+                max_len: Some(max_len.unwrap_or(PARAM_DEFAULT_MAX_LEN)),
+            },
+            ParamConstraint::Path {
+                allow_prefix,
+                deny_glob,
+                max_len,
+            } => ParamConstraint::Path {
+                allow_prefix: allow_prefix.clone(),
+                deny_glob: Some(deny_glob.unwrap_or(PARAM_PATH_DENY_GLOB_DEFAULT)),
+                max_len: Some(max_len.unwrap_or(PARAM_DEFAULT_MAX_LEN)),
+            },
+            ParamConstraint::Enum { values } => ParamConstraint::Enum {
+                values: values.clone(),
+            },
         }
+    }
+
+    /// Check one substituted value against this constraint. Returns the rejection
+    /// reason, or `None` if the value satisfies the constraint.
+    ///
+    /// Runs at resolve time, *before* the existing sudo/path static gates, on
+    /// every rendered value (for a list param, on each element). The two layers
+    /// are complementary: this one bounds the value to the record's declared
+    /// domain (charset / prefix / member set), the static gates independently
+    /// re-check the fully-rendered Cmnd or path.
+    fn value_defect(&self, value: &str) -> Option<&'static str> {
+        match self {
+            ParamConstraint::Token { max_len } => {
+                if value.is_empty() {
+                    return Some("token value is empty");
+                }
+                if value.len() > max_len.unwrap_or(PARAM_DEFAULT_MAX_LEN) {
+                    return Some("token value exceeds max_len");
+                }
+                if value
+                    .chars()
+                    .any(|c| !(c.is_ascii_alphanumeric() || TOKEN_EXTRA_CHARS.contains(&c)))
+                {
+                    return Some(
+                        "token value contains a character outside the safe identifier charset",
+                    );
+                }
+                None
+            }
+            ParamConstraint::Path {
+                allow_prefix,
+                deny_glob,
+                max_len,
+            } => {
+                if value.len() > max_len.unwrap_or(PARAM_DEFAULT_MAX_LEN) {
+                    return Some("path value exceeds max_len");
+                }
+                // The absolute/`..`/control checks are the file-path gate's job and
+                // run right after; here we own the prefix and glob policy.
+                if !allow_prefix.iter().any(|p| value.starts_with(p.as_str())) {
+                    return Some("path value is not under any allowed prefix");
+                }
+                if deny_glob.unwrap_or(PARAM_PATH_DENY_GLOB_DEFAULT) && has_glob_metachar(value) {
+                    return Some(
+                        "path value contains a glob metacharacter (*?[) but globs are denied",
+                    );
+                }
+                None
+            }
+            ParamConstraint::Enum { values } => {
+                if values.iter().any(|v| v == value) {
+                    None
+                } else {
+                    Some("value is not one of the allowed enum values")
+                }
+            }
+        }
+    }
+}
+
+/// The set of file-access bits a grant requests.
+///
+/// A *set* of independent bits, not an ordered ladder: each of `read`, `write`,
+/// `execute`, `traverse` composes by union (OR), so two grants on the same path
+/// merge to the union of their bits. The four bits map onto a POSIX ACL perm
+/// string (see [`crate::fileaccess`]):
+///
+/// - `read` → `r` (read file contents / list a directory);
+/// - `write` → `w`;
+/// - `execute` → lowercase `x` (run a file — execute on a *file* inode);
+/// - `traverse` → conditional `X` (enter/search a directory — execute on a *dir*
+///   inode only, never on a regular file the way lowercase `x` would).
+///
+/// `read` and `traverse` are deliberately separate: a directory-read grant lists
+/// a tree (`r`) and walks into it (`X`) without ever gaining execute on the
+/// regular files inside, which is exactly the legacy `ro` semantics. The two
+/// legacy strings map onto fixed bit sets that materialize byte-for-byte to the
+/// historical ACL strings: `"ro"` → `{read, traverse}` (`r-X`) and `"rw"` →
+/// `{read, write, traverse}` (`rwX`).
+///
+/// Some POSIX ACL modes have no representation here on purpose: there is no
+/// `append` bit, because the open ACL backend cannot express append-only access,
+/// and admitting a token that maps to it would promise enforcement Census cannot
+/// deliver. An unknown access token or bit name fails closed at parse.
+// `Ord` is derived over the raw `u8` bit field so an `Access` can key a
+// set-equality comparison (the plan/apply drift gate sorts grant keys). The
+// order is arbitrary-but-total — only equality and a stable sort are relied on,
+// never a "wider/narrower" meaning (access composes by bit-union, not a ladder).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Access(u8);
+
+impl Access {
+    /// Read file contents or list a directory → ACL `r`.
+    pub const READ: Access = Access(0b0001);
+    /// Modify file contents or a directory's entries → ACL `w`.
+    pub const WRITE: Access = Access(0b0010);
+    /// Run a file (execute on a *file* inode) → lowercase ACL `x`.
+    pub const EXECUTE: Access = Access(0b0100);
+    /// Enter/search a directory (execute on a *dir* inode) → conditional ACL `X`.
+    pub const TRAVERSE: Access = Access(0b1000);
+
+    /// Legacy `ro`: read + directory-traverse — materializes to `r-X`.
+    pub const RO: Access = Access(Access::READ.0 | Access::TRAVERSE.0);
+    /// Legacy `rw`: read + write + directory-traverse — materializes to `rwX`.
+    pub const RW: Access = Access(Access::READ.0 | Access::WRITE.0 | Access::TRAVERSE.0);
+
+    /// Whether this set contains every bit in `bit` (used to test a single bit).
+    #[must_use]
+    pub const fn contains(self, bit: Access) -> bool {
+        self.0 & bit.0 == bit.0
+    }
+
+    /// Whether no bit is set. An empty access grants nothing; the parser rejects
+    /// it so a grant always requests at least one capability.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The union of two access sets (OR of their bits). Used when unioning grants
+    /// on the same path across permissions, layers, and bundle members: access
+    /// composes rather than picking a winner, so `{read} ∪ {write,traverse}` is
+    /// `{read,write,traverse}`. Commutative and idempotent.
+    #[must_use]
+    pub const fn union(self, other: Access) -> Access {
+        Access(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOr for Access {
+    type Output = Access;
+
+    fn bitor(self, rhs: Access) -> Access {
+        self.union(rhs)
+    }
+}
+
+impl std::ops::BitOrAssign for Access {
+    fn bitor_assign(&mut self, rhs: Access) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl std::fmt::Debug for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Debug as the set of bit names so test failures and logs read clearly,
+        // e.g. `Access(read | traverse)`.
+        let mut first = true;
+        write!(f, "Access(")?;
+        for (bit, name) in [
+            (Access::READ, "read"),
+            (Access::WRITE, "write"),
+            (Access::EXECUTE, "execute"),
+            (Access::TRAVERSE, "traverse"),
+        ] {
+            if self.contains(bit) {
+                if !first {
+                    write!(f, " | ")?;
+                }
+                write!(f, "{name}")?;
+                first = false;
+            }
+        }
+        if first {
+            write!(f, "<empty>")?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl std::fmt::Display for Access {
+    /// Render the short display token (`ro`/`rw` for the legacy sets, else the
+    /// sorted perm letters `r`/`w`/`x`/`X`). A human-facing summary for plan and
+    /// coverage notes; the machine-readable, round-tripping form is the serde
+    /// serialization (see [`Access::serialize`]).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display_token())
+    }
+}
+
+impl<'de> Deserialize<'de> for Access {
+    /// Parse an access from TOML, accepting two interchangeable grammars:
+    ///
+    /// - one of the eight canonical compact strings — the legacy aliases `"ro"`
+    ///   (== `{read, traverse}`) and `"rw"` (== `{read, write, traverse}`), plus
+    ///   the lowercase perm-letter combinations in fixed `r` < `w` < `x` order
+    ///   (`"r"`, `"w"`, `"x"`, `"rx"`, `"wx"`, `"rwx"`); a misordered or repeated
+    ///   string (`"xr"`, `"rr"`) is rejected so the grammar matches the schema;
+    /// - an array of bit names: `["read"]`, `["read", "traverse"]`,
+    ///   `["read", "execute"]`, … drawn from `read`/`write`/`execute`/`traverse`
+    ///   — the only way to spell a set the compact letters cannot (e.g. a
+    ///   `traverse` bit on its own).
+    ///
+    /// Both forms must name at least one capability. Any unknown token, letter, or
+    /// bit name — including anything that would map to an `append`-style mode
+    /// Census cannot enforce — fails closed.
+    fn deserialize<D>(deserializer: D) -> Result<Access, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        // Accept either a string (compact letters / legacy alias) or a list of
+        // bit names. `toml`/`serde` hand us one or the other; an untagged enum
+        // lets a single field accept both without a wrapper table.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Compact(String),
+            Bits(Vec<String>),
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Compact(s) => parse_compact_access(&s)
+                .ok_or_else(|| D::Error::custom(format!("unknown access {s:?}"))),
+            Raw::Bits(names) => parse_bit_names(&names).map_err(D::Error::custom),
+        }
+    }
+}
+
+impl serde::Serialize for Access {
+    /// Serialize so a round-tripped grant re-parses to the same set. The two
+    /// legacy sets keep their historical string spellings (`"ro"`, `"rw"`) so a
+    /// persisted managed-registry grant written before this change still reads
+    /// back identically. Every other set serializes as the bit-name ARRAY
+    /// (`["read", "write"]`, …): the compact letter form would render `{read,
+    /// write}` as `"rw"`, colliding with the legacy `rw` alias (which carries
+    /// traverse), so the array form is the only spelling that round-trips every
+    /// non-legacy set unambiguously.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq as _;
+
+        if *self == Access::RO {
+            return serializer.serialize_str("ro");
+        }
+        if *self == Access::RW {
+            return serializer.serialize_str("rw");
+        }
+        let bits: &[(Access, &str)] = &[
+            (Access::READ, "read"),
+            (Access::WRITE, "write"),
+            (Access::EXECUTE, "execute"),
+            (Access::TRAVERSE, "traverse"),
+        ];
+        let present = bits.iter().filter(|(b, _)| self.contains(*b)).count();
+        let mut seq = serializer.serialize_seq(Some(present))?;
+        for (bit, name) in bits {
+            if self.contains(*bit) {
+                seq.serialize_element(name)?;
+            }
+        }
+        seq.end()
+    }
+}
+
+impl Access {
+    /// A short human-readable token for display (logs, plan/coverage notes).
+    /// Legacy `ro`/`rw` keep their historical spelling; any other set renders as
+    /// sorted perm letters (`r`, `w`, lowercase `x` for execute, capital `X` for
+    /// traverse). This is a DISPLAY form, not the serialization form: the literal
+    /// `{read, write}` set displays as `rw`, which is fine for a human note but
+    /// would collide with the legacy `rw` alias on parse, so serialization uses
+    /// the unambiguous bit-name array instead (see [`Access::serialize`]).
+    fn display_token(self) -> String {
+        if self == Access::RO {
+            return "ro".to_owned();
+        }
+        if self == Access::RW {
+            return "rw".to_owned();
+        }
+        let mut s = String::with_capacity(4);
+        if self.contains(Access::READ) {
+            s.push('r');
+        }
+        if self.contains(Access::WRITE) {
+            s.push('w');
+        }
+        if self.contains(Access::EXECUTE) {
+            s.push('x');
+        }
+        if self.contains(Access::TRAVERSE) {
+            s.push('X');
+        }
+        s
+    }
+}
+
+/// Parse a compact access string into an [`Access`], or `None` if it is not one
+/// of the accepted spellings.
+///
+/// Exactly the eight canonical compact tokens are accepted — the two legacy
+/// aliases (`ro`, `rw`) plus the lowercase perm-letter combinations in a fixed
+/// `r` < `w` < `x` order (`r`, `w`, `x`, `rx`, `wx`, `rwx`). This is the precise
+/// set the JSON-schema contract advertises, so the parser and the schema never
+/// drift: a misordered (`xr`), repeated (`rr`), or capital-`X` string fails
+/// closed here. Anything beyond these (a traverse bit without the legacy alias,
+/// or any mix the letters cannot spell) is expressed through the bit-name array
+/// form instead.
+fn parse_compact_access(s: &str) -> Option<Access> {
+    let access = match s {
+        // Legacy aliases — fixed sets that preserve the historical ACL strings.
+        "ro" => Access::RO,
+        "rw" => Access::RW,
+        // Lowercase perm letters, canonical `r` < `w` < `x` order only.
+        "r" => Access::READ,
+        "w" => Access::WRITE,
+        "x" => Access::EXECUTE,
+        "rx" => Access::READ.union(Access::EXECUTE),
+        "wx" => Access::WRITE.union(Access::EXECUTE),
+        "rwx" => Access::READ.union(Access::WRITE).union(Access::EXECUTE),
+        _ => return None,
+    };
+    Some(access)
+}
+
+/// Parse an array of bit names (`["read", "traverse"]`, …) into an [`Access`].
+/// Each name maps to one bit; an empty list, an unknown name, or a duplicate is
+/// rejected with a clear message. Returns the rejection reason on failure.
+fn parse_bit_names(names: &[String]) -> Result<Access, String> {
+    if names.is_empty() {
+        return Err("access bit-name list is empty".to_owned());
+    }
+    let mut acc = Access(0);
+    for name in names {
+        let bit = match name.as_str() {
+            "read" => Access::READ,
+            "write" => Access::WRITE,
+            "execute" => Access::EXECUTE,
+            "traverse" => Access::TRAVERSE,
+            other => return Err(format!("unknown access bit {other:?}")),
+        };
+        if acc.contains(bit) {
+            return Err(format!("duplicate access bit {name:?}"));
+        }
+        acc |= bit;
+    }
+    Ok(acc)
+}
+
+/// Hand-written schema for [`Access`]: the type has a custom `Deserialize`
+/// (a compact perm string OR an array of bit names), so its schema is written by
+/// hand to mirror exactly that one-of rather than a derived enum that would not
+/// match the deserializer. The string arm enumerates the accepted compact tokens
+/// (the legacy aliases plus the perm-letter combinations); the array arm is a
+/// list drawn from the four bit names. Behind the `schema` feature — schema
+/// generation is a CI/contract concern, not part of the default public API.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Access {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Access".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "A set of file-access bits. Either a compact perm \
+                string (letters r/w/x plus the legacy aliases \"ro\"/\"rw\") or \
+                an array of bit names drawn from read/write/execute/traverse.",
+            "oneOf": [
+                {
+                    "type": "string",
+                    "enum": ["ro", "rw", "r", "w", "x", "rx", "wx", "rwx"],
+                },
+                {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["read", "write", "execute", "traverse"],
+                    },
+                    "minItems": 1,
+                    "uniqueItems": true,
+                },
+            ],
+        })
     }
 }
 
@@ -317,7 +809,7 @@ fn has_glob_metachar(path: &str) -> bool {
 pub struct FileGrant {
     /// Absolute path to a directory, file, or glob pattern.
     pub path: String,
-    /// Read-only or read-write.
+    /// The set of access bits this grant requests (read/write/execute/traverse).
     pub access: Access,
     /// For directories: apply recursively and set a default-ACL so new files in
     /// the tree inherit the access. Absent defaults to `false`.
@@ -448,6 +940,16 @@ pub struct PermissionDef {
     /// is parsed strictly and its path validated at the read boundary.
     #[serde(default, rename = "file")]
     pub files: Vec<FileGrant>,
+
+    /// Per-parameter constraints (`[params.<name>]` sub-tables) bounding the
+    /// values a role may substitute into this record's `{placeholder}`s. Every
+    /// placeholder that appears in any template (sudo, groups, file path) MUST
+    /// have a matching entry here, and every entry MUST name a placeholder that
+    /// the record actually uses — both enforced at the read boundary
+    /// (fail-closed). The constraint is applied to each substituted value at
+    /// resolve time, before the static sudo/path gates.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, ParamConstraint>,
 }
 
 impl PermissionDef {
@@ -526,7 +1028,79 @@ impl PermissionDef {
                 });
             }
         }
+
+        // Parameter guard rails (fail-closed, pre-release: no grace period).
+        //
+        // 1. Each declared constraint must be internally well-formed (a `path`
+        //    with no allow_prefix, an `enum` with no values, accepts/refuses
+        //    everything and is almost certainly an authoring mistake).
+        for (name, constraint) in &self.params {
+            if let Some(reason) = constraint.declaration_defect() {
+                return Err(CatalogError::InvalidParamConstraint {
+                    id: self.id.clone(),
+                    param: name.clone(),
+                    reason,
+                });
+            }
+        }
+
+        // 2. Every placeholder used in ANY of this record's templates must have a
+        //    matching `[params.<name>]`. A placeholder a role could fill with an
+        //    unconstrained value is the fail-open class this guard closes, so a
+        //    missing constraint is rejected here, before resolve.
+        let used = self.placeholder_names();
+        for name in &used {
+            if !self.params.contains_key(name) {
+                return Err(CatalogError::UnconstrainedParam {
+                    id: self.id.clone(),
+                    param: name.clone(),
+                });
+            }
+        }
+
+        // 3. Conversely, a declared constraint whose name appears in NO template
+        //    is dead config — a typo'd placeholder name or a stale entry. Reject
+        //    it (pre-release strictness) so the constraint a role relies on is
+        //    never silently inert.
+        for name in self.params.keys() {
+            if !used.contains(name) {
+                return Err(CatalogError::OrphanParamConstraint {
+                    id: self.id.clone(),
+                    param: name.clone(),
+                });
+            }
+        }
+
         Ok(())
+    }
+
+    /// Every distinct `{placeholder}` name this record's templates reference,
+    /// across sudo commands, group names, and file-grant paths.
+    ///
+    /// The single source of truth for "which parameters does this record take",
+    /// used by [`PermissionDef::validate`] to require a constraint per
+    /// placeholder. Order is first-seen; duplicates are collapsed.
+    fn placeholder_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut push_from = |template: &str| {
+            for name in extract_placeholders(template) {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_owned());
+                }
+            }
+        };
+        for ov in [&self.groups, &self.sudo] {
+            let values = match ov {
+                ListOverride::Replace(v) | ListOverride::Append(v) => v,
+            };
+            for v in values {
+                push_from(v);
+            }
+        }
+        for grant in &self.files {
+            push_from(&grant.path);
+        }
+        names
     }
 }
 
@@ -1184,14 +1758,14 @@ pub struct SourcedPrimitive {
 /// A file-access grant after resolve: its path, access, recursion, derived
 /// [`Shape`], and the per-grant provenance (which layers — and, through a bundle,
 /// which member — contributed it). Grants on the same path are unioned across
-/// layers/members: access widens to the max (`Ro` < `Rw`), `recursive` is the OR,
-/// and provenance accumulates.
+/// layers/members: access is the bit-union (OR of the access bits), `recursive`
+/// is the OR, and provenance accumulates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedFileGrant {
     /// Absolute path (literal, already `{param}`-substituted if it was templated).
     pub path: String,
-    /// Effective access (the max over every contributing grant on this path).
+    /// Effective access (the bit-union over every contributing grant on this path).
     pub access: Access,
     /// Effective recursion (the OR over every contributing grant on this path).
     pub recursive: bool,
@@ -1254,6 +1828,15 @@ pub struct ResolvedPermission {
     /// captured `category_members` are bound to this version. `None` for a bare
     /// leaf resolve (no `ctx`).
     pub resolved_catalog_version: Option<String>,
+    /// The parameter constraints in effect for this resolved permission, by
+    /// placeholder name. Merged from every contributing record: across OS layers
+    /// the topmost layer that declares a given param wins (mirroring `risk` /
+    /// `runas`), and across bundle members each member contributes its own
+    /// params (a member's constraint fills a name the bundle and earlier members
+    /// have not already set). These are the constraints
+    /// [`resolve_with_params`] enforces on each substituted value, before the
+    /// static sudo/path gates.
+    pub params: std::collections::BTreeMap<String, ParamConstraint>,
 }
 
 /// Errors compiling/resolving the catalog.
@@ -1450,6 +2033,85 @@ pub enum CatalogError {
         /// The depth at which expansion was refused.
         depth: usize,
     },
+    /// A `{placeholder}` appears in one of a record's templates (sudo, groups, or
+    /// a file path) but the record declares no matching `[params.<name>]`
+    /// constraint. A substituted value with no constraint is unbounded — a role
+    /// could point a parametrized file permission at `/etc/shadow` or splice an
+    /// arbitrary token into a sudoers Cmnd — so a missing constraint is rejected
+    /// at the read boundary, before resolve. Pre-release: no grace period, every
+    /// placeholder must be constrained.
+    #[error(
+        "permission {id}: template placeholder {{{param}}} has no [params.{param}] constraint"
+    )]
+    UnconstrainedParam {
+        /// The permission id whose template carries the unconstrained placeholder.
+        id: String,
+        /// The placeholder name lacking a constraint.
+        param: String,
+    },
+    /// A record declares a `[params.<name>]` constraint for a name that appears
+    /// in NO template. Dead config — a typo'd placeholder name or a stale entry —
+    /// which would silently never apply; rejected at the read boundary so a
+    /// constraint a role relies on is never inert.
+    #[error("permission {id}: [params.{param}] constrains a placeholder no template uses")]
+    OrphanParamConstraint {
+        /// The permission id carrying the orphan constraint.
+        id: String,
+        /// The constrained name that matches no placeholder.
+        param: String,
+    },
+    /// A `[params.<name>]` constraint declaration is itself malformed (e.g. a
+    /// `path` kind with no `allow_prefix`, an `enum` with no `values`, or a
+    /// non-absolute prefix). Rejected at the read boundary so a constraint that
+    /// would accept everything (or nothing) never reaches resolve.
+    #[error("permission {id}: invalid [params.{param}] constraint: {reason}")]
+    InvalidParamConstraint {
+        /// The permission id carrying the malformed constraint.
+        id: String,
+        /// The parameter whose constraint is malformed.
+        param: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+    /// A substituted parameter value violates its record's `[params.<name>]`
+    /// constraint (outside the token charset, not under an allowed path prefix,
+    /// not in the enum set, over the length bound, or carrying a denied glob).
+    /// Enforced at resolve time, before the static sudo/path gates — the value
+    /// is bounded to the record's declared domain so a role cannot widen a
+    /// parametrized grant past what the catalog author allowed. For a list param,
+    /// any single offending element fails the whole expansion closed.
+    #[error(
+        "permission {id}: parameter {param} value {value:?} violates its constraint: {reason}"
+    )]
+    ParamConstraintViolation {
+        /// The permission id whose constraint was violated.
+        id: String,
+        /// The parameter whose value was rejected.
+        param: String,
+        /// The rejected substituted value.
+        value: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+    /// Two bundle members contribute `[params.<name>]` constraints for the same
+    /// placeholder name with structurally different constraints. The bundle
+    /// expands every member's templates into one shared `{name}` domain, so two
+    /// members disagreeing on what values that name may take is ambiguous: a
+    /// first-writer-wins merge would silently bind the placeholder to one
+    /// member's constraint and let the other member's templates render values its
+    /// author never sanctioned. Fail closed — the labeller must reconcile the two
+    /// members onto one constraint (or rename the placeholder). Identical
+    /// constraints merge idempotently and never trip this.
+    #[error(
+        "bundle {id}: members declare conflicting [params.{param}] constraints; \
+         a placeholder shared across members must resolve to one constraint"
+    )]
+    ConflictingParamConstraint {
+        /// The bundle id whose members disagree.
+        id: String,
+        /// The placeholder name with conflicting constraints.
+        param: String,
+    },
 }
 
 /// Maximum number of nested bundle includes expanded from a single root before
@@ -1514,6 +2176,14 @@ pub fn resolve_leaf(
     let mut runas: Option<String> = None;
     let mut limits: Option<Limits> = None;
     let mut limits_layer: Option<String> = None;
+    // Parameter constraints, merged across layers. A higher layer's entry for a
+    // given name overrides a lower layer's (topmost-setter-wins, like risk): the
+    // layer that owns the template for a placeholder owns its constraint. A
+    // `replace=true` layer wipes accumulated params alongside the primitives —
+    // it restates its own templates and (per its own validate()) their
+    // constraints.
+    let mut params: std::collections::BTreeMap<String, ParamConstraint> =
+        std::collections::BTreeMap::new();
     let mut found = false;
 
     for layer in &chain {
@@ -1530,12 +2200,16 @@ pub fn resolve_leaf(
             raw_files.clear();
             limits = None;
             limits_layer = None;
+            params.clear();
         }
 
         apply_list_override(&mut groups, &def.groups, layer, None);
         apply_list_override(&mut sudo, &def.sudo, layer, None);
         for grant in def.files {
             raw_files.push((grant, layer.clone()));
+        }
+        for (name, constraint) in def.params {
+            params.insert(name, constraint); // topmost setter wins
         }
 
         if let Some(r) = def.risk {
@@ -1577,6 +2251,7 @@ pub fn resolve_leaf(
             limits_layer,
             category_members: Vec::new(),
             resolved_catalog_version: None,
+            params,
         },
         warnings,
     ))
@@ -1584,9 +2259,9 @@ pub fn resolve_leaf(
 
 /// Union raw `(FileGrant, layer)` pairs into [`ResolvedFileGrant`]s keyed by path.
 ///
-/// Grants on the same `path` merge: access widens to the max (`Ro` < `Rw`),
-/// `recursive` is the OR, and every contributing layer/member is recorded in
-/// `sources`. Path order is the first-seen order so the resolved list is stable.
+/// Grants on the same `path` merge: access is the bit-union (OR of the access
+/// bits), `recursive` is the OR, and every contributing layer/member is recorded
+/// in `sources`. Path order is the first-seen order so the resolved list is stable.
 /// `shape` is derived from the path plus the *effective* (OR'd) `recursive` flag,
 /// so a path stated once as a file and once as recursive resolves to a directory.
 /// `via` tags the bundle member that pulled grants in (`None` for a leaf).
@@ -1601,7 +2276,7 @@ pub(crate) fn union_file_grants(
             via: via.map(str::to_owned),
         };
         if let Some(existing) = out.iter_mut().find(|g| g.path == grant.path) {
-            existing.access = existing.access.max(grant.access);
+            existing.access |= grant.access;
             existing.recursive = existing.recursive || grant.recursive;
             // Recompute the derived shape against the now-effective recursive flag.
             existing.shape = FileGrant {
@@ -1626,7 +2301,7 @@ pub(crate) fn union_file_grants(
 
 /// Union already-resolved file grants from several permissions into one set,
 /// keyed by path — the SAME merge rule the in-permission resolve uses (access
-/// widens to the max, `recursive` is the OR, `shape` is recomputed against the
+/// is the bit-union, `recursive` is the OR, `shape` is recomputed against the
 /// effective recursive flag, and every contributing grant's `sources` are
 /// concatenated). Used by [`crate::model::resolve`] to combine the file grants
 /// of all the permissions a single role-account carries; a role declaring two
@@ -1638,7 +2313,7 @@ pub fn union_resolved_file_grants(
     let mut out: Vec<ResolvedFileGrant> = Vec::new();
     for grant in grants {
         if let Some(existing) = out.iter_mut().find(|g| g.path == grant.path) {
-            existing.access = existing.access.max(grant.access);
+            existing.access |= grant.access;
             existing.recursive = existing.recursive || grant.recursive;
             existing.shape = FileGrant {
                 path: existing.path.clone(),
@@ -1817,6 +2492,16 @@ fn resolve_inner(
     let mut limits = own.limits;
     let mut limits_layer = own.limits_layer;
     let declared_risk = own.risk;
+    // Parameter constraints in effect for the bundle: the bundle's OWN params
+    // first, then each member's. A member's constraint fills a placeholder name
+    // the bundle (and earlier members) have not already bound — the bundle's own
+    // statement wins. A name already present must agree structurally: because
+    // `service-restart`-style bundles fill `{units}` across every member, each
+    // member declares the SAME constraint for that name, which merges
+    // idempotently. Two members declaring the same name with DIFFERENT
+    // constraints is ambiguous (one shared placeholder, two domains) and is
+    // rejected at the merge below rather than silently bound to one member's.
+    let mut params = own.params;
     // The bundle's OWN run-spec. This applies only to the bundle's own sudo
     // commands (already stamped onto `own.sudo` by resolve_leaf). Each member's
     // commands keep the run-spec the member resolved to — carried per primitive
@@ -1888,6 +2573,36 @@ fn resolve_inner(
         union_member_primitives(&mut sudo, resolved.sudo, member);
         union_member_file_grants(&mut file_grants, resolved.file_grants, member);
 
+        // A member's param constraints fill placeholder names the bundle (and
+        // earlier members) have not yet bound. The bundle expands members'
+        // templates into its own sudo/file set, so every placeholder those
+        // templates carry must have a constraint reachable here. A name already
+        // present must agree structurally: an identical constraint merges
+        // idempotently, but two members declaring the SAME name with DIFFERENT
+        // constraints is ambiguous and fails closed rather than silently keeping
+        // whichever member resolved first and letting the other's templates
+        // render values its author never sanctioned.
+        for (name, constraint) in resolved.params {
+            match params.entry(name) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(constraint);
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    // Compare by EFFECTIVE meaning, not surface syntax: a member
+                    // writing `max_len = 256` (the default) and another leaving it
+                    // implicit declare the same constraint and must merge, not
+                    // conflict. A genuine difference (different kind, prefixes,
+                    // enum set, or bound) still fails closed.
+                    if slot.get().normalized() != constraint.normalized() {
+                        return Err(CatalogError::ConflictingParamConstraint {
+                            id: id.to_owned(),
+                            param: slot.key().clone(),
+                        });
+                    }
+                }
+            }
+        }
+
         // A member's limits fill in only if the bundle (and earlier members) set
         // none — explicit bundle/own limits win over inherited ones.
         if limits.is_none() {
@@ -1942,14 +2657,15 @@ fn resolve_inner(
             limits_layer,
             category_members,
             resolved_catalog_version: ctx.catalog_version.clone(),
+            params,
         },
         warnings,
     ))
 }
 
 /// Union a member's resolved file grants into the bundle accumulator, merging by
-/// path (access = max, recursive = OR, shape recomputed) and recording the member
-/// id that pulled each grant in via `via`.
+/// path (access = bit-union, recursive = OR, shape recomputed) and recording the
+/// member id that pulled each grant in via `via`.
 ///
 /// Mirrors [`union_file_grants`] but operates on already-resolved member grants,
 /// re-tagging provenance with the directly-referenced member so audit shows which
@@ -1961,7 +2677,7 @@ fn union_member_file_grants(
 ) {
     for grant in members {
         if let Some(existing) = acc.iter_mut().find(|g| g.path == grant.path) {
-            existing.access = existing.access.max(grant.access);
+            existing.access |= grant.access;
             existing.recursive = existing.recursive || grant.recursive;
             existing.shape = FileGrant {
                 path: existing.path.clone(),
@@ -2141,17 +2857,37 @@ pub fn resolve_with_params(
     // Track which params actually fill a placeholder so unused ones can warn.
     let mut used_params: Vec<String> = Vec::new();
 
+    // The per-parameter constraints in effect for this resolved permission (see
+    // `ResolvedPermission::params`). Each substituted value is checked against
+    // its name's constraint inside `render_template`, BEFORE the static
+    // sudo/path gates below. Taken out so the field can be borrowed while the
+    // primitive vectors are moved through the substitution helpers.
+    let constraints = std::mem::take(&mut resolved.params);
+
     resolved.groups = substitute_primitives(
         &resolved.id,
         resolved.groups,
         params,
+        &constraints,
         &mut used_params,
         false,
     )?;
-    resolved.sudo =
-        substitute_primitives(&resolved.id, resolved.sudo, params, &mut used_params, true)?;
-    resolved.file_grants =
-        substitute_file_grants(&resolved.id, resolved.file_grants, params, &mut used_params)?;
+    resolved.sudo = substitute_primitives(
+        &resolved.id,
+        resolved.sudo,
+        params,
+        &constraints,
+        &mut used_params,
+        true,
+    )?;
+    resolved.file_grants = substitute_file_grants(
+        &resolved.id,
+        resolved.file_grants,
+        params,
+        &constraints,
+        &mut used_params,
+    )?;
+    resolved.params = constraints;
 
     for key in params.keys() {
         if !used_params.contains(key) {
@@ -2174,12 +2910,13 @@ fn substitute_primitives(
     permission: &str,
     prims: Vec<SourcedPrimitive>,
     params: &std::collections::BTreeMap<String, ParamValue>,
+    constraints: &std::collections::BTreeMap<String, ParamConstraint>,
     used_params: &mut Vec<String>,
     is_sudo: bool,
 ) -> Result<Vec<SourcedPrimitive>, CatalogError> {
     let mut out: Vec<SourcedPrimitive> = Vec::new();
     for prim in prims {
-        let rendered = render_template(permission, &prim.value, params, used_params)?;
+        let rendered = render_template(permission, &prim.value, params, constraints, used_params)?;
         for value in rendered {
             // Every rendered string is a concrete primitive now. For sudo,
             // re-validate against the SAME sudo-command gate applied at catalog
@@ -2217,16 +2954,17 @@ fn substitute_primitives(
 /// `..`, no control char) — the authoritative check for a templated path that the
 /// parse-time static gate deferred — and its `shape` is recomputed against the now
 /// concrete path. After substitution, grants are re-unioned by path so two params
-/// that render to the same path collapse (access = max, recursive = OR).
+/// that render to the same path collapse (access = bit-union, recursive = OR).
 fn substitute_file_grants(
     permission: &str,
     grants: Vec<ResolvedFileGrant>,
     params: &std::collections::BTreeMap<String, ParamValue>,
+    constraints: &std::collections::BTreeMap<String, ParamConstraint>,
     used_params: &mut Vec<String>,
 ) -> Result<Vec<ResolvedFileGrant>, CatalogError> {
     let mut rendered: Vec<ResolvedFileGrant> = Vec::new();
     for grant in grants {
-        let paths = render_template(permission, &grant.path, params, used_params)?;
+        let paths = render_template(permission, &grant.path, params, constraints, used_params)?;
         for path in paths {
             // The post-substitution gate is authoritative for a templated path:
             // a `{param}` that rendered to a non-absolute, `..`-bearing, or
@@ -2269,7 +3007,7 @@ fn substitute_file_grants(
     let mut out: Vec<ResolvedFileGrant> = Vec::new();
     for grant in rendered {
         if let Some(existing) = out.iter_mut().find(|g| g.path == grant.path) {
-            existing.access = existing.access.max(grant.access);
+            existing.access |= grant.access;
             existing.recursive = existing.recursive || grant.recursive;
             existing.shape = FileGrant {
                 path: existing.path.clone(),
@@ -2285,13 +3023,51 @@ fn substitute_file_grants(
     Ok(out)
 }
 
+/// Check a single substituted value against the constraint declared for its
+/// parameter name. Fail-closed in two ways: a value the constraint rejects is a
+/// [`CatalogError::ParamConstraintViolation`], and a *missing* constraint (a
+/// placeholder with no `[params.<name>]` reaching resolve) is itself a violation
+/// — parse-time validation guarantees one exists, so a gap here means a record
+/// reached resolve without passing the gate and must not be expanded.
+fn check_param_constraint(
+    permission: &str,
+    name: &str,
+    value: &str,
+    constraints: &std::collections::BTreeMap<String, ParamConstraint>,
+) -> Result<(), CatalogError> {
+    let Some(constraint) = constraints.get(name) else {
+        return Err(CatalogError::ParamConstraintViolation {
+            id: permission.to_owned(),
+            param: name.to_owned(),
+            value: value.to_owned(),
+            reason: "parameter has no constraint (record reached resolve unvalidated)",
+        });
+    };
+    if let Some(reason) = constraint.value_defect(value) {
+        return Err(CatalogError::ParamConstraintViolation {
+            id: permission.to_owned(),
+            param: name.to_owned(),
+            value: value.to_owned(),
+            reason,
+        });
+    }
+    Ok(())
+}
+
 /// Render one template string against `params`, returning one or more concrete
 /// strings (one per list-param element, or exactly one for an all-scalar
 /// template). Records every param key it consumed in `used_params`.
+///
+/// Each substituted value is checked against `constraints` (the resolved
+/// permission's `[params.<name>]` table) BEFORE it is spliced in — and before
+/// the caller's static sudo/path gates run on the rendered string. For a list
+/// param, every element is checked, so one bad element fails the whole render
+/// closed.
 fn render_template(
     permission: &str,
     template: &str,
     params: &std::collections::BTreeMap<String, ParamValue>,
+    constraints: &std::collections::BTreeMap<String, ParamConstraint>,
     used_params: &mut Vec<String>,
 ) -> Result<Vec<String>, CatalogError> {
     // Collect this template's placeholders (deduped, in order). A template with
@@ -2341,6 +3117,9 @@ fn render_template(
                             reason,
                         });
                     }
+                    // Per-record constraint gate, ahead of the static sudo/path
+                    // gates: each list element must satisfy `[params.<name>]`.
+                    check_param_constraint(permission, name, &s, constraints)?;
                     elems.push(s);
                 }
                 if let Some((first, _)) = &list_param {
@@ -2367,6 +3146,8 @@ fn render_template(
                         reason,
                     });
                 }
+                // Per-record constraint gate, ahead of the static sudo/path gates.
+                check_param_constraint(permission, name, &s, constraints)?;
                 scalar_subs.push((name.clone(), s));
             }
         }
@@ -2587,7 +3368,17 @@ include_categories = ["network"]
             includes: Vec::new(),
             include_categories: Vec::new(),
             files: Vec::new(),
+            params: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Build a single-entry `params` map for a `token`-kind constraint with no
+    /// length cap — the common case for the systemd-unit-style placeholders the
+    /// resolve tests exercise.
+    fn token_param(name: &str) -> std::collections::BTreeMap<String, ParamConstraint> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(name.to_owned(), ParamConstraint::Token { max_len: None });
+        m
     }
 
     fn debian12() -> OsTarget {
@@ -2887,6 +3678,113 @@ include_categories = ["network"]
         assert_eq!(from_diag.via.as_deref(), Some("network-diag"));
         let from_admin = r.groups.iter().find(|p| p.value == "netdev").unwrap();
         assert_eq!(from_admin.via.as_deref(), Some("network-admin"));
+    }
+
+    #[test]
+    fn bundle_members_conflicting_param_constraint_rejected() {
+        // Two members share the placeholder name `{unit}` but constrain it
+        // differently — one as a free token, one as a closed enum. The bundle
+        // expands both members' templates into one shared `{unit}` domain, so a
+        // first-writer-wins merge would silently bind `{unit}` to one member's
+        // constraint and let the other's template render values its author never
+        // sanctioned. The merge must fail closed instead.
+        let mut enum_unit = std::collections::BTreeMap::new();
+        enum_unit.insert(
+            "unit".to_owned(),
+            ParamConstraint::Enum {
+                values: vec!["ssh".to_owned()],
+            },
+        );
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec![
+                        "/usr/bin/systemctl restart {unit}".to_owned()
+                    ]),
+                    params: token_param("unit"),
+                    ..def("svc-token")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(
+                        vec!["/usr/bin/systemctl status {unit}".to_owned()],
+                    ),
+                    params: enum_unit,
+                    ..def("svc-enum")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    includes: vec!["svc-token".to_owned(), "svc-enum".to_owned()],
+                    ..def("svc-bundle")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve("svc-bundle", &os, &cat, &ctx()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CatalogError::ConflictingParamConstraint { ref id, ref param }
+                    if id == "svc-bundle" && param == "unit"
+            ),
+            "expected ConflictingParamConstraint, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bundle_members_identical_param_constraint_merges() {
+        // The legitimate case the guard must NOT break: two members both declare
+        // `{unit}` as the SAME token constraint. The merge is idempotent and the
+        // bundle resolves cleanly with one constraint in effect.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec![
+                        "/usr/bin/systemctl restart {unit}".to_owned()
+                    ]),
+                    params: token_param("unit"),
+                    ..def("svc-a")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(
+                        vec!["/usr/bin/systemctl status {unit}".to_owned()],
+                    ),
+                    params: token_param("unit"),
+                    ..def("svc-b")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    includes: vec!["svc-a".to_owned(), "svc-b".to_owned()],
+                    ..def("svc-bundle")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (r, _) = resolve("svc-bundle", &os, &cat, &ctx()).unwrap();
+        // One constraint survives for the shared name, and both members' templates
+        // came through.
+        assert_eq!(
+            r.params.get("unit"),
+            Some(&ParamConstraint::Token { max_len: None })
+        );
+        let mut sudo = values(&r.sudo);
+        sudo.sort();
+        assert_eq!(
+            sudo,
+            vec![
+                "/usr/bin/systemctl restart {unit}",
+                "/usr/bin/systemctl status {unit}"
+            ]
+        );
     }
 
     #[test]
@@ -4171,6 +5069,7 @@ include_categories = ["network"]
                     "/usr/bin/systemctl restart {unit}.service".to_owned(),
                     "/usr/bin/systemctl status {unit}.service".to_owned(),
                 ]),
+                params: token_param("unit"),
                 ..def("service-restart")
             },
         );
@@ -4192,6 +5091,7 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                params: token_param("unit"),
                 ..def("svc")
             },
         );
@@ -4228,6 +5128,7 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                params: token_param("unit"),
                 ..def("svc")
             },
         );
@@ -4269,6 +5170,7 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                params: token_param("unit"),
                 ..def("svc")
             },
         );
@@ -4310,6 +5212,7 @@ include_categories = ["network"]
             PermissionDef {
                 // The whole command is the placeholder → renders to a bare token.
                 sudo: ListOverride::Replace(vec!["{cmd}".to_owned()]),
+                params: token_param("cmd"),
                 ..def("svc")
             },
         );
@@ -4331,6 +5234,7 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/{tool}".to_owned()]),
+                params: token_param("tool"),
                 ..def("svc")
             },
         );
@@ -4354,6 +5258,11 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/x {a} {b}".to_owned()]),
+                params: {
+                    let mut m = token_param("a");
+                    m.insert("b".to_owned(), ParamConstraint::Token { max_len: None });
+                    m
+                },
                 ..def("svc")
             },
         );
@@ -4373,6 +5282,11 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/{verb} {unit}".to_owned()]),
+                params: {
+                    let mut m = token_param("verb");
+                    m.insert("unit".to_owned(), ParamConstraint::Token { max_len: None });
+                    m
+                },
                 ..def("svc")
             },
         );
@@ -4395,6 +5309,7 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 groups: ListOverride::Replace(vec!["svc-{unit}".to_owned()]),
+                params: token_param("unit"),
                 ..def("svc")
             },
         );
@@ -4412,6 +5327,7 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                params: token_param("unit"),
                 ..def("svc")
             },
         );
@@ -4440,9 +5356,9 @@ access = "ro"
         .unwrap();
         assert_eq!(def.files.len(), 2);
         assert_eq!(def.files[0].path, "/etc/ssh");
-        assert_eq!(def.files[0].access, Access::Rw);
+        assert_eq!(def.files[0].access, Access::RW);
         assert!(def.files[0].recursive);
-        assert_eq!(def.files[1].access, Access::Ro);
+        assert_eq!(def.files[1].access, Access::RO);
         // recursive defaults to false when absent.
         assert!(!def.files[1].recursive);
     }
@@ -4458,6 +5374,279 @@ access = "rw"
 bogus = true
 "#;
         assert!(toml::from_str::<PermissionDef>(src).is_err());
+    }
+
+    #[test]
+    fn file_grant_new_access_forms_parse() {
+        // A `[[file]]` grant accepts the new forms: a compact letter string and a
+        // bit-name array, alongside the legacy aliases.
+        let def: PermissionDef = toml::from_str(
+            r#"
+id = "fs"
+[[file]]
+path = "/usr/local/bin/tool"
+access = "rx"
+[[file]]
+path = "/srv/data"
+access = ["read", "write"]
+recursive = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(def.files[0].access, Access::READ | Access::EXECUTE);
+        assert_eq!(def.files[1].access, Access::READ | Access::WRITE);
+    }
+
+    #[test]
+    fn file_grant_append_access_rejected_fail_closed() {
+        // `append` is not declarable (no append bit, no backend); a grant naming
+        // it fails closed at parse rather than silently degrading.
+        let compact = r#"
+id = "fs"
+[[file]]
+path = "/var/log/app.log"
+access = "a"
+"#;
+        assert!(toml::from_str::<PermissionDef>(compact).is_err());
+        let array = r#"
+id = "fs"
+[[file]]
+path = "/var/log/app.log"
+access = ["append"]
+"#;
+        assert!(toml::from_str::<PermissionDef>(array).is_err());
+    }
+
+    // --- Access bit set: parse, union, canonical token ---
+
+    /// Parse one access value from a standalone `access = <value>` TOML fragment.
+    fn parse_access(value: &str) -> Result<Access, toml::de::Error> {
+        #[derive(Deserialize)]
+        struct Wrap {
+            access: Access,
+        }
+        toml::from_str::<Wrap>(&format!("access = {value}")).map(|w| w.access)
+    }
+
+    #[test]
+    fn access_legacy_aliases_map_to_fixed_sets() {
+        // `ro` == {read, traverse}; `rw` == {read, write, traverse}. These are the
+        // sets that preserve the historical ACL strings (proven in fileaccess.rs).
+        assert_eq!(parse_access("\"ro\"").unwrap(), Access::RO);
+        assert_eq!(parse_access("\"rw\"").unwrap(), Access::RW);
+        assert_eq!(
+            Access::RO,
+            Access::READ | Access::TRAVERSE,
+            "ro is read+traverse"
+        );
+        assert_eq!(
+            Access::RW,
+            Access::READ | Access::WRITE | Access::TRAVERSE,
+            "rw is read+write+traverse"
+        );
+    }
+
+    #[test]
+    fn access_compact_letters_parse() {
+        assert_eq!(parse_access("\"r\"").unwrap(), Access::READ);
+        assert_eq!(parse_access("\"w\"").unwrap(), Access::WRITE);
+        assert_eq!(parse_access("\"x\"").unwrap(), Access::EXECUTE);
+        assert_eq!(
+            parse_access("\"rx\"").unwrap(),
+            Access::READ | Access::EXECUTE
+        );
+        assert_eq!(
+            parse_access("\"rwx\"").unwrap(),
+            Access::READ | Access::WRITE | Access::EXECUTE
+        );
+    }
+
+    #[test]
+    fn access_bit_name_array_parses() {
+        assert_eq!(
+            parse_access("[\"read\", \"traverse\"]").unwrap(),
+            Access::RO
+        );
+        assert_eq!(
+            parse_access("[\"read\", \"execute\"]").unwrap(),
+            Access::READ | Access::EXECUTE
+        );
+        assert_eq!(parse_access("[\"write\"]").unwrap(), Access::WRITE);
+        // Order does not matter — it is a set.
+        assert_eq!(
+            parse_access("[\"traverse\", \"read\"]").unwrap(),
+            Access::READ | Access::TRAVERSE
+        );
+    }
+
+    #[test]
+    fn access_unknown_or_append_token_rejected_fail_closed() {
+        // Legacy typo, a bare unknown letter, an empty value, the never-declarable
+        // `append`, and an unknown bit name all fail closed at parse.
+        assert!(parse_access("\"wo\"").is_err());
+        assert!(parse_access("\"q\"").is_err());
+        assert!(parse_access("\"\"").is_err());
+        assert!(parse_access("\"append\"").is_err());
+        assert!(parse_access("\"a\"").is_err());
+        assert!(parse_access("[\"append\"]").is_err());
+        assert!(parse_access("[\"read\", \"bogus\"]").is_err());
+        // Empty array names no capability.
+        assert!(parse_access("[]").is_err());
+        // A duplicate letter/name is a typo, not a wider grant.
+        assert!(parse_access("\"rr\"").is_err());
+        assert!(parse_access("[\"read\", \"read\"]").is_err());
+    }
+
+    #[test]
+    fn access_noncanonical_compact_spellings_rejected() {
+        // The compact grammar accepts ONLY the eight canonical spellings the schema
+        // advertises. A misordered string, or capital `X` as a traverse spelling,
+        // is rejected so the parser never drifts wider than the contract — the
+        // bit-name array is the way to express those sets.
+        assert!(parse_access("\"xr\"").is_err(), "misordered xr rejected");
+        assert!(parse_access("\"wr\"").is_err(), "misordered wr rejected");
+        assert!(
+            parse_access("\"rX\"").is_err(),
+            "capital-X compact rejected"
+        );
+        assert!(parse_access("\"X\"").is_err(), "bare capital X rejected");
+        assert!(parse_access("\"xw\"").is_err(), "misordered xw rejected");
+        // The array form is how a traverse-bearing non-legacy set is expressed.
+        assert_eq!(
+            parse_access("[\"read\", \"traverse\"]").unwrap(),
+            Access::RO
+        );
+        assert_eq!(
+            parse_access("[\"write\", \"traverse\"]").unwrap(),
+            Access::WRITE | Access::TRAVERSE
+        );
+    }
+
+    #[test]
+    fn bundle_members_param_constraint_default_max_len_not_conflicting() {
+        // A member declaring `max_len = 256` (the default) and another leaving it
+        // implicit declare the SAME effective token constraint; the merge must be
+        // idempotent, not a false ConflictingParamConstraint.
+        let mut explicit = std::collections::BTreeMap::new();
+        explicit.insert(
+            "unit".to_owned(),
+            ParamConstraint::Token {
+                max_len: Some(PARAM_DEFAULT_MAX_LEN),
+            },
+        );
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec![
+                        "/usr/bin/systemctl restart {unit}".to_owned()
+                    ]),
+                    params: token_param("unit"), // max_len: None (implicit default)
+                    ..def("svc-implicit")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(
+                        vec!["/usr/bin/systemctl status {unit}".to_owned()],
+                    ),
+                    params: explicit, // max_len: Some(default)
+                    ..def("svc-explicit")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    includes: vec!["svc-implicit".to_owned(), "svc-explicit".to_owned()],
+                    ..def("svc-bundle")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (r, _) = resolve("svc-bundle", &os, &cat, &ctx())
+            .expect("identical-effective constraints must merge, not conflict");
+        assert!(r.params.contains_key("unit"));
+    }
+
+    #[test]
+    fn access_union_is_bit_or_idempotent_and_order_independent() {
+        let a = Access::READ;
+        let b = Access::WRITE | Access::TRAVERSE;
+        let want = Access::READ | Access::WRITE | Access::TRAVERSE;
+        assert_eq!(a | b, want);
+        assert_eq!(b | a, want, "commutative");
+        assert_eq!(want | want, want, "idempotent");
+        assert_eq!(a.union(a), a, "self-union is identity");
+
+        let mut acc = Access::READ;
+        acc |= Access::WRITE;
+        assert_eq!(acc, Access::READ | Access::WRITE);
+    }
+
+    #[test]
+    fn access_serde_round_trips_every_set() {
+        // The serialized form (legacy string for ro/rw, bit-name array otherwise)
+        // must re-deserialize to the same set for EVERY combination — this is what
+        // keeps the persisted managed-registry grant stable across writes.
+        let all = [
+            Access::READ,
+            Access::WRITE,
+            Access::EXECUTE,
+            Access::TRAVERSE,
+        ];
+        // Every non-empty subset of the four bits, plus the legacy sets.
+        for mask in 1u8..=0b1111 {
+            let mut set = Access(0);
+            for (i, bit) in all.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    set |= *bit;
+                }
+            }
+            #[derive(serde::Serialize, Deserialize, PartialEq, Debug)]
+            struct Wrap {
+                access: Access,
+            }
+            let toml_str = toml::to_string(&Wrap { access: set }).unwrap();
+            let back: Wrap = toml::from_str(&toml_str).unwrap();
+            assert_eq!(back.access, set, "serde round-trip for {set:?}\n{toml_str}");
+        }
+    }
+
+    #[test]
+    fn access_legacy_sets_serialize_to_legacy_strings() {
+        // ro/rw keep their historical string spelling so a registry written before
+        // the bit-set change still reads back unchanged.
+        #[derive(serde::Serialize)]
+        struct Wrap {
+            access: Access,
+        }
+        assert_eq!(
+            toml::to_string(&Wrap { access: Access::RO }).unwrap(),
+            "access = \"ro\"\n"
+        );
+        assert_eq!(
+            toml::to_string(&Wrap { access: Access::RW }).unwrap(),
+            "access = \"rw\"\n"
+        );
+        // A non-legacy set serializes as the bit-name array (NOT a colliding
+        // letter string).
+        assert_eq!(
+            toml::to_string(&Wrap {
+                access: Access::READ | Access::WRITE
+            })
+            .unwrap(),
+            "access = [\"read\", \"write\"]\n"
+        );
+    }
+
+    #[test]
+    fn access_display_tokens() {
+        assert_eq!(Access::RO.to_string(), "ro");
+        assert_eq!(Access::RW.to_string(), "rw");
+        assert_eq!(Access::READ.to_string(), "r");
+        assert_eq!(Access::EXECUTE.to_string(), "x");
+        assert_eq!((Access::READ | Access::WRITE).to_string(), "rw");
+        assert_eq!((Access::READ | Access::EXECUTE).to_string(), "rx");
     }
 
     #[test]
@@ -4490,7 +5679,7 @@ access = "wo"
     fn file_path_relative_rejected_at_read_boundary() {
         // A relative path would become a root setfacl target resolved against cwd.
         let cat = FakeCatalog::new();
-        let bad = file_def("a", vec![grant("etc/ssh", Access::Rw, true)]);
+        let bad = file_def("a", vec![grant("etc/ssh", Access::RW, true)]);
         // validate() runs at the read boundary; FakeCatalog.read_layer triggers it.
         let cat = cat.with("linux", bad);
         let err =
@@ -4506,7 +5695,7 @@ access = "wo"
     fn file_path_dotdot_component_rejected() {
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("a", vec![grant("/etc/ssh/../shadow", Access::Ro, false)]),
+            file_def("a", vec![grant("/etc/ssh/../shadow", Access::RO, false)]),
         );
         let err =
             resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap_err();
@@ -4520,7 +5709,7 @@ access = "wo"
     fn file_path_control_char_rejected() {
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("a", vec![grant("/etc/ss\nh", Access::Ro, false)]),
+            file_def("a", vec![grant("/etc/ss\nh", Access::RO, false)]),
         );
         let err =
             resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap_err();
@@ -4533,34 +5722,34 @@ access = "wo"
     #[test]
     fn dotdot_inside_name_is_allowed() {
         // `a..b` as a longer component is not a traversal; only a bare `..` is.
-        let g = grant("/etc/my..app", Access::Ro, true);
+        let g = grant("/etc/my..app", Access::RO, true);
         assert_eq!(file_path_static_defect(&g.path), None);
     }
 
     #[test]
     fn shape_derivation_rule() {
         // recursive=true → Dir.
-        assert_eq!(grant("/etc/ssh", Access::Rw, true).shape(), Shape::Dir);
+        assert_eq!(grant("/etc/ssh", Access::RW, true).shape(), Shape::Dir);
         // trailing slash → Dir even without recursive.
-        assert_eq!(grant("/etc/ssh/", Access::Rw, false).shape(), Shape::Dir);
+        assert_eq!(grant("/etc/ssh/", Access::RW, false).shape(), Shape::Dir);
         // bare path, no recursive, no slash → File (the AclBackend refuses these,
         // steering authors to widen to a directory).
-        assert_eq!(grant("/etc/ssh", Access::Rw, false).shape(), Shape::File);
+        assert_eq!(grant("/etc/ssh", Access::RW, false).shape(), Shape::File);
         // glob metachar → Pattern, regardless of recursive.
         assert_eq!(
-            grant("/var/log/*.log", Access::Ro, false).shape(),
+            grant("/var/log/*.log", Access::RO, false).shape(),
             Shape::Pattern
         );
         assert_eq!(
-            grant("/var/log/*.log", Access::Ro, true).shape(),
+            grant("/var/log/*.log", Access::RO, true).shape(),
             Shape::Pattern
         );
         assert_eq!(
-            grant("/etc/conf?", Access::Ro, false).shape(),
+            grant("/etc/conf?", Access::RO, false).shape(),
             Shape::Pattern
         );
         assert_eq!(
-            grant("/etc/[abc]", Access::Ro, false).shape(),
+            grant("/etc/[abc]", Access::RO, false).shape(),
             Shape::Pattern
         );
     }
@@ -4572,7 +5761,7 @@ access = "wo"
         // is silently ineffective) and must fail closed at the read boundary.
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("a", vec![grant("/etc/ssh/", Access::Rw, false)]),
+            file_def("a", vec![grant("/etc/ssh/", Access::RW, false)]),
         );
         let err =
             resolve_leaf("a", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap_err();
@@ -4585,7 +5774,7 @@ access = "wo"
         // trailing slash + recursive=true → accepted, resolves as Dir.
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("b", vec![grant("/etc/ssh/", Access::Rw, true)]),
+            file_def("b", vec![grant("/etc/ssh/", Access::RW, true)]),
         );
         let (r, _) =
             resolve_leaf("b", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap();
@@ -4594,7 +5783,7 @@ access = "wo"
         // no trailing slash + recursive=true → accepted, Dir.
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("c", vec![grant("/etc/ssh", Access::Rw, true)]),
+            file_def("c", vec![grant("/etc/ssh", Access::RW, true)]),
         );
         let (r, _) =
             resolve_leaf("c", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap();
@@ -4603,7 +5792,7 @@ access = "wo"
         // no trailing slash + recursive=false → accepted, File (unchanged).
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("d", vec![grant("/etc/ssh", Access::Rw, false)]),
+            file_def("d", vec![grant("/etc/ssh", Access::RW, false)]),
         );
         let (r, _) =
             resolve_leaf("d", &OsTarget::new("linux", "debian", None).unwrap(), &cat).unwrap();
@@ -4614,14 +5803,14 @@ access = "wo"
     fn resolve_collects_file_grant_with_provenance() {
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("ssh-admin", vec![grant("/etc/ssh", Access::Rw, true)]),
+            file_def("ssh-admin", vec![grant("/etc/ssh", Access::RW, true)]),
         );
         let os = OsTarget::new("linux", "debian", None).unwrap();
         let (r, _) = resolve_leaf("ssh-admin", &os, &cat).unwrap();
         assert_eq!(r.file_grants.len(), 1);
         let fg = &r.file_grants[0];
         assert_eq!(fg.path, "/etc/ssh");
-        assert_eq!(fg.access, Access::Rw);
+        assert_eq!(fg.access, Access::RW);
         assert!(fg.recursive);
         assert_eq!(fg.shape, Shape::Dir);
         assert_eq!(fg.sources.len(), 1);
@@ -4635,11 +5824,11 @@ access = "wo"
         let cat = FakeCatalog::new()
             .with(
                 "linux",
-                file_def("ssh-admin", vec![grant("/etc/ssh", Access::Ro, false)]),
+                file_def("ssh-admin", vec![grant("/etc/ssh", Access::RO, false)]),
             )
             .with(
                 "linux-debian",
-                file_def("ssh-admin", vec![grant("/etc/ssh", Access::Rw, true)]),
+                file_def("ssh-admin", vec![grant("/etc/ssh", Access::RW, true)]),
             );
         let (r, _) = resolve_leaf("ssh-admin", &debian12(), &cat).unwrap();
         assert_eq!(
@@ -4648,7 +5837,7 @@ access = "wo"
             "same path must union, not duplicate"
         );
         let fg = &r.file_grants[0];
-        assert_eq!(fg.access, Access::Rw, "access widens to max");
+        assert_eq!(fg.access, Access::RW, "access widens to max");
         assert!(fg.recursive, "recursive is OR");
         // Effective recursive flips the file→dir shape.
         assert_eq!(fg.shape, Shape::Dir);
@@ -4663,13 +5852,13 @@ access = "wo"
         let cat = FakeCatalog::new()
             .with(
                 "linux",
-                file_def("a", vec![grant("/etc/ssh", Access::Ro, true)]),
+                file_def("a", vec![grant("/etc/ssh", Access::RO, true)]),
             )
             .with(
                 "linux-debian",
                 PermissionDef {
                     replace: true,
-                    files: vec![grant("/etc/pam.d", Access::Rw, true)],
+                    files: vec![grant("/etc/pam.d", Access::RW, true)],
                     ..def("a")
                 },
             );
@@ -4685,8 +5874,8 @@ access = "wo"
             file_def(
                 "a",
                 vec![
-                    grant("/etc/ssh", Access::Rw, true),
-                    grant("/var/log", Access::Ro, true),
+                    grant("/etc/ssh", Access::RW, true),
+                    grant("/var/log", Access::RO, true),
                 ],
             ),
         );
@@ -4696,11 +5885,28 @@ access = "wo"
         assert_eq!(paths, vec!["/etc/ssh", "/var/log"]);
     }
 
+    /// A file-grant record carrying a per-parameter constraint, for the
+    /// templated-path tests (every placeholder needs a constraint at parse).
+    fn file_def_p(
+        id: &str,
+        grants: Vec<FileGrant>,
+        params: std::collections::BTreeMap<String, ParamConstraint>,
+    ) -> PermissionDef {
+        PermissionDef {
+            params,
+            ..file_def(id, grants)
+        }
+    }
+
     #[test]
     fn templated_file_path_substitutes_and_revalidates() {
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("app-config", vec![grant("/etc/{app}", Access::Rw, true)]),
+            file_def_p(
+                "app-config",
+                vec![grant("/etc/{app}", Access::RW, true)],
+                token_param("app"),
+            ),
         );
         let os = OsTarget::new("linux", "debian", None).unwrap();
         let p = params(vec![("app", toml::Value::String("nginx".to_owned()))]);
@@ -4715,7 +5921,11 @@ access = "wo"
     fn templated_file_path_list_expands_to_multiple_grants() {
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("app-config", vec![grant("/etc/{app}", Access::Rw, true)]),
+            file_def_p(
+                "app-config",
+                vec![grant("/etc/{app}", Access::RW, true)],
+                token_param("app"),
+            ),
         );
         let os = OsTarget::new("linux", "debian", None).unwrap();
         let p = params(vec![("app", arr(&["nginx", "redis"]))]);
@@ -4728,18 +5938,21 @@ access = "wo"
     fn templated_file_path_injection_rejected() {
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("app-config", vec![grant("/etc/{app}", Access::Rw, true)]),
+            file_def_p(
+                "app-config",
+                vec![grant("/etc/{app}", Access::RW, true)],
+                token_param("app"),
+            ),
         );
         let os = OsTarget::new("linux", "debian", None).unwrap();
         // A `..` smuggled via the param renders to a traversal path — must be
-        // rejected by the post-substitution gate. The param-value gate also blocks
-        // many metachars; this asserts the file-path gate as the authoritative one
-        // for a value that survives param validation as a plain token.
+        // rejected by the post-substitution gate. The token constraint admits the
+        // `..`-bearing value (`.` and `/` are valid identifier chars), so the
+        // file-path gate is the authoritative one for the traversal here.
         let p = params(vec![("app", toml::Value::String("ssh".to_owned()))]);
         // Sanity: a clean value passes (so the rejection below is about injection).
         assert!(resolve_with_params("app-config", &p, &os, &cat, &ctx()).is_ok());
-        // A param-level metachar (`/`) is blocked at the param-value gate before
-        // it can build a traversal path.
+        // `/etc/../shadow` renders a `..` component; the file gate rejects it.
         let bad = params(vec![("app", toml::Value::String("../shadow".to_owned()))]);
         assert!(resolve_with_params("app-config", &bad, &os, &cat, &ctx()).is_err());
     }
@@ -4752,11 +5965,319 @@ access = "wo"
         // gate but is non-absolute, proving the file gate is the one that fires.
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("a", vec![grant("/{p}", Access::Ro, false)]),
+            file_def_p(
+                "a",
+                vec![grant("/{p}", Access::RO, false)],
+                token_param("p"),
+            ),
         );
         let os = OsTarget::new("linux", "debian", None).unwrap();
         // Renders to "/etc" — absolute, fine.
         let ok = params(vec![("p", toml::Value::String("etc".to_owned()))]);
         assert!(resolve_with_params("a", &ok, &os, &cat, &ctx()).is_ok());
+    }
+
+    // --- parameter guard rails (feature B): per-record [params.*] constraints ---
+
+    #[test]
+    fn placeholder_without_constraint_rejected_at_parse() {
+        // A template carries {unit} but the record declares no [params.unit]:
+        // fail-closed at the read boundary, before resolve.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                ..def("svc")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve("svc", &os, &cat, &ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            CatalogError::UnconstrainedParam { ref id, ref param }
+                if id == "svc" && param == "unit"
+        ));
+    }
+
+    #[test]
+    fn orphan_constraint_rejected_at_parse() {
+        // A [params.unused] constraint with no matching placeholder is dead
+        // config and rejected at parse (pre-release strictness).
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                params: token_param("unused"),
+                ..def("net")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve("net", &os, &cat, &ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            CatalogError::OrphanParamConstraint { ref id, ref param }
+                if id == "net" && param == "unused"
+        ));
+    }
+
+    #[test]
+    fn malformed_path_constraint_rejected_at_parse() {
+        // A path-kind constraint with an empty allow_prefix would accept any
+        // absolute path, defeating the guard rail — rejected at parse.
+        let mut p = std::collections::BTreeMap::new();
+        p.insert(
+            "app".to_owned(),
+            ParamConstraint::Path {
+                allow_prefix: Vec::new(),
+                deny_glob: None,
+                max_len: None,
+            },
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/bin/edit {app}".to_owned()]),
+                params: p,
+                ..def("svc")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        assert!(matches!(
+            resolve("svc", &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::InvalidParamConstraint { ref id, ref param, .. }
+                if id == "svc" && param == "app"
+        ));
+    }
+
+    #[test]
+    fn path_constraint_rejects_value_outside_allow_prefix() {
+        let mut p = std::collections::BTreeMap::new();
+        p.insert(
+            "path".to_owned(),
+            ParamConstraint::Path {
+                allow_prefix: vec!["/etc/myapp/".to_owned()],
+                deny_glob: None,
+                max_len: None,
+            },
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def_p("app-config", vec![grant("{path}", Access::RW, true)], p),
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        // Under the prefix → accepted.
+        let ok = params(vec![(
+            "path",
+            toml::Value::String("/etc/myapp/conf/".to_owned()),
+        )]);
+        assert!(resolve_with_params("app-config", &ok, &os, &cat, &ctx()).is_ok());
+        // The classic fail-open target: /etc/shadow is not under the prefix.
+        let bad = params(vec![(
+            "path",
+            toml::Value::String("/etc/shadow".to_owned()),
+        )]);
+        assert!(matches!(
+            resolve_with_params("app-config", &bad, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::ParamConstraintViolation { ref id, ref param, .. }
+                if id == "app-config" && param == "path"
+        ));
+    }
+
+    #[test]
+    fn path_constraint_denies_glob_by_default() {
+        // The path-kind `deny_glob` (default true) is the second line of defence
+        // behind the param-value gate, which already forbids `*?[` for sudo
+        // safety. Exercise the constraint directly so its glob policy is tested
+        // independent of which gate fires first at resolve.
+        let c = ParamConstraint::Path {
+            allow_prefix: vec!["/srv/".to_owned()],
+            deny_glob: None, // default true
+            max_len: None,
+        };
+        assert!(c
+            .value_defect("/srv/*.conf")
+            .is_some_and(|r| r.contains("glob")));
+        // The same value under an explicit deny_glob=false is allowed (prefix ok).
+        let c_allow = ParamConstraint::Path {
+            allow_prefix: vec!["/srv/".to_owned()],
+            deny_glob: Some(false),
+            max_len: None,
+        };
+        assert!(c_allow.value_defect("/srv/*.conf").is_none());
+
+        // And at resolve, a glob value still fails closed (the param-value gate is
+        // the one that fires first here) — the path is never widened to a pattern.
+        let mut p = std::collections::BTreeMap::new();
+        p.insert(
+            "path".to_owned(),
+            ParamConstraint::Path {
+                allow_prefix: vec!["/srv/".to_owned()],
+                deny_glob: None,
+                max_len: None,
+            },
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            file_def_p("g", vec![grant("{path}", Access::RO, true)], p),
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let bad = params(vec![(
+            "path",
+            toml::Value::String("/srv/*.conf".to_owned()),
+        )]);
+        assert!(resolve_with_params("g", &bad, &os, &cat, &ctx()).is_err());
+    }
+
+    #[test]
+    fn enum_constraint_rejects_value_not_in_list() {
+        let mut p = std::collections::BTreeMap::new();
+        p.insert(
+            "verb".to_owned(),
+            ParamConstraint::Enum {
+                values: vec!["start".to_owned(), "stop".to_owned()],
+            },
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/bin/systemctl {verb} nginx".to_owned()]),
+                params: p,
+                ..def("svc")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        // Allowed value → accepted.
+        let ok = params(vec![("verb", toml::Value::String("start".to_owned()))]);
+        assert!(resolve_with_params("svc", &ok, &os, &cat, &ctx()).is_ok());
+        // A verb outside the set (e.g. `mask`) is refused.
+        let bad = params(vec![("verb", toml::Value::String("mask".to_owned()))]);
+        assert!(matches!(
+            resolve_with_params("svc", &bad, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::ParamConstraintViolation { ref param, .. } if param == "verb"
+        ));
+    }
+
+    #[test]
+    fn token_constraint_rejects_illegal_char() {
+        // A token value carrying a char outside the safe identifier charset (a
+        // space is already blocked by the param-value gate; use a `,` which the
+        // FORBIDDEN set blocks — so use a `;`? both are blocked earlier). Use a
+        // char the param-value gate permits but the token charset does not: the
+        // param-value gate permits e.g. `+`, the token charset does not.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                params: token_param("unit"),
+                ..def("svc")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let bad = params(vec![("unit", toml::Value::String("ngin+x".to_owned()))]);
+        assert!(matches!(
+            resolve_with_params("svc", &bad, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::ParamConstraintViolation { ref param, .. } if param == "unit"
+        ));
+        // A clean systemd-style instance name passes (charset includes @, -).
+        let ok = params(vec![(
+            "unit",
+            toml::Value::String("wg-quick@wg0".to_owned()),
+        )]);
+        assert!(resolve_with_params("svc", &ok, &os, &cat, &ctx()).is_ok());
+    }
+
+    #[test]
+    fn token_constraint_enforces_max_len() {
+        let mut p = std::collections::BTreeMap::new();
+        p.insert(
+            "unit".to_owned(),
+            ParamConstraint::Token { max_len: Some(4) },
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                params: p,
+                ..def("svc")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let bad = params(vec![("unit", toml::Value::String("nginx".to_owned()))]);
+        assert!(matches!(
+            resolve_with_params("svc", &bad, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::ParamConstraintViolation { reason, .. } if reason.contains("max_len")
+        ));
+    }
+
+    #[test]
+    fn list_param_one_bad_element_fails_closed() {
+        // A list param expands to one Cmnd per element; a SINGLE element outside
+        // the constraint must fail the whole resolve closed, not silently drop.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {units}".to_owned()]),
+                params: token_param("units"),
+                ..def("svc")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        // First element clean, second carries an illegal char.
+        let bad = params(vec![("units", arr(&["nginx", "ngin+x"]))]);
+        assert!(matches!(
+            resolve_with_params("svc", &bad, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::ParamConstraintViolation { ref param, .. } if param == "units"
+        ));
+        // All-clean list resolves.
+        let ok = params(vec![("units", arr(&["nginx", "redis"]))]);
+        assert!(resolve_with_params("svc", &ok, &os, &cat, &ctx()).is_ok());
+    }
+
+    #[test]
+    fn params_table_parses_from_toml() {
+        // The on-disk [params.<name>] surface deserializes into the right kinds,
+        // and an unknown key inside a constraint is rejected (deny_unknown_fields).
+        let def: PermissionDef = toml::from_str(
+            r#"
+id = "svc"
+sudo = ["/usr/bin/systemctl {verb} {units}"]
+[[file]]
+path = "{cfg}"
+access = "rw"
+recursive = true
+[params.units]
+kind = "token"
+[params.verb]
+kind = "enum"
+values = ["start", "stop"]
+[params.cfg]
+kind = "path"
+allow_prefix = ["/etc/app/"]
+deny_glob = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(def.params.len(), 3);
+        assert!(matches!(
+            def.params.get("units"),
+            Some(ParamConstraint::Token { max_len: None })
+        ));
+        assert!(matches!(
+            def.params.get("verb"),
+            Some(ParamConstraint::Enum { values }) if values.len() == 2
+        ));
+        assert!(matches!(
+            def.params.get("cfg"),
+            Some(ParamConstraint::Path {
+                deny_glob: Some(false),
+                ..
+            })
+        ));
+
+        // Unknown key inside a token constraint is rejected.
+        assert!(toml::from_str::<PermissionDef>(
+            "id = \"svc\"\nsudo = [\"/x {u}\"]\n[params.u]\nkind = \"token\"\nbogus = 1\n"
+        )
+        .is_err());
     }
 }

@@ -2,3 +2,13 @@ id       = "session-terminate"
 risk     = "escalation-capable"
 category = "os-config"
 sudo     = ["/usr/bin/loginctl terminate-user {user}", "/usr/bin/loginctl terminate-session {session}"]
+
+# Guard rails for the two placeholders. {user} is a login/UID and {session} is a
+# loginctl session id (a short alphanumeric like `c1`/`42`); both fit the token
+# identifier charset, which keeps a sudoers/shell metacharacter out of the
+# rendered Cmnd. Enforced at resolve, ahead of the static sudo gate.
+[params.user]
+kind = "token"
+
+[params.session]
+kind = "token"

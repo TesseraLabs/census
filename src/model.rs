@@ -224,7 +224,7 @@ pub struct ResolvedAccount {
     /// permission expansion. An explicit raw limit wins over an expanded one.
     pub limits: Limits,
     /// File-access grants, unioned across every permission the role carries
-    /// (by path: access widens to the max, `recursive` is the OR, provenance
+    /// (by path: access is the bit-union, `recursive` is the OR, provenance
     /// accumulates) — the same rule the catalog applies within one permission.
     /// Materialized by a [`crate::fileaccess::FileAccessBackend`] in the apply
     /// file-access phase; there is no raw escape-hatch for file grants (they
@@ -355,7 +355,7 @@ pub struct ResolvedGroup {
     /// Materialized as a `%group` NOPASSWD sudoers fragment.
     pub sudo_commands: Vec<SudoCommand>,
     /// File-access grants the bound roles grant the group, unioned by path
-    /// (access widens to the max, `recursive` is the OR, provenance accumulates)
+    /// (access is the bit-union, `recursive` is the OR, provenance accumulates)
     /// — the same rule resolve applies to an account. Materialized as `g:group`
     /// ACL entries.
     pub file_grants: Vec<catalog::ResolvedFileGrant>,
@@ -948,7 +948,16 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::catalog::{FakeCatalog, ListOverride, PermissionDef};
+    use crate::catalog::{FakeCatalog, ListOverride, ParamConstraint, PermissionDef};
+
+    /// A single `token`-kind constraint for a named placeholder — every catalog
+    /// record must constrain each placeholder it uses, and the model tests only
+    /// exercise systemd-unit-shaped tokens.
+    fn token_param(name: &str) -> std::collections::BTreeMap<String, ParamConstraint> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(name.to_owned(), ParamConstraint::Token { max_len: None });
+        m
+    }
 
     /// A fixed OS target for tests (no /etc/os-release dependency).
     fn os() -> OsTarget {
@@ -982,6 +991,7 @@ mod tests {
             includes: Vec::new(),
             include_categories: Vec::new(),
             files: Vec::new(),
+            params: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1137,6 +1147,7 @@ uid = 9010
                     "/usr/bin/systemctl restart {unit}".to_owned(),
                     "/usr/bin/systemctl restart {unit}.service".to_owned(),
                 ]),
+                params: token_param("unit"),
                 ..def("service-restart")
             },
         );
@@ -1175,6 +1186,7 @@ uid = 9010
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                params: token_param("unit"),
                 ..def("service-restart")
             },
         );
@@ -1201,6 +1213,7 @@ uid = 9010
             "linux",
             PermissionDef {
                 sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {unit}".to_owned()]),
+                params: token_param("unit"),
                 ..def("service-restart")
             },
         );
@@ -1444,7 +1457,7 @@ uid = 9010
             PermissionDef {
                 files: vec![FileGrant {
                     path: "/etc/ssh".to_owned(),
-                    access: Access::Rw,
+                    access: Access::RW,
                     recursive: true,
                 }],
                 ..def("fs-edit")
@@ -1456,7 +1469,7 @@ uid = 9010
         let a = &resolved[0];
         assert_eq!(a.file_grants.len(), 1);
         assert_eq!(a.file_grants[0].path, "/etc/ssh");
-        assert_eq!(a.file_grants[0].access, Access::Rw);
+        assert_eq!(a.file_grants[0].access, Access::RW);
         assert!(a.file_grants[0].recursive);
         assert_eq!(a.file_grants[0].shape, Shape::Dir);
     }
@@ -1473,7 +1486,7 @@ uid = 9010
                 PermissionDef {
                     files: vec![FileGrant {
                         path: "/etc/ssh".to_owned(),
-                        access: Access::Ro,
+                        access: Access::RO,
                         recursive: false,
                     }],
                     ..def("fs-read")
@@ -1484,7 +1497,7 @@ uid = 9010
                 PermissionDef {
                     files: vec![FileGrant {
                         path: "/etc/ssh".to_owned(),
-                        access: Access::Rw,
+                        access: Access::RW,
                         recursive: true,
                     }],
                     ..def("fs-edit")
@@ -1495,12 +1508,60 @@ uid = 9010
         let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
         let a = &resolved[0];
         assert_eq!(a.file_grants.len(), 1, "same path unions to one grant");
-        assert_eq!(a.file_grants[0].access, Access::Rw, "access widens to rw");
+        assert_eq!(a.file_grants[0].access, Access::RW, "access widens to rw");
         assert!(a.file_grants[0].recursive, "recursive ORs to true");
         assert_eq!(
             a.file_grants[0].sources.len(),
             2,
             "both contributors recorded"
+        );
+    }
+
+    #[test]
+    fn file_grants_union_across_permissions_is_bit_or() {
+        use crate::catalog::{Access, FileGrant};
+        // One permission grants {read} on a path, another grants {write, traverse}
+        // on the same path. The account-level union must be the bit-OR
+        // {read, write, traverse} == legacy rw — proving access composes by bits,
+        // not by picking a ladder winner.
+        let (_tmp, decl) = fixture("[payload]\npermissions = [\"fs-r\", \"fs-wt\"]\n");
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    files: vec![FileGrant {
+                        path: "/srv/data".to_owned(),
+                        access: Access::READ,
+                        recursive: true,
+                    }],
+                    ..def("fs-r")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    files: vec![FileGrant {
+                        path: "/srv/data".to_owned(),
+                        access: Access::WRITE | Access::TRAVERSE,
+                        recursive: true,
+                    }],
+                    ..def("fs-wt")
+                },
+            );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let a = &resolved[0];
+        assert_eq!(a.file_grants.len(), 1, "same path unions to one grant");
+        assert_eq!(
+            a.file_grants[0].access,
+            Access::READ | Access::WRITE | Access::TRAVERSE,
+            "access is the bit-OR of the two grants"
+        );
+        assert_eq!(
+            a.file_grants[0].access,
+            Access::RW,
+            "the union equals legacy rw"
         );
     }
 
@@ -1517,7 +1578,7 @@ uid = 9010
         let a = &resolved[0];
         assert_eq!(a.file_grants.len(), 1);
         assert_eq!(a.file_grants[0].path, "/etc/X11/xorg.conf.d/99-cal.conf");
-        assert_eq!(a.file_grants[0].access, Access::Rw);
+        assert_eq!(a.file_grants[0].access, Access::RW);
         assert!(!a.file_grants[0].recursive);
         assert_eq!(a.file_grants[0].shape, Shape::File);
         // Honest provenance: the raw role grant's source layer is `role:<name>`.
@@ -1551,7 +1612,7 @@ uid = 9010
             PermissionDef {
                 files: vec![FileGrant {
                     path: "/etc/ssh".to_owned(),
-                    access: Access::Rw,
+                    access: Access::RW,
                     recursive: true,
                 }],
                 ..def("fs-edit")
@@ -1563,7 +1624,7 @@ uid = 9010
         let a = &resolved[0];
         assert_eq!(a.file_grants.len(), 1, "same path unions to one grant");
         assert_eq!(a.file_grants[0].path, "/etc/ssh");
-        assert_eq!(a.file_grants[0].access, Access::Rw, "access widens to rw");
+        assert_eq!(a.file_grants[0].access, Access::RW, "access widens to rw");
         assert!(a.file_grants[0].recursive, "recursive ORs to true");
         assert_eq!(
             a.file_grants[0].sources.len(),
@@ -1896,7 +1957,7 @@ home_base = "/var/lib/census/home"
                 }),
                 files: vec![crate::catalog::FileGrant {
                     path: "/etc/net".to_owned(),
-                    access: crate::catalog::Access::Rw,
+                    access: crate::catalog::Access::RW,
                     recursive: true,
                 }],
                 ..def("net-admin")
@@ -1950,7 +2011,7 @@ home_base = "/var/lib/census/home"
         let g = &groups[0];
         assert_eq!(g.file_grants.len(), 1);
         assert_eq!(g.file_grants[0].path, "/etc/net");
-        assert_eq!(g.file_grants[0].access, Access::Rw);
+        assert_eq!(g.file_grants[0].access, Access::RW);
         assert!(g.file_grants[0].recursive);
         assert_eq!(g.file_grants[0].sources[0].layer, "role:netops");
         assert_eq!(g.bound_roles, vec!["netops"]);

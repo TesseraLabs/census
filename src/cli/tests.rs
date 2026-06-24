@@ -362,6 +362,7 @@ fn compiled_perm(
             limits_layer: None,
             category_members: Vec::new(),
             resolved_catalog_version: None,
+            params: std::collections::BTreeMap::new(),
         },
     }
 }
@@ -400,6 +401,7 @@ fn compiled_perm_with_file(
             limits_layer: None,
             category_members: Vec::new(),
             resolved_catalog_version: None,
+            params: std::collections::BTreeMap::new(),
         },
     }
 }
@@ -576,9 +578,9 @@ fn render_compile_human_shows_file_grants_dir_and_file() {
         role: "oper".to_owned(),
         permissions: vec![
             // A rewrite-proof dir grant (open AclBackend) ...
-            compiled_perm_with_file("ssh-edit", "/etc/ssh", Access::Rw, true, None),
+            compiled_perm_with_file("ssh-edit", "/etc/ssh", Access::RW, true, None),
             // ... and a per-file grant that needs a capable backend.
-            compiled_perm_with_file("hosts-edit", "/etc/hosts", Access::Ro, false, None),
+            compiled_perm_with_file("hosts-edit", "/etc/hosts", Access::RO, false, None),
         ],
         raw_groups: vec![],
         raw_sudo_role: None,
@@ -604,7 +606,7 @@ fn render_compile_json_emits_file_grants_array_escaped() {
         permissions: vec![compiled_perm_with_file(
             "ssh-edit",
             "/etc/s\"sh",
-            Access::Rw,
+            Access::RW,
             true,
             None,
         )],
@@ -633,7 +635,7 @@ fn render_show_tree_shows_file_grant_with_backend() {
         permissions: vec![compiled_perm_with_file(
             "ssh-edit",
             "/etc/ssh",
-            Access::Rw,
+            Access::RW,
             true,
             None,
         )],
@@ -660,7 +662,7 @@ fn risk_lint_flags_rw_on_root_equivalent() {
         permissions: vec![compiled_perm_with_file(
             "ssh-edit",
             "/etc/ssh",
-            Access::Rw,
+            Access::RW,
             true,
             None,
         )],
@@ -687,7 +689,7 @@ fn risk_lint_flags_secret_path_read() {
         permissions: vec![compiled_perm_with_file(
             "etc-read",
             "/etc",
-            Access::Ro,
+            Access::RO,
             true,
             None,
         )],
@@ -714,7 +716,7 @@ fn risk_lint_flags_ssh_host_key_read() {
         permissions: vec![compiled_perm_with_file(
             "host-key-read",
             "/etc/ssh/ssh_host_rsa_key",
-            Access::Ro,
+            Access::RO,
             false,
             None,
         )],
@@ -735,7 +737,7 @@ fn risk_lint_flags_ssh_host_key_read() {
         permissions: vec![compiled_perm_with_file(
             "sshd-config-read",
             "/etc/ssh/sshd_config",
-            Access::Ro,
+            Access::RO,
             false,
             None,
         )],
@@ -760,7 +762,7 @@ fn risk_lint_clean_grant_no_finding() {
         permissions: vec![compiled_perm_with_file(
             "app-edit",
             "/etc/myapp",
-            Access::Rw,
+            Access::RW,
             true,
             None,
         )],
@@ -812,7 +814,7 @@ fn group_lint_flags_rw_root_equivalent_file_grant() {
     let groups = vec![resolved_group(
         "netops",
         &[],
-        vec![rfg("/etc/ssh", Access::Rw, true)],
+        vec![rfg("/etc/ssh", Access::RW, true)],
     )];
     let findings = group_grant_risk_findings(&groups);
     let f = findings
@@ -851,7 +853,7 @@ fn group_lint_flags_secret_path_grant() {
     let groups = vec![resolved_group(
         "auditors",
         &[],
-        vec![rfg("/etc", Access::Ro, true)],
+        vec![rfg("/etc", Access::RO, true)],
     )];
     let findings = group_grant_risk_findings(&groups);
     let f = findings
@@ -870,7 +872,7 @@ fn group_lint_flags_ssh_host_key_grant() {
     let groups = vec![resolved_group(
         "keyops",
         &[],
-        vec![rfg("/etc/ssh/ssh_host_ed25519_key", Access::Ro, false)],
+        vec![rfg("/etc/ssh/ssh_host_ed25519_key", Access::RO, false)],
     )];
     let findings = group_grant_risk_findings(&groups);
     let f = findings
@@ -890,7 +892,7 @@ fn group_lint_clean_group_has_no_finding() {
     let groups = vec![resolved_group(
         "appops",
         &["/usr/bin/systemctl restart atm-app"],
-        vec![rfg("/etc/myapp", Access::Rw, true)],
+        vec![rfg("/etc/myapp", Access::RW, true)],
     )];
     assert!(group_grant_risk_findings(&groups).is_empty());
 }
@@ -1495,7 +1497,7 @@ fn file_match(perm: &str, path: &str) -> coverage::GrantMatch {
         target: coverage::GrantTarget::Account(perm.to_owned()),
         kind: coverage::GrantKind::File,
         detail: path.to_owned(),
-        access: Some(crate::catalog::Access::Rw),
+        access: Some(crate::catalog::Access::RW),
         recursive: Some(true),
         backend: Some("AclBackend".to_owned()),
         risk: Some(Risk::Contained),
@@ -1524,7 +1526,7 @@ fn group_file_match(group: &str, path: &str) -> coverage::GrantMatch {
         target: coverage::GrantTarget::Group(group.to_owned()),
         kind: coverage::GrantKind::File,
         detail: path.to_owned(),
-        access: Some(crate::catalog::Access::Rw),
+        access: Some(crate::catalog::Access::RW),
         recursive: Some(true),
         backend: Some("AclBackend".to_owned()),
         risk: None,
@@ -1637,7 +1639,7 @@ fn build_grant_sources_skips_templated_and_unresolvable() {
             (
                 "linux",
                 "service-restart",
-                "id = \"service-restart\"\nsudo = [\"/usr/bin/systemctl restart {unit}\"]\n",
+                "id = \"service-restart\"\nsudo = [\"/usr/bin/systemctl restart {unit}\"]\n\n[params.unit]\nkind = \"token\"\n",
             ),
         ],
     );
