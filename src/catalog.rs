@@ -304,8 +304,13 @@ fn has_glob_metachar(path: &str) -> bool {
 /// typo or a smuggled field, not something to silently ignore.
 ///
 /// The `path` is validated (absolute, no control chars, no `..` component) at the
-/// read boundary; `{param}` placeholders are filled and re-validated at resolve
-/// time, mirroring the parametrized-sudo path exactly.
+/// read boundary. `{param}` placeholders here are filled and re-validated at
+/// resolve time, mirroring the parametrized-sudo path exactly — but this
+/// substitution path applies ONLY to a catalog permission grant, which has a
+/// param source (the referencing role's `PermissionRef` params). A raw role
+/// `[payload].files` grant has no param source, so `crate::model` forbids
+/// placeholders there entirely and validates the literal path in full; this type
+/// is shared by both, but only the catalog side ever substitutes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -345,6 +350,40 @@ impl FileGrant {
         } else {
             Shape::File
         }
+    }
+
+    /// Static defect in this grant's literal path, or `None` if it is fit to
+    /// materialize as a root `setfacl` target. Returns the rejection reason.
+    ///
+    /// Two rules, shared with the catalog parse gate so they can never drift
+    /// between a catalog `[[file]]` grant and a raw role `[payload].files` grant:
+    ///   1. the path passes [`file_path_static_defect`] (absolute, no `..`
+    ///      component, no control char, non-empty);
+    ///   2. a trailing `/` (a directory grant) is not paired with
+    ///      `recursive = false` — the flag would be silently ineffective because a
+    ///      directory grant always materializes recursively with a default-ACL, so
+    ///      the contradiction is rejected to force the author to state the intent.
+    ///
+    /// IMPORTANT: a path bearing a `{param}` placeholder is partially EXEMPTED
+    /// here — rule 2 is skipped, and rule 1's absolute-path / `..` checks are also
+    /// deferred by [`file_path_static_defect`] (only control-char / empty are
+    /// rejected). That exemption is sound ONLY for a catalog permission grant,
+    /// whose placeholder is filled and then re-validated in full by the
+    /// authoritative post-substitution gate. It is NOT sufficient on its own for a
+    /// raw role grant, which is never substituted: a caller validating a raw
+    /// `[payload].files` grant MUST first reject any placeholder (see
+    /// [`has_placeholder`]) so the path reaching this method is always literal and
+    /// rules 1 and 2 apply with no exemption. `crate::model` does exactly that.
+    pub(crate) fn static_path_defect(&self) -> Option<&'static str> {
+        if let Some(reason) = file_path_static_defect(&self.path) {
+            return Some(reason);
+        }
+        if self.path.ends_with('/') && !self.recursive && !has_placeholder(&self.path) {
+            return Some(
+                "trailing '/' denotes a recursive directory grant; set recursive=true or remove the trailing slash for a file grant",
+            );
+        }
+        None
     }
 }
 
@@ -479,23 +518,11 @@ impl PermissionDef {
         // (`{param}`) is validated after substitution by the resolver; the static
         // gate still rejects the always-illegal defects (control chars, empty).
         for grant in &self.files {
-            if let Some(reason) = file_path_static_defect(&grant.path) {
+            if let Some(reason) = grant.static_path_defect() {
                 return Err(CatalogError::InvalidFilePath {
                     id: self.id.clone(),
                     path: grant.path.clone(),
                     reason,
-                });
-            }
-            // A trailing '/' denotes a directory grant (Shape::Dir), which the
-            // AclBackend always materializes recursively with a default-ACL. Pairing
-            // it with `recursive = false` is contradictory: the flag would be
-            // silently ineffective. Reject it so the author resolves the intent
-            // explicitly rather than being surprised by a recursive grant.
-            if grant.path.ends_with('/') && !grant.recursive && !has_placeholder(&grant.path) {
-                return Err(CatalogError::InvalidFilePath {
-                    id: self.id.clone(),
-                    path: grant.path.clone(),
-                    reason: "trailing '/' denotes a recursive directory grant; set recursive=true or remove the trailing slash for a file grant",
                 });
             }
         }
@@ -630,7 +657,7 @@ fn runas_defect(value: &str) -> Option<&'static str> {
 /// tree) is unfit. Empty is rejected too. This is the static gate applied to a
 /// literal path at parse time *and* — via [`file_path_defect_substituted`] — to a
 /// `{param}`-rendered path before it reaches root.
-fn file_path_static_defect(path: &str) -> Option<&'static str> {
+pub(crate) fn file_path_static_defect(path: &str) -> Option<&'static str> {
     if path.chars().any(char::is_control) {
         Some("contains a control character")
     } else if path.trim().is_empty() {
@@ -1563,7 +1590,10 @@ pub fn resolve_leaf(
 /// `shape` is derived from the path plus the *effective* (OR'd) `recursive` flag,
 /// so a path stated once as a file and once as recursive resolves to a directory.
 /// `via` tags the bundle member that pulled grants in (`None` for a leaf).
-fn union_file_grants(raw: Vec<(FileGrant, String)>, via: Option<&str>) -> Vec<ResolvedFileGrant> {
+pub(crate) fn union_file_grants(
+    raw: Vec<(FileGrant, String)>,
+    via: Option<&str>,
+) -> Vec<ResolvedFileGrant> {
     let mut out: Vec<ResolvedFileGrant> = Vec::new();
     for (grant, layer) in raw {
         let source = SourcedFileGrant {
@@ -2005,7 +2035,7 @@ fn union_member_primitives(
 // sudoers matches argv exactly, so the author owns which concrete forms exist.
 
 /// Does `s` contain at least one `{name}` placeholder?
-fn has_placeholder(s: &str) -> bool {
+pub(crate) fn has_placeholder(s: &str) -> bool {
     extract_placeholders(s).next().is_some()
 }
 
