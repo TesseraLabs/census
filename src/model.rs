@@ -5,8 +5,8 @@
 //! each role's `payload.permissions` is expanded against the catalog into
 //! concrete Unix primitives BEFORE the plan is built, so `plan`/`apply` work
 //! with roles-in-permissions directly. The raw escape-hatch fields
-//! (`groups`/`sudo_role`/`limits`) are unioned with the expansion; using a raw
-//! primitive alongside permissions is allowed but lint-flagged.
+//! (`groups`/`sudo_role`/`limits`/`files`) are unioned with the expansion; using
+//! a raw primitive alongside permissions is allowed but lint-flagged.
 
 use std::path::PathBuf;
 
@@ -449,12 +449,13 @@ impl ResolvedGroupBuilder {
 /// own lint signals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveWarning {
-    /// A raw escape-hatch primitive (`groups`/`sudo_role`/`limits`) was used on
-    /// a role that also declares permissions. Allowed, but prefer permissions.
+    /// A raw escape-hatch primitive (`groups`/`sudo_role`/`limits`/`files`) was
+    /// used on a role that also declares permissions. Allowed, but prefer
+    /// permissions.
     RawPrimitiveAlongsidePermissions {
         /// Role the warning is about.
         role: String,
-        /// Which raw primitive (`groups`/`sudo_role`/`limits`).
+        /// Which raw primitive (`groups`/`sudo_role`/`limits`/`files`).
         primitive: &'static str,
     },
     /// A bound role expanded an in-group-membership sub-primitive (`groups`)
@@ -529,6 +530,19 @@ pub enum ResolveError {
         /// The undeclared group the binding pointed at.
         group: String,
     },
+    /// A raw `[payload].files` grant carried an invalid path (relative, `..`
+    /// component, control char, or a contradictory trailing-slash/recursive combo).
+    /// Fail-closed before apply — a role escape-hatch file grant is materialized as
+    /// root via setfacl, so an unsafe path must never reach the backend.
+    #[error("role {role}: invalid file grant path {path:?}: {reason}")]
+    InvalidFileGrant {
+        /// The role carrying the bad raw file grant.
+        role: String,
+        /// The rejected file path.
+        path: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
 }
 
 /// Inputs to permission expansion threaded through [`resolve`]. Bundles the
@@ -597,9 +611,43 @@ pub fn resolve(
             }
         }
         let mut sudo_commands: Vec<SudoCommand> = Vec::new();
-        // File grants come ONLY from permissions (no raw escape-hatch). Collect
-        // every permission's resolved grants, then union by path below.
-        let mut file_grants: Vec<catalog::ResolvedFileGrant> = Vec::new();
+        // Seed file grants from the role's raw `[payload].files` escape hatch, then
+        // union the permission-derived grants on top (by path) below: a raw grant
+        // and a permission grant on the same path widen/merge exactly like two
+        // permissions do.
+        //
+        // A raw role path must be a LITERAL, validated as such before it can reach
+        // setfacl as root. A `{placeholder}` only has meaning for a catalog
+        // permission grant (filled from the permission ref's params and re-validated
+        // after substitution); a raw role grant has no param source, so a placeholder
+        // can never be filled. The shared static gate deliberately EXEMPTS
+        // placeholder-bearing paths from the absolute/`..`/trailing-slash checks
+        // (deferring them to the post-substitution gate the catalog path runs), so
+        // an unsubstituted raw path like `{x}/../../etc/shadow` would otherwise slip
+        // through to a root ACL mutation. Reject any placeholder up front; the
+        // literal-only path then gets the full static gate with no exemption gap.
+        // The layer label is honest provenance (`role:<name>`, no bundle `via`).
+        let mut raw_role_grants: Vec<(catalog::FileGrant, String)> =
+            Vec::with_capacity(comp.files.len());
+        for grant in &comp.files {
+            if catalog::has_placeholder(&grant.path) {
+                return Err(ResolveError::InvalidFileGrant {
+                    role: acct.role.clone(),
+                    path: grant.path.clone(),
+                    reason: "raw role file paths must not contain a {placeholder} (only catalog permissions are parametrized)",
+                });
+            }
+            if let Some(reason) = grant.static_path_defect() {
+                return Err(ResolveError::InvalidFileGrant {
+                    role: acct.role.clone(),
+                    path: grant.path.clone(),
+                    reason,
+                });
+            }
+            raw_role_grants.push((grant.clone(), format!("role:{}", acct.role)));
+        }
+        let mut file_grants: Vec<catalog::ResolvedFileGrant> =
+            catalog::union_file_grants(raw_role_grants, None);
         // Raw limits win: capture whether the role set any so an expanded limit
         // never overwrites an explicit operator choice.
         let raw_limits_present = comp.limits != Limits::default();
@@ -625,6 +673,12 @@ pub fn resolve(
                 warnings.push(ResolveWarning::RawPrimitiveAlongsidePermissions {
                     role: acct.role.clone(),
                     primitive: "limits",
+                });
+            }
+            if !comp.files.is_empty() {
+                warnings.push(ResolveWarning::RawPrimitiveAlongsidePermissions {
+                    role: acct.role.clone(),
+                    primitive: "files",
                 });
             }
         }
@@ -780,8 +834,48 @@ pub fn resolve_groups(
 
         // Accumulate this binding's file grants separately, then union by path
         // once after every permission so the by-path widening is applied whole.
-        let mut binding_file_grants: Vec<catalog::ResolvedFileGrant> = Vec::new();
+        // Seed from the bound role's raw `[payload].files` escape hatch: file
+        // grants ARE meaningful on a group (the group principal carries and
+        // materializes them), so unlike the `groups` sub-primitive they are applied,
+        // not dropped. Each raw path must be a LITERAL, validated before it can reach
+        // setfacl as root, and tagged with honest `role:<bound role>` provenance.
+        // A `{placeholder}` is rejected up front for the same reason as the account
+        // path: a raw role grant has no param source, the placeholder can never be
+        // filled, and the shared static gate exempts placeholder paths from the
+        // absolute/`..`/trailing-slash checks — so an unsubstituted `{x}/..`-style
+        // path would otherwise reach a root ACL mutation. Forbidding the placeholder
+        // keeps the literal-only path fully covered by the static gate.
+        let mut raw_binding_grants: Vec<(catalog::FileGrant, String)> =
+            Vec::with_capacity(comp.files.len());
+        for grant in &comp.files {
+            if catalog::has_placeholder(&grant.path) {
+                return Err(ResolveError::InvalidFileGrant {
+                    role: rg.role.clone(),
+                    path: grant.path.clone(),
+                    reason: "raw role file paths must not contain a {placeholder} (only catalog permissions are parametrized)",
+                });
+            }
+            if let Some(reason) = grant.static_path_defect() {
+                return Err(ResolveError::InvalidFileGrant {
+                    role: rg.role.clone(),
+                    path: grant.path.clone(),
+                    reason,
+                });
+            }
+            raw_binding_grants.push((grant.clone(), format!("role:{}", rg.role)));
+        }
+        let mut binding_file_grants: Vec<catalog::ResolvedFileGrant> =
+            catalog::union_file_grants(raw_binding_grants, None);
         let mut emitted_groups_warning = false;
+
+        // Lint: a raw `files` escape hatch used alongside permissions on the bound
+        // role, mirroring the account-side lint.
+        if !comp.permissions.is_empty() && !comp.files.is_empty() {
+            warnings.push(ResolveWarning::RawPrimitiveAlongsidePermissions {
+                role: rg.role.clone(),
+                primitive: "files",
+            });
+        }
 
         for perm in &comp.permissions {
             let (resolved, catalog_warnings) = catalog::resolve_with_params(
@@ -1411,6 +1505,194 @@ uid = 9010
     }
 
     #[test]
+    fn raw_role_file_grant_lands_on_resolved_account() {
+        use crate::catalog::{Access, Shape};
+        let (_tmp, decl) = fixture(
+            "[payload]\n[[payload.files]]\npath = \"/etc/X11/xorg.conf.d/99-cal.conf\"\naccess = \"rw\"\n",
+        );
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (resolved, warnings) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let a = &resolved[0];
+        assert_eq!(a.file_grants.len(), 1);
+        assert_eq!(a.file_grants[0].path, "/etc/X11/xorg.conf.d/99-cal.conf");
+        assert_eq!(a.file_grants[0].access, Access::Rw);
+        assert!(!a.file_grants[0].recursive);
+        assert_eq!(a.file_grants[0].shape, Shape::File);
+        // Honest provenance: the raw role grant's source layer is `role:<name>`.
+        assert_eq!(a.file_grants[0].sources.len(), 1);
+        assert_eq!(a.file_grants[0].sources[0].layer, "role:oper");
+        assert_eq!(a.file_grants[0].sources[0].via, None);
+        // A files-only role must NOT emit the alongside-permissions lint.
+        assert!(
+            !warnings.iter().any(|w| matches!(
+                w,
+                ResolveWarning::RawPrimitiveAlongsidePermissions {
+                    primitive: "files",
+                    ..
+                }
+            )),
+            "files-only role must not lint: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn raw_file_grant_and_permission_grant_union_by_path() {
+        use crate::catalog::{Access, FileGrant};
+        // Raw role grant: ro + non-recursive on /etc/ssh. Permission grant: rw +
+        // recursive on the SAME path. They union to ONE widened grant (access max,
+        // recursive OR) with both sources recorded.
+        let (_tmp, decl) = fixture(
+            "[payload]\npermissions = [\"fs-edit\"]\n[[payload.files]]\npath = \"/etc/ssh\"\naccess = \"ro\"\n",
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                files: vec![FileGrant {
+                    path: "/etc/ssh".to_owned(),
+                    access: Access::Rw,
+                    recursive: true,
+                }],
+                ..def("fs-edit")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let a = &resolved[0];
+        assert_eq!(a.file_grants.len(), 1, "same path unions to one grant");
+        assert_eq!(a.file_grants[0].path, "/etc/ssh");
+        assert_eq!(a.file_grants[0].access, Access::Rw, "access widens to rw");
+        assert!(a.file_grants[0].recursive, "recursive ORs to true");
+        assert_eq!(
+            a.file_grants[0].sources.len(),
+            2,
+            "both the raw role grant and the permission grant are recorded"
+        );
+        let layers: Vec<&str> = a.file_grants[0]
+            .sources
+            .iter()
+            .map(|s| s.layer.as_str())
+            .collect();
+        assert!(
+            layers.contains(&"role:oper") && layers.contains(&"linux"),
+            "both sources present: {layers:?}"
+        );
+    }
+
+    #[test]
+    fn raw_file_grant_alongside_permissions_lints() {
+        let (_tmp, decl) = fixture(
+            "[payload]\npermissions = [\"log-read\"]\n[[payload.files]]\npath = \"/etc/app\"\naccess = \"rw\"\nrecursive = true\n",
+        );
+        let cat = FakeCatalog::new().with("linux", def("log-read"));
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (_resolved, warnings) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ResolveWarning::RawPrimitiveAlongsidePermissions {
+                    primitive: "files",
+                    ..
+                }
+            )),
+            "raw files alongside permissions must lint: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn raw_file_grant_with_relative_path_fails_closed() {
+        let (_tmp, decl) =
+            fixture("[payload]\n[[payload.files]]\npath = \"etc/app\"\naccess = \"rw\"\n");
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::InvalidFileGrant { ref path, .. } if path == "etc/app"),
+            "relative path must fail closed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_file_grant_with_dotdot_component_fails_closed() {
+        let (_tmp, decl) = fixture(
+            "[payload]\n[[payload.files]]\npath = \"/etc/../root/secret\"\naccess = \"rw\"\n",
+        );
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::InvalidFileGrant { .. }),
+            "`..` component must fail closed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_file_grant_with_control_char_fails_closed() {
+        let (_tmp, decl) =
+            fixture("[payload]\n[[payload.files]]\npath = \"/etc/a\\nb\"\naccess = \"rw\"\n");
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::InvalidFileGrant { .. }),
+            "control char must fail closed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_file_grant_trailing_slash_without_recursive_fails_closed() {
+        let (_tmp, decl) =
+            fixture("[payload]\n[[payload.files]]\npath = \"/etc/app/\"\naccess = \"rw\"\n");
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::InvalidFileGrant { ref path, .. } if path == "/etc/app/"),
+            "trailing slash without recursive must fail closed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_file_grant_with_placeholder_dotdot_path_fails_closed() {
+        // A raw role grant is never substituted, so a `{placeholder}` path must be
+        // rejected — otherwise the static gate's placeholder exemption would let an
+        // unsubstituted `..`-bearing path reach setfacl as root (fail-open).
+        let (_tmp, decl) = fixture(
+            "[payload]\n[[payload.files]]\npath = \"{x}/../../etc/shadow\"\naccess = \"rw\"\n",
+        );
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::InvalidFileGrant { ref path, .. } if path == "{x}/../../etc/shadow"),
+            "placeholder path must fail closed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_file_grant_with_bare_placeholder_path_fails_closed() {
+        // A bare `{x}` defeats the absolute-path rule the same way; reject it.
+        let (_tmp, decl) =
+            fixture("[payload]\n[[payload.files]]\npath = \"{x}\"\naccess = \"rw\"\n");
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::InvalidFileGrant { ref path, .. } if path == "{x}"),
+            "bare placeholder path must fail closed: {err:?}"
+        );
+    }
+
+    #[test]
     fn raw_and_permission_groups_union_with_lint_warning() {
         // Role declares BOTH a raw group and a permission. The result is the
         // union, and a lint warning flags the raw primitive.
@@ -1644,6 +1926,79 @@ home_base = "/var/lib/census/home"
         assert!(
             warnings.is_empty(),
             "clean binding must not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn bound_role_raw_file_grant_lands_on_group() {
+        use crate::catalog::Access;
+        // A bound role's raw `[payload].files` escape hatch flows onto the group's
+        // file_grants (the group principal materializes them), with honest
+        // `role:<bound role>` provenance.
+        let (_tmp, decl) = group_fixture(
+            &[(
+                "netops",
+                "[payload]\n[[payload.files]]\npath = \"/etc/net\"\naccess = \"rw\"\nrecursive = true\n",
+            )],
+            "[[group]]\nname = \"ops\"\ngid = 8020\n[[role_group]]\nrole = \"netops\"\ngroup = \"ops\"\n",
+        );
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (groups, warnings) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!(g.file_grants.len(), 1);
+        assert_eq!(g.file_grants[0].path, "/etc/net");
+        assert_eq!(g.file_grants[0].access, Access::Rw);
+        assert!(g.file_grants[0].recursive);
+        assert_eq!(g.file_grants[0].sources[0].layer, "role:netops");
+        assert_eq!(g.bound_roles, vec!["netops"]);
+        // Files-only bound role must not lint.
+        assert!(
+            warnings.is_empty(),
+            "clean files-only binding must not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn bound_role_raw_file_grant_with_placeholder_dotdot_fails_closed() {
+        // The group path must close the same fail-open as the account path: a raw
+        // bound-role grant is never substituted, so a `{placeholder}` `..` path must
+        // be rejected before it can reach a root ACL mutation on the group.
+        let (_tmp, decl) = group_fixture(
+            &[(
+                "netops",
+                "[payload]\n[[payload.files]]\npath = \"{x}/../../etc/shadow\"\naccess = \"rw\"\n",
+            )],
+            "[[group]]\nname = \"ops\"\n[[role_group]]\nrole = \"netops\"\ngroup = \"ops\"\n",
+        );
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::InvalidFileGrant { ref path, .. } if path == "{x}/../../etc/shadow"),
+            "placeholder path on bound role must fail closed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bound_role_raw_file_grant_with_bare_placeholder_fails_closed() {
+        let (_tmp, decl) = group_fixture(
+            &[(
+                "netops",
+                "[payload]\n[[payload.files]]\npath = \"{x}\"\naccess = \"rw\"\n",
+            )],
+            "[[group]]\nname = \"ops\"\n[[role_group]]\nrole = \"netops\"\ngroup = \"ops\"\n",
+        );
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let err = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::InvalidFileGrant { ref path, .. } if path == "{x}"),
+            "bare placeholder path on bound role must fail closed: {err:?}"
         );
     }
 
