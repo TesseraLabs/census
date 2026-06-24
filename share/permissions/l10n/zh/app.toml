@@ -1,4 +1,4 @@
 [app-config-edit]
 title     = "应用配置编辑"
 summary   = "通过包装的编辑器编辑指定的应用配置文件（参数：path）。"
-risk_note = "风险取决于文件：编辑与安全相关的配置可能具备提权能力。"
+risk_note = "具备提权能力：编辑器以 root 运行且可派生 shell，因此无论编辑哪个文件都能获得 root；allow_prefix 限制目标文件，但不限制编辑器的逃逸。"

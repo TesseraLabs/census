@@ -1,4 +1,4 @@
 [app-config-edit]
 title     = "Application config editing"
 summary   = "Edit specific application config files via a wrapped editor (parameter: path)."
-risk_note = "Risk depends on the file: editing a security-relevant config can be escalation-capable."
+risk_note = "Escalation-capable: the editor runs as root and can spawn a shell, so root is reachable regardless of which file is edited; allow_prefix limits the target file, not the escape."

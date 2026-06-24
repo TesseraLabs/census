@@ -1069,7 +1069,7 @@ mod tests {
         ManagedAccount {
             file_grants: vec![ManagedFileGrant {
                 path: path.to_owned(),
-                access: crate::catalog::Access::Rw,
+                access: crate::catalog::Access::RW,
                 recursive: true,
             }],
             ..managed_acct(name, 9010, "/bin/bash", &["wheel"])

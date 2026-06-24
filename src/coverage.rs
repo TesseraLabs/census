@@ -663,13 +663,13 @@ fn fold_unit_forms(unit: &str, units: &mut std::collections::HashSet<String>) {
 }
 
 /// Fold a covering file grant into the accumulator, keyed by path. A repeated
-/// path widens access to the max (`Ro` < `Rw`) and ORs `recursive` — the same
-/// union rule the catalog/model use — so two grants on the same path do not let a
-/// narrower one mask a wider, and the recorded access reflects the strongest grant
-/// that would be enforced.
+/// path unions the access bits (OR) and ORs `recursive` — the same union rule the
+/// catalog/model use — so two grants on the same path do not let a narrower one
+/// mask a wider, and the recorded access reflects every bit that would be
+/// enforced.
 fn push_unique_grant(acc: &mut Vec<ResolvedFileGrant>, grant: ResolvedFileGrant) {
     if let Some(existing) = acc.iter_mut().find(|g| g.path == grant.path) {
-        existing.access = wider_access(existing.access, grant.access);
+        existing.access |= grant.access;
         existing.recursive = existing.recursive || grant.recursive;
         // Recompute the shape against the now-effective recursive flag (a path
         // seen once as a file and once recursive is effectively a directory).
@@ -680,16 +680,6 @@ fn push_unique_grant(acc: &mut Vec<ResolvedFileGrant>, grant: ResolvedFileGrant)
         };
     } else {
         acc.push(grant);
-    }
-}
-
-/// The wider of two accesses (`Ro` < `Rw`). `Access::max` is private to the
-/// catalog module, so the coverage core has its own tiny widening helper rather
-/// than widening that struct's API just for this read-only audit.
-fn wider_access(a: Access, b: Access) -> Access {
-    match (a, b) {
-        (Access::Rw, _) | (_, Access::Rw) => Access::Rw,
-        _ => Access::Ro,
     }
 }
 
@@ -971,8 +961,12 @@ fn config_grant_cover(path: &str, grants: &[ResolvedFileGrant]) -> Option<String
     let mut best: Option<&ResolvedFileGrant> = None;
     for g in grants {
         if grant_covers_path(g, path).is_some() {
+            // Prefer the most privilege-relevant covering grant for the note: a
+            // write grant outranks a read-only one (a reviewer most needs to see
+            // the strongest access reachable on the path). Among grants of equal
+            // write-ness, keep the first seen for stability.
             best = Some(match best {
-                Some(prev) if prev.access == Access::Rw => prev,
+                Some(prev) if prev.access.contains(Access::WRITE) => prev,
                 _ => g,
             });
         }
@@ -1004,15 +998,14 @@ fn grant_covers_path<'a>(
     None
 }
 
-/// The coverage note for a covering grant: `<ro|rw> via <backend> (<shape>)`. A
-/// directory grant is enforced rewrite-proof by the open `AclBackend`; a File or
-/// Pattern grant would need a capability-gated backend, which the note states
-/// honestly so the report does not imply the open build can enforce it.
+/// The coverage note for a covering grant: `<access> via <backend> (<shape>)`,
+/// where `<access>` is the grant's canonical token (`ro`/`rw` or sorted perm
+/// letters). A directory grant is enforced rewrite-proof by the open
+/// `AclBackend`; a File or Pattern grant would need a capability-gated backend,
+/// which the note states honestly so the report does not imply the open build
+/// can enforce it.
 fn grant_coverage_note(grant: &ResolvedFileGrant) -> String {
-    let access = match grant.access {
-        Access::Ro => "ro",
-        Access::Rw => "rw",
-    };
+    let access = grant.access;
     match grant.shape {
         Shape::Dir => format!("{access} via AclBackend (dir)"),
         Shape::File => format!("{access} (requires per-file-capable backend)"),
@@ -1940,9 +1933,31 @@ fn parse_dpkg_search(stdout: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{FakeCatalog, ListOverride, PermissionDef};
+    use crate::catalog::{FakeCatalog, ListOverride, ParamConstraint, PermissionDef};
 
     // --- builders -----------------------------------------------------------
+
+    /// Build a `token`-kind constraint for every `{placeholder}` found across the
+    /// given templates. Each catalog record must constrain every placeholder it
+    /// uses; the coverage tests only exercise systemd-unit-shaped tokens, so a
+    /// token constraint is the right default. A minimal `{name}` scan (the real
+    /// placeholder grammar lives in `catalog`) suffices for these fixtures.
+    fn token_params_for(templates: &[&str]) -> std::collections::BTreeMap<String, ParamConstraint> {
+        let mut m = std::collections::BTreeMap::new();
+        for t in templates {
+            let mut rest = *t;
+            while let Some(open) = rest.find('{') {
+                let after = &rest[open + 1..];
+                let Some(close) = after.find('}') else { break };
+                let name = &after[..close];
+                if !name.is_empty() {
+                    m.insert(name.to_owned(), ParamConstraint::Token { max_len: None });
+                }
+                rest = &after[close + 1..];
+            }
+        }
+        m
+    }
 
     fn debian() -> OsTarget {
         OsTarget::new("linux", "debian", None).unwrap()
@@ -1961,6 +1976,7 @@ mod tests {
             includes: Vec::new(),
             include_categories: Vec::new(),
             files: Vec::new(),
+            params: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1974,6 +1990,7 @@ mod tests {
     fn sudo_def(id: &str, sudo: &[&str]) -> PermissionDef {
         PermissionDef {
             sudo: ListOverride::Replace(sudo.iter().map(|s| s.to_string()).collect()),
+            params: token_params_for(sudo),
             ..def(id)
         }
     }
@@ -1993,6 +2010,7 @@ mod tests {
                 access,
                 recursive,
             }],
+            params: token_params_for(&[path]),
             ..def(id)
         }
     }
@@ -2546,7 +2564,7 @@ mod tests {
         // stays covered — backend-limited only reclassifies UNcovered objects.
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("logindefs", "/etc/login.defs", Access::Rw, false),
+            file_def("logindefs", "/etc/login.defs", Access::RW, false),
         );
         let surface = vec![obj(
             SurfaceClass::Config,
@@ -2593,7 +2611,7 @@ mod tests {
         // Catalog gives a recursive rw Dir grant on /etc/ssh; the config object
         // /etc/ssh/sshd_config under it is covered, with an AclBackend (dir) note.
         let cat =
-            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::RW, true));
         let surface = vec![obj(
             SurfaceClass::Config,
             "/etc/ssh/sshd_config",
@@ -2611,7 +2629,7 @@ mod tests {
     fn config_ro_vs_rw_distinguished_in_note() {
         // An ro recursive grant yields an `ro` note (not rw).
         let cat =
-            FakeCatalog::new().with("linux", file_def("ssh-read", "/etc/ssh", Access::Ro, true));
+            FakeCatalog::new().with("linux", file_def("ssh-read", "/etc/ssh", Access::RO, true));
         let surface = vec![obj(
             SurfaceClass::Config,
             "/etc/ssh/sshd_config",
@@ -2632,7 +2650,7 @@ mod tests {
         // miss observable as an uncovered object, guarding against starts_with.
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("sec-edit", "/etc/security", Access::Rw, true),
+            file_def("sec-edit", "/etc/security", Access::RW, true),
         );
         let surface = vec![
             obj(
@@ -2656,7 +2674,7 @@ mod tests {
         // child of /etc/sudoers.d (which it makes no claim on).
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("sudoers-edit", "/etc/sudoers", Access::Rw, false),
+            file_def("sudoers-edit", "/etc/sudoers", Access::RW, false),
         );
         let surface = vec![
             obj(SurfaceClass::Config, "/etc/sudoers", Provenance::Vendor),
@@ -2684,7 +2702,7 @@ mod tests {
         // in, the config object under it is covered.
         let cat = FakeCatalog::new().with(
             "linux",
-            file_def("app-config-edit", "/etc/{app}", Access::Rw, true),
+            file_def("app-config-edit", "/etc/{app}", Access::RW, true),
         );
         let surface = vec![obj(
             SurfaceClass::Config,
@@ -2705,7 +2723,7 @@ mod tests {
         let role = ResolvedRole::with_file_grants(
             vec![],
             vec![],
-            vec![rfg("/etc/nginx", Access::Rw, true)],
+            vec![rfg("/etc/nginx", Access::RW, true)],
         );
         let r = coverage(&surface, &cat, &debian(), &[role], &ctx()).unwrap();
         let c = find(&r, "/etc/nginx/nginx.conf");
@@ -2723,7 +2741,7 @@ mod tests {
         // --include-low-priority it is a genuine gap — distinct from the
         // backend-limited reclassification a bare /etc file would get.
         let cat =
-            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::RW, true));
         let surface = vec![
             obj(
                 SurfaceClass::Config,
@@ -2760,7 +2778,7 @@ mod tests {
         // The default config denominator counts only the security-relevant one,
         // demonstrating the narrowed, meaningful metric.
         let cat =
-            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::Rw, true));
+            FakeCatalog::new().with("linux", file_def("ssh-edit", "/etc/ssh", Access::RW, true));
         let surface = vec![
             obj(
                 SurfaceClass::Config,
@@ -2819,7 +2837,7 @@ mod tests {
         // which-grants /usr/sbin/ip finds only the sudo one.
         let sources = vec![
             grant_src("network-admin", &["/usr/sbin/ip link set"], vec![]),
-            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::Rw, true)]),
+            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::RW, true)]),
         ];
         let matches = which_grants("/usr/sbin/ip", &sources);
         assert_eq!(matches.len(), 1);
@@ -2835,14 +2853,14 @@ mod tests {
         // /etc/ssh/sshd_config is under the recursive /etc/ssh rw grant → file match.
         let sources = vec![
             grant_src("network-admin", &["/usr/sbin/ip link set"], vec![]),
-            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::Rw, true)]),
+            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::RW, true)]),
         ];
         let matches = which_grants("/etc/ssh/sshd_config", &sources);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].permission, "ssh-edit");
         assert_eq!(matches[0].kind, GrantKind::File);
         assert_eq!(matches[0].detail, "/etc/ssh");
-        assert_eq!(matches[0].access, Some(Access::Rw));
+        assert_eq!(matches[0].access, Some(Access::RW));
         assert_eq!(matches[0].recursive, Some(true));
         assert_eq!(matches[0].backend.as_deref(), Some("AclBackend"));
     }
@@ -2851,7 +2869,7 @@ mod tests {
     fn which_grants_non_matching_arg_is_empty() {
         let sources = vec![
             grant_src("network-admin", &["/usr/sbin/ip link set"], vec![]),
-            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::Rw, true)]),
+            grant_src("ssh-edit", &[], vec![rfg("/etc/ssh", Access::RW, true)]),
         ];
         assert!(which_grants("/usr/bin/nonexistent", &sources).is_empty());
         // A path neighbour of the recursive grant (textual prefix, not a
@@ -2876,7 +2894,7 @@ mod tests {
         let sources = vec![grant_src(
             "sudoers-edit",
             &[],
-            vec![rfg("/etc/sudoers", Access::Rw, false)],
+            vec![rfg("/etc/sudoers", Access::RW, false)],
         )];
         let exact = which_grants("/etc/sudoers", &sources);
         assert_eq!(exact.len(), 1);
@@ -2913,14 +2931,14 @@ mod tests {
         let sources = vec![group_grant_src(
             "netops",
             &[],
-            vec![rfg("/etc/net", Access::Rw, true)],
+            vec![rfg("/etc/net", Access::RW, true)],
         )];
         let matches = which_grants("/etc/net/iface.conf", &sources);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].permission, "netops");
         assert_eq!(matches[0].kind, GrantKind::File);
         assert_eq!(matches[0].target, GrantTarget::Group("netops".to_owned()));
-        assert_eq!(matches[0].access, Some(Access::Rw));
+        assert_eq!(matches[0].access, Some(Access::RW));
         assert_eq!(matches[0].recursive, Some(true));
     }
 

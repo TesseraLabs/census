@@ -170,7 +170,7 @@ pub(crate) fn file_grant_risk_findings(compiled: &CompiledRole) -> Vec<LintFindi
     for f in compiled.flat_file_grants() {
         let path = &f.grant.path;
 
-        if f.grant.access == catalog::Access::Rw
+        if f.grant.access.contains(catalog::Access::WRITE)
             && ROOT_EQUIVALENT_RW_PREFIXES
                 .iter()
                 .any(|p| path_boundary_overlaps(p, path))
@@ -266,7 +266,7 @@ pub(crate) fn group_grant_risk_findings(groups: &[model::ResolvedGroup]) -> Vec<
         // `g:group` file grants, classified exactly like a `u:account` grant.
         for grant in &g.file_grants {
             let path = &grant.path;
-            if grant.access == catalog::Access::Rw
+            if grant.access.contains(catalog::Access::WRITE)
                 && ROOT_EQUIVALENT_RW_PREFIXES
                     .iter()
                     .any(|p| path_boundary_overlaps(p, path))

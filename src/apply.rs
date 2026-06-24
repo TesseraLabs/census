@@ -2726,7 +2726,7 @@ mod tests {
         rec.sudo_commands = vec![SudoCommand::root("/usr/sbin/ip")];
         rec.file_grants = vec![ManagedFileGrant {
             path: "/etc/ssh".to_owned(),
-            access: crate::catalog::Access::Rw,
+            access: crate::catalog::Access::RW,
             recursive: true,
         }];
         let st = fake_state(vec![rec]);
@@ -3073,6 +3073,7 @@ mod tests {
                     access,
                     recursive,
                 }],
+                params: std::collections::BTreeMap::new(),
             },
         );
         let os = OsTarget::new("linux", "debian", Some("12".to_owned())).unwrap();
@@ -3142,7 +3143,7 @@ mod tests {
         let sessions = FakeSessionSource::empty();
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
-        let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
+        let compile = compile_with_file_perm("/etc/ssh", Access::RW, true);
         run(
             fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
             &mut p,
@@ -3181,7 +3182,7 @@ mod tests {
         let mut prior = managed("oper", 9010, &[], 5);
         prior.file_grants = vec![crate::state::ManagedFileGrant {
             path: "/etc/old".to_owned(),
-            access: Access::Rw,
+            access: Access::RW,
             recursive: true,
         }];
         let st = fake_state(vec![prior]);
@@ -3189,7 +3190,7 @@ mod tests {
         let sessions = FakeSessionSource::empty();
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::default();
-        let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
+        let compile = compile_with_file_perm("/etc/ssh", Access::RW, true);
         run(
             fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
             &mut p,
@@ -3223,7 +3224,7 @@ mod tests {
         let mut prior = managed("oper", 9010, &[], 4);
         prior.file_grants = vec![crate::state::ManagedFileGrant {
             path: "/etc/ssh".to_owned(),
-            access: Access::Rw,
+            access: Access::RW,
             recursive: true,
         }];
         let st = fake_state(vec![prior]);
@@ -3258,7 +3259,7 @@ mod tests {
         let sessions = FakeSessionSource::empty();
         let mut fa = dir_backend(); // dir-only capability
         let mut p = FakeProvisioner::default();
-        let compile = compile_with_file_perm("/etc/ssh/sshd_config", Access::Rw, false);
+        let compile = compile_with_file_perm("/etc/ssh/sshd_config", Access::RW, false);
         let err = run(
             fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
             &mut p,
@@ -3297,7 +3298,7 @@ mod tests {
         let sessions = FakeSessionSource::empty();
         let mut fa = dir_backend();
         let mut p = FakeProvisioner::failing("create");
-        let compile = compile_with_file_perm("/etc/ssh", Access::Rw, true);
+        let compile = compile_with_file_perm("/etc/ssh", Access::RW, true);
         let err = run(
             fa_inputs(&d, &st, &insp, &sessions, compile, &mut fa),
             &mut p,
@@ -3334,7 +3335,7 @@ mod tests {
             .map(|p| {
                 vec![FileGrant {
                     path: p.to_owned(),
-                    access: Access::Rw,
+                    access: Access::RW,
                     recursive: true,
                 }]
             })
@@ -3353,6 +3354,7 @@ mod tests {
                 includes: Vec::new(),
                 include_categories: Vec::new(),
                 files,
+                params: std::collections::BTreeMap::new(),
             },
         );
         let os = OsTarget::new("linux", "debian", None).unwrap();
@@ -3562,7 +3564,7 @@ mod tests {
             sudo_commands: vec![SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![ManagedFileGrant {
                 path: "/etc/net".to_owned(),
-                access: Access::Rw,
+                access: Access::RW,
                 recursive: true,
             }],
             adopt_baseline: Some(crate::state::GroupBaseline {
@@ -3632,7 +3634,7 @@ mod tests {
             sudo_commands: vec![SudoCommand::root("/usr/sbin/ip")],
             file_grants: vec![ManagedFileGrant {
                 path: "/etc/net".to_owned(),
-                access: Access::Rw,
+                access: Access::RW,
                 recursive: true,
             }],
             adopt_baseline: None,

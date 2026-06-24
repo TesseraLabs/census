@@ -171,17 +171,44 @@ pub trait FileAccessBackend {
     fn restore(&mut self) -> Result<(), FileAccessError>;
 }
 
-/// The ACL permission string for an [`Access`]: `r-X` (ro) or `rwX` (rw).
+/// The three-character ACL permission string for an [`Access`] bit set.
 ///
-/// The capital `X` means "execute only on directories (and files already executable
-/// by someone)": a reader can traverse a directory tree without gaining execute on
-/// regular files. Lowercase `x` would set execute on every file, which is not what
-/// a read grant intends.
-fn acl_perm(access: Access) -> &'static str {
-    match access {
-        Access::Ro => "r-X",
-        Access::Rw => "rwX",
-    }
+/// The position layout is the POSIX `rwx` triple. The first two slots are the
+/// plain `read`/`write` bits (`r`/`-`, `w`/`-`). The third (execute) slot encodes
+/// the two distinct execute semantics Census distinguishes:
+///
+/// - lowercase `x` when `execute` is set — execute on a *file* inode (run a file),
+///   which `setfacl` applies unconditionally to every file in the tree;
+/// - capital `X` when only `traverse` is set — the conditional execute that
+///   `setfacl` applies to directories (and files already executable by someone),
+///   so a reader can walk into a directory tree without gaining execute on the
+///   regular files inside;
+/// - `-` when neither is set.
+///
+/// `execute` wins the slot over `traverse` (lowercase `x` already implies the
+/// directory-search the capital `X` would grant, so emitting both is redundant).
+/// This preserves the historical mapping byte-for-byte: legacy `ro`
+/// (`{read, traverse}`) → `r-X` and legacy `rw` (`{read, write, traverse}`) →
+/// `rwX`.
+fn acl_perm(access: Access) -> String {
+    let r = if access.contains(Access::READ) {
+        'r'
+    } else {
+        '-'
+    };
+    let w = if access.contains(Access::WRITE) {
+        'w'
+    } else {
+        '-'
+    };
+    let x = if access.contains(Access::EXECUTE) {
+        'x'
+    } else if access.contains(Access::TRAVERSE) {
+        'X'
+    } else {
+        '-'
+    };
+    [r, w, x].into_iter().collect()
 }
 
 /// Build the two `setfacl` argv vectors that materialize one directory grant for
@@ -716,11 +743,44 @@ mod tests {
         }
     }
 
+    // --- ACL perm-string mapping (bit set → POSIX rwx triple) ---
+
+    #[test]
+    fn acl_perm_legacy_equivalence_is_byte_for_byte() {
+        // THE migration invariant: the legacy `ro`/`rw` sets must materialize to
+        // the exact ACL strings the two-value enum did, or every already-applied
+        // ACL silently changes meaning on the next apply. Asserted byte-for-byte.
+        assert_eq!(acl_perm(Access::RO), "r-X", "legacy ro == r-X");
+        assert_eq!(acl_perm(Access::RW), "rwX", "legacy rw == rwX");
+    }
+
+    #[test]
+    fn acl_perm_maps_each_bit_combo() {
+        // read → r, write → w, execute → lowercase x (file exec), traverse →
+        // capital X (dir-only exec). execute wins the x-slot over traverse.
+        assert_eq!(acl_perm(Access::READ), "r--");
+        assert_eq!(acl_perm(Access::READ | Access::TRAVERSE), "r-X");
+        assert_eq!(acl_perm(Access::READ | Access::EXECUTE), "r-x");
+        assert_eq!(acl_perm(Access::EXECUTE), "--x");
+        assert_eq!(acl_perm(Access::TRAVERSE), "--X");
+        assert_eq!(acl_perm(Access::READ | Access::WRITE), "rw-");
+        assert_eq!(
+            acl_perm(Access::READ | Access::WRITE | Access::EXECUTE),
+            "rwx"
+        );
+        // execute set alongside traverse: lowercase x already covers dir search,
+        // so the x-slot is lowercase, not capital.
+        assert_eq!(
+            acl_perm(Access::READ | Access::EXECUTE | Access::TRAVERSE),
+            "r-x"
+        );
+    }
+
     // --- pure argv construction ---
 
     #[test]
     fn setfacl_args_ro_uses_rx_and_default_pass() {
-        let g = grant("/etc/ssh", Access::Ro, true, Shape::Dir);
+        let g = grant("/etc/ssh", Access::RO, true, Shape::Dir);
         let args = setfacl_args(&Principal::User("alice".to_owned()), &g);
         assert_eq!(args.len(), 2, "access ACL + default ACL");
         // Access pass: -R --physical -m u:alice:r-X /etc/ssh
@@ -737,7 +797,7 @@ mod tests {
 
     #[test]
     fn setfacl_args_rw_uses_rwx() {
-        let g = grant("/etc/pam.d", Access::Rw, true, Shape::Dir);
+        let g = grant("/etc/pam.d", Access::RW, true, Shape::Dir);
         let args = setfacl_args(&Principal::User("bob".to_owned()), &g);
         assert!(args[0].contains(&"u:bob:rwX".to_owned()));
         assert!(args[1].contains(&"-d".to_owned()));
@@ -747,7 +807,7 @@ mod tests {
     fn setfacl_args_group_uses_g_prefix_with_default_pass() {
         // A group grant is the user grant with a `g:` prefix — same -R --physical,
         // same default-ACL pass, only the principal letter differs.
-        let g = grant("/srv/shared", Access::Rw, true, Shape::Dir);
+        let g = grant("/srv/shared", Access::RW, true, Shape::Dir);
         let args = setfacl_args(&Principal::Group("wheel".to_owned()), &g);
         assert_eq!(args.len(), 2, "access ACL + default ACL");
         assert_eq!(
@@ -764,7 +824,7 @@ mod tests {
     #[test]
     fn setfacl_args_user_ro_regression_unchanged() {
         // The pre-group behavior for a user principal is intact: u: prefix, r-X.
-        let g = grant("/etc/ssh", Access::Ro, true, Shape::Dir);
+        let g = grant("/etc/ssh", Access::RO, true, Shape::Dir);
         let args = setfacl_args(&Principal::User("alice".to_owned()), &g);
         assert_eq!(
             args[0],
@@ -774,7 +834,7 @@ mod tests {
 
     #[test]
     fn revoke_args_remove_only_account_entry() {
-        let g = grant("/etc/ssh", Access::Rw, true, Shape::Dir);
+        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
         let args = revoke_args(&Principal::User("alice".to_owned()), &g);
         assert_eq!(args.len(), 2);
         // -x with u:alice (no perm — removal), access + default. Never names owner
@@ -795,7 +855,7 @@ mod tests {
 
     #[test]
     fn revoke_args_group_removes_only_group_entry() {
-        let g = grant("/srv/shared", Access::Rw, true, Shape::Dir);
+        let g = grant("/srv/shared", Access::RW, true, Shape::Dir);
         let args = revoke_args(&Principal::Group("wheel".to_owned()), &g);
         assert_eq!(args.len(), 2);
         // -x with g:wheel (no perm — removal), access + default. Mirrors the user
@@ -852,7 +912,7 @@ mod tests {
     #[test]
     fn acl_materialize_runs_both_setfacl_passes() {
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/etc/ssh", Access::Rw, true, Shape::Dir);
+        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
         b.materialize(
             &Principal::User("alice".to_owned()),
             std::slice::from_ref(&g),
@@ -865,7 +925,7 @@ mod tests {
     #[test]
     fn acl_materialize_group_writes_g_entries() {
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/srv/shared", Access::Rw, true, Shape::Dir);
+        let g = grant("/srv/shared", Access::RW, true, Shape::Dir);
         b.materialize(
             &Principal::Group("wheel".to_owned()),
             std::slice::from_ref(&g),
@@ -897,7 +957,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant(&link.to_string_lossy(), Access::Rw, true, Shape::Dir);
+        let g = grant(&link.to_string_lossy(), Access::RW, true, Shape::Dir);
         let err = b
             .materialize(
                 &Principal::User("alice".to_owned()),
@@ -924,7 +984,7 @@ mod tests {
         let real = tmp.path().join("real-tree");
         std::fs::create_dir(&real).unwrap();
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant(&real.to_string_lossy(), Access::Rw, true, Shape::Dir);
+        let g = grant(&real.to_string_lossy(), Access::RW, true, Shape::Dir);
         b.materialize(
             &Principal::User("alice".to_owned()),
             std::slice::from_ref(&g),
@@ -940,7 +1000,7 @@ mod tests {
     #[test]
     fn acl_refuses_non_dir_grant() {
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/etc/ssh/sshd_config", Access::Rw, false, Shape::File);
+        let g = grant("/etc/ssh/sshd_config", Access::RW, false, Shape::File);
         let err = b
             .materialize(
                 &Principal::User("alice".to_owned()),
@@ -957,7 +1017,7 @@ mod tests {
     #[test]
     fn acl_revoke_runs_two_passes() {
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/etc/ssh", Access::Rw, true, Shape::Dir);
+        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
         b.revoke(&Principal::User("alice".to_owned()), &g).unwrap();
         assert_eq!(b.runner.calls.len(), 2);
     }
@@ -1002,7 +1062,7 @@ mod tests {
             }
         }
         let mut b = AclBackend::new(FailRunner, "setfacl", "getfacl", std::env::temp_dir());
-        let g = grant("/etc/ssh", Access::Rw, true, Shape::Dir);
+        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
         let err = b
             .materialize(
                 &Principal::User("alice".to_owned()),
@@ -1024,7 +1084,7 @@ mod tests {
             rewrite_proof: false,
         };
         let mut f = FakeBackend::new("fake", caps);
-        let g = grant("/etc/ssh", Access::Rw, true, Shape::Dir);
+        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
         f.materialize(
             &Principal::User("alice".to_owned()),
             std::slice::from_ref(&g),
@@ -1062,7 +1122,7 @@ mod tests {
     fn route_dir_grant_to_acl_backend() {
         let acl = FakeBackend::new("acl", acl_caps());
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl];
-        let grants = vec![grant("/etc/ssh", Access::Rw, true, Shape::Dir)];
+        let grants = vec![grant("/etc/ssh", Access::RW, true, Shape::Dir)];
         let routed = route_grants(&grants, &backends).unwrap();
         assert_eq!(routed.len(), 1);
         assert_eq!(routed[0].0, 0, "routed to backend index 0 (acl)");
@@ -1075,7 +1135,7 @@ mod tests {
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl];
         let grants = vec![grant(
             "/etc/ssh/sshd_config",
-            Access::Rw,
+            Access::RW,
             false,
             Shape::File,
         )];
@@ -1096,7 +1156,7 @@ mod tests {
     fn route_pattern_grant_with_only_acl_is_unsupported() {
         let acl = FakeBackend::new("acl", acl_caps());
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl];
-        let grants = vec![grant("/var/log/*.log", Access::Ro, false, Shape::Pattern)];
+        let grants = vec![grant("/var/log/*.log", Access::RO, false, Shape::Pattern)];
         let err = route_grants(&grants, &backends).unwrap_err();
         match err {
             FileAccessError::Unsupported { shape, reason, .. } => {
@@ -1127,9 +1187,9 @@ mod tests {
         );
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl, &capable];
         let grants = vec![
-            grant("/etc/ssh", Access::Rw, true, Shape::Dir),
-            grant("/etc/ssh/sshd_config", Access::Rw, false, Shape::File),
-            grant("/var/log/*.log", Access::Ro, false, Shape::Pattern),
+            grant("/etc/ssh", Access::RW, true, Shape::Dir),
+            grant("/etc/ssh/sshd_config", Access::RW, false, Shape::File),
+            grant("/var/log/*.log", Access::RO, false, Shape::Pattern),
         ];
         let routed = route_grants(&grants, &backends).unwrap();
         assert_eq!(routed.len(), 3);
@@ -1145,8 +1205,8 @@ mod tests {
         let acl = FakeBackend::new("acl", acl_caps());
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl];
         let grants = vec![
-            grant("/etc/ssh", Access::Rw, true, Shape::Dir),
-            grant("/var/log/*.log", Access::Ro, false, Shape::Pattern),
+            grant("/etc/ssh", Access::RW, true, Shape::Dir),
+            grant("/var/log/*.log", Access::RO, false, Shape::Pattern),
         ];
         assert!(route_grants(&grants, &backends).is_err());
     }

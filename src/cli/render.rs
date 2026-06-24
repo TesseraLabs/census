@@ -19,12 +19,11 @@ pub(crate) fn risk_label(risk: Option<Risk>) -> &'static str {
     }
 }
 
-/// The access token (`ro`/`rw`) for display.
-pub(crate) fn access_token(access: catalog::Access) -> &'static str {
-    match access {
-        catalog::Access::Ro => "ro",
-        catalog::Access::Rw => "rw",
-    }
+/// The canonical access token for display (`ro`/`rw` for the legacy sets, else
+/// the sorted perm letters). Delegates to the type's `Display`, so the rendered
+/// token always matches what the access serializes/parses as.
+pub(crate) fn access_token(access: catalog::Access) -> String {
+    access.to_string()
 }
 
 /// Describe which backend + guarantee resolves a grant of this shape in the open

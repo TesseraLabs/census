@@ -13,9 +13,19 @@ title     = "主机名配置"
 summary   = "设置系统主机名（hostnamectl）。"
 risk_note = "受限：仅标识标签，无权限影响。"
 
+[service-observe]
+title     = "服务观察（限定范围）"
+summary   = "查询指定 systemd 单元的状态，只读（status、is-active；参数：units）。"
+risk_note = "受限：对指定单元的只读状态查询，不改变状态。"
+
+[service-control]
+title     = "服务控制（限定范围）"
+summary   = "启动/停止/重启/reset-failed 指定的 systemd 单元（参数：units）。"
+risk_note = "仅限于指定单元；sudoers 精确匹配参数，范围无法扩大。"
+
 [service-restart]
 title     = "服务重启（限定范围）"
-summary   = "启动/停止/重启/查询指定的 systemd 单元（参数：units）。"
+summary   = "观察并控制指定的 systemd 单元——捆绑 service-observe 与 service-control（参数：units）。"
 risk_note = "仅限于指定单元；sudoers 精确匹配参数，范围无法扩大。"
 
 [service-admin]

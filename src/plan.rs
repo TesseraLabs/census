@@ -217,13 +217,18 @@ fn diff_fields(target: &ResolvedAccount, current: &ManagedAccount) -> Vec<String
 /// provenance-insensitive — provenance and the derived shape are not part of the
 /// account's enforced state, only what is materialized is. The path is borrowed
 /// (`&str`) so the key carries no allocation.
-fn grant_key(path: &str, access: crate::catalog::Access, recursive: bool) -> (&str, bool, bool) {
-    // access encoded as a bool (rw=true) so the tuple is cheaply Ord-comparable.
-    (
-        path,
-        matches!(access, crate::catalog::Access::Rw),
-        recursive,
-    )
+///
+/// The key carries the FULL access value, not a derived flag. Every distinct
+/// access set must compare distinct, or the drift gate ([`file_grants_set_equal`])
+/// would see a grant edited from one set to another (e.g. `ro` → `{read, execute}`,
+/// both materializing different ACLs) as unchanged and apply would never re-run
+/// `setfacl`, silently failing to enforce the new access.
+fn grant_key(
+    path: &str,
+    access: crate::catalog::Access,
+    recursive: bool,
+) -> (&str, crate::catalog::Access, bool) {
+    (path, access, recursive)
 }
 
 /// Whether a recorded managed file-grant set equals a resolved target set,
@@ -914,9 +919,9 @@ mod tests {
         // Managed records a ro grant; the target widens it to rw → must Update
         // with a change line mentioning file-grants.
         let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
-        t.file_grants = vec![rgrant("/etc/ssh", Access::Rw, true)];
+        t.file_grants = vec![rgrant("/etc/ssh", Access::RW, true)];
         let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
-        m.file_grants = vec![mgrant("/etc/ssh", Access::Ro, true)];
+        m.file_grants = vec![mgrant("/etc/ssh", Access::RO, true)];
         let plan = diff(&[t], &state_of(vec![m]));
         assert_eq!(plan.actions.len(), 1);
         match &plan.actions[0] {
@@ -932,12 +937,62 @@ mod tests {
     }
 
     #[test]
+    fn file_grant_access_change_within_nonrw_sets_yields_update() {
+        // Regression for a lossy drift key. Both `ro` (r-X) and `{read, execute}`
+        // (r-x) are non-`rw` sets that materialize DIFFERENT ACLs. A key that
+        // collapsed access to "is it rw?" keyed both to the same value, so this
+        // edit reported no drift and apply never re-ran setfacl — the file-exec
+        // was silently never granted. The key must carry the full access value.
+        let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
+        t.file_grants = vec![rgrant(
+            "/usr/local/bin/tool",
+            Access::READ | Access::EXECUTE,
+            false,
+        )];
+        let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
+        m.file_grants = vec![mgrant("/usr/local/bin/tool", Access::RO, false)];
+        let plan = diff(&[t], &state_of(vec![m]));
+        assert_eq!(plan.actions.len(), 1, "ro → r-x must be detected as drift");
+        assert!(
+            matches!(&plan.actions[0], Action::Update { changes, .. }
+                if changes.iter().any(|c| c.contains("file-grants"))),
+            "expected a file-grants Update, got {:?}",
+            plan.actions[0]
+        );
+        // The set-equality gate itself must see the two sets as unequal.
+        assert!(
+            !file_grants_set_equal(
+                &[mgrant("/usr/local/bin/tool", Access::RO, false)],
+                &[rgrant(
+                    "/usr/local/bin/tool",
+                    Access::READ | Access::EXECUTE,
+                    false
+                )],
+            ),
+            "ro and {{read,execute}} must not compare set-equal"
+        );
+    }
+
+    #[test]
+    fn file_grant_read_write_swap_is_detected() {
+        // A {read}↔{write} swap (r-- vs -w-) is likewise invisible to a bool key
+        // (neither is rw). The gate must distinguish them.
+        assert!(
+            !file_grants_set_equal(
+                &[mgrant("/srv/data", Access::READ, false)],
+                &[rgrant("/srv/data", Access::WRITE, false)],
+            ),
+            "{{read}} and {{write}} must not compare set-equal"
+        );
+    }
+
+    #[test]
     fn file_grant_removal_yields_update() {
         // Target drops a grant the registry still records → must Update so the
         // backend revokes it (no stale ACL leak).
         let t = target("oper", 9010, "/bin/bash", &["wheel"]); // no grants
         let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
-        m.file_grants = vec![mgrant("/etc/ssh", Access::Rw, true)];
+        m.file_grants = vec![mgrant("/etc/ssh", Access::RW, true)];
         let plan = diff(&[t], &state_of(vec![m]));
         assert_eq!(plan.actions.len(), 1);
         match &plan.actions[0] {
@@ -956,13 +1011,13 @@ mod tests {
         // Same grant set in a different order must NOT produce an action.
         let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
         t.file_grants = vec![
-            rgrant("/etc/ssh", Access::Rw, true),
-            rgrant("/etc/pam.d", Access::Ro, true),
+            rgrant("/etc/ssh", Access::RW, true),
+            rgrant("/etc/pam.d", Access::RO, true),
         ];
         let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
         m.file_grants = vec![
-            mgrant("/etc/pam.d", Access::Ro, true),
-            mgrant("/etc/ssh", Access::Rw, true),
+            mgrant("/etc/pam.d", Access::RO, true),
+            mgrant("/etc/ssh", Access::RW, true),
         ];
         let plan = diff(&[t], &state_of(vec![m]));
         assert!(
@@ -1286,9 +1341,9 @@ mod tests {
     #[test]
     fn resolved_group_file_grants_drift_yields_update() {
         let mut t = rgroup("ops", Some(8020), Provenance::Created);
-        t.file_grants = vec![rgrant("/etc/net", Access::Rw, true)];
+        t.file_grants = vec![rgrant("/etc/net", Access::RW, true)];
         let mut m = mgroup("ops", 8020);
-        m.file_grants = vec![mgrant("/etc/net", Access::Ro, true)];
+        m.file_grants = vec![mgrant("/etc/net", Access::RO, true)];
         let registry = managed_groups(&[m]);
         let actions = diff_resolved_groups(&[t], &registry);
         assert_eq!(actions.len(), 1);
@@ -1333,7 +1388,7 @@ mod tests {
             SudoCommand::root("/usr/sbin/ip"),
             SudoCommand::root("/usr/bin/nmcli"),
         ];
-        t.file_grants = vec![rgrant("/etc/net", Access::Rw, true)];
+        t.file_grants = vec![rgrant("/etc/net", Access::RW, true)];
         t.members = vec!["dbops".into(), "netops".into()];
         let mut m = mgroup("ops", 8020);
         // Different ORDER on every set — must still be in sync.
@@ -1341,7 +1396,7 @@ mod tests {
             SudoCommand::root("/usr/bin/nmcli"),
             SudoCommand::root("/usr/sbin/ip"),
         ];
-        m.file_grants = vec![mgrant("/etc/net", Access::Rw, true)];
+        m.file_grants = vec![mgrant("/etc/net", Access::RW, true)];
         m.members_added = vec!["netops".into(), "dbops".into()];
         let registry = managed_groups(&[m]);
         let actions = diff_resolved_groups(&[t], &registry);
