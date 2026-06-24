@@ -1,14 +1,18 @@
 //! Reads the Linux *composition* subset of a Tessera role-store slice.
 //!
-//! Census needs only `payload.groups`, `payload.sudo_role`, `payload.limits`.
+//! Census needs only `payload.groups`, `payload.sudo_role`, `payload.limits`,
+//! `payload.permissions`, and `payload.files`.
 //! Parsing is TOLERANT (no `deny_unknown_fields`): full role-schema validation
 //! is Tessera's responsibility (spec §17). Census ignores fields it does not
-//! consume (`mac_mask`, `selinux`, `session`, `name`, `level`, ...).
+//! consume (`mac_mask`, `selinux`, `session`, `name`, `level`, ...). The one
+//! exception is the inner `[[payload.files]]` grant, which reuses the strict
+//! catalog [`FileGrant`] type: a role file grant is materialized as root via
+//! setfacl, so an unknown key there must fail closed, not be silently ignored.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::catalog::ParamValue;
+use crate::catalog::{FileGrant, ParamValue};
 
 /// A permission reference as written in a role slice's `payload.permissions`.
 ///
@@ -139,10 +143,16 @@ pub struct RoleComposition {
     pub sudo_role: Option<String>,
     /// Resource limits (raw escape-hatch primitive).
     pub limits: Limits,
+    /// Inline file-access grants (raw escape-hatch primitive), reusing the same
+    /// shape as a catalog `[[file]]` grant. The strict catalog [`FileGrant`] type
+    /// is reused deliberately: a role file grant is materialized as root via
+    /// setfacl, so an unknown key must fail closed. Like the other raw primitives,
+    /// these are unioned with the permission expansion by the resolver.
+    pub files: Vec<FileGrant>,
     /// Permission references to expand against the catalog. Each is a bare id or
-    /// a `{id, ...params}` table. The raw `groups`/`sudo_role`/`limits` above are
-    /// unioned with the expansion of these (spec: escape hatch coexists with
-    /// permissions).
+    /// a `{id, ...params}` table. The raw `groups`/`sudo_role`/`limits`/`files`
+    /// above are unioned with the expansion of these (spec: escape hatch coexists
+    /// with permissions).
     pub permissions: Vec<PermissionRef>,
 }
 
@@ -158,9 +168,13 @@ pub struct RoleComposition {
 // Tolerant on purpose (no `deny_unknown_fields`) — Tessera owns the role schema
 // and Census must ignore the adapter fields it does not consume (§4.2).
 
-/// The `[payload]` subset Census reads from a role slice. Tolerant: unknown
-/// keys are ignored (Census reads only the Linux/payload subset of a format
-/// Tessera owns). `pub` so the interface-contract test can schematize it.
+/// The `[payload]` subset Census reads from a role slice. Tolerant at the
+/// payload level: unknown keys are ignored (Census reads only the Linux/payload
+/// subset of a format Tessera owns). The one strict spot is the inner
+/// `[[payload.files]]` grant, which reuses the catalog [`FileGrant`]
+/// (`deny_unknown_fields`) — a role file grant materializes as root, so a typo'd
+/// key there must fail closed. `pub` so the interface-contract test can
+/// schematize it.
 #[derive(Debug, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SlicePayload {
@@ -170,6 +184,8 @@ pub struct SlicePayload {
     sudo_role: Option<String>,
     #[serde(default)]
     limits: Option<Limits>,
+    #[serde(default)]
+    files: Option<Vec<FileGrant>>,
     #[serde(default)]
     permissions: Option<Vec<PermissionRef>>,
 }
@@ -231,12 +247,14 @@ pub fn read_composition(role_store: &Path, role: &str) -> Result<RoleComposition
         groups: None,
         sudo_role: None,
         limits: None,
+        files: None,
         permissions: None,
     });
     Ok(RoleComposition {
         groups: payload.groups.unwrap_or_default(),
         sudo_role: payload.sudo_role,
         limits: payload.limits.unwrap_or_default(),
+        files: payload.files.unwrap_or_default(),
         permissions: payload.permissions.unwrap_or_default(),
     })
 }
@@ -437,6 +455,133 @@ permissions = [{ units = ["nginx"] }]
         );
         let c = read_composition(tmp.path(), "noperm").unwrap();
         assert!(c.permissions.is_empty());
+    }
+
+    #[test]
+    fn reads_single_inline_file_grant() {
+        use crate::catalog::Access;
+        let tmp = tempfile::tempdir().unwrap();
+        write_slice(
+            tmp.path(),
+            "cal",
+            r#"
+role = "cal"
+version = 1
+os = "linux"
+name = "Calibration"
+level = 2
+[payload]
+[[payload.files]]
+path = "/etc/X11/xorg.conf.d/99-calibration.conf"
+access = "rw"
+"#,
+        );
+        let c = read_composition(tmp.path(), "cal").unwrap();
+        assert_eq!(c.files.len(), 1);
+        assert_eq!(c.files[0].path, "/etc/X11/xorg.conf.d/99-calibration.conf");
+        assert_eq!(c.files[0].access, Access::RW);
+        // `recursive` defaults to false when omitted.
+        assert!(!c.files[0].recursive);
+    }
+
+    #[test]
+    fn reads_multiple_inline_file_grants() {
+        use crate::catalog::Access;
+        let tmp = tempfile::tempdir().unwrap();
+        write_slice(
+            tmp.path(),
+            "multi",
+            r#"
+role = "multi"
+version = 1
+os = "linux"
+name = "Multi"
+level = 2
+[payload]
+[[payload.files]]
+path = "/etc/app/conf.d"
+access = "rw"
+recursive = true
+[[payload.files]]
+path = "/var/log/app/current.log"
+access = "ro"
+"#,
+        );
+        let c = read_composition(tmp.path(), "multi").unwrap();
+        assert_eq!(c.files.len(), 2);
+        assert_eq!(c.files[0].path, "/etc/app/conf.d");
+        assert!(c.files[0].recursive);
+        assert_eq!(c.files[1].access, Access::RO);
+    }
+
+    #[test]
+    fn inline_file_grants_coexist_with_permissions_and_raw_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_slice(
+            tmp.path(),
+            "coexist",
+            r#"
+role = "coexist"
+version = 1
+os = "linux"
+name = "Coexist"
+level = 3
+[payload]
+groups = ["wheel"]
+sudo_role = "ops"
+permissions = ["log-read"]
+[[payload.files]]
+path = "/etc/app"
+access = "rw"
+recursive = true
+[payload.limits]
+nofile = 1024
+"#,
+        );
+        let c = read_composition(tmp.path(), "coexist").unwrap();
+        assert_eq!(c.groups, vec!["wheel"]);
+        assert_eq!(c.sudo_role.as_deref(), Some("ops"));
+        assert_eq!(c.limits.nofile, Some(1024));
+        assert_eq!(c.permissions.len(), 1);
+        assert_eq!(c.files.len(), 1);
+        assert_eq!(c.files[0].path, "/etc/app");
+    }
+
+    #[test]
+    fn inline_file_grant_with_unknown_key_is_rejected() {
+        // FileGrant is strict (deny_unknown_fields): a typo'd key must fail closed
+        // because the grant materializes as root via setfacl.
+        let tmp = tempfile::tempdir().unwrap();
+        write_slice(
+            tmp.path(),
+            "typo",
+            r#"
+role = "typo"
+version = 1
+os = "linux"
+name = "Typo"
+level = 0
+[payload]
+[[payload.files]]
+path = "/etc/app"
+access = "rw"
+recursiv = true
+"#,
+        );
+        let err = read_composition(tmp.path(), "typo").unwrap_err();
+        assert!(matches!(err, RoleStoreError::TomlParse { .. }));
+    }
+
+    #[test]
+    fn absent_files_yields_empty_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_slice(
+            tmp.path(),
+            "nofiles",
+            "role = \"nofiles\"\nversion = 1\nos = \"linux\"\nname = \"n\"\nlevel = 0\n[payload]\ngroups = [\"wheel\"]\n",
+        );
+        let c = read_composition(tmp.path(), "nofiles").unwrap();
+        assert!(c.files.is_empty());
     }
 
     #[test]

@@ -16,6 +16,62 @@
     }
   },
   "$defs": {
+    "Access": {
+      "description": "A set of file-access bits. Either a compact perm string (letters r/w/x plus the legacy aliases \"ro\"/\"rw\") or an array of bit names drawn from read/write/execute/traverse.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "ro",
+            "rw",
+            "r",
+            "w",
+            "x",
+            "rx",
+            "wx",
+            "rwx"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write",
+              "execute",
+              "traverse"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      ]
+    },
+    "FileGrant": {
+      "description": "A single file-access grant as written in a catalog record, parsed *strictly*.\n\nStrict (`deny_unknown_fields`) for the same reason the whole catalog is: Census\nowns this format and materializes it as root (setfacl). An unrecognised key is a\ntypo or a smuggled field, not something to silently ignore.\n\nThe `path` is validated (absolute, no control chars, no `..` component) at the\nread boundary. `{param}` placeholders here are filled and re-validated at\nresolve time, mirroring the parametrized-sudo path exactly — but this\nsubstitution path applies ONLY to a catalog permission grant, which has a\nparam source (the referencing role's `PermissionRef` params). A raw role\n`[payload].files` grant has no param source, so `crate::model` forbids\nplaceholders there entirely and validates the literal path in full; this type\nis shared by both, but only the catalog side ever substitutes.",
+      "type": "object",
+      "properties": {
+        "access": {
+          "description": "The set of access bits this grant requests (read/write/execute/traverse).",
+          "$ref": "#/$defs/Access"
+        },
+        "path": {
+          "description": "Absolute path to a directory, file, or glob pattern.",
+          "type": "string"
+        },
+        "recursive": {
+          "description": "For directories: apply recursively and set a default-ACL so new files in\nthe tree inherit the access. Absent defaults to `false`.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "access"
+      ]
+    },
     "Limits": {
       "description": "systemd/rlimit composition subset Census consumes.",
       "type": "object",
@@ -61,9 +117,18 @@
       ]
     },
     "SlicePayload": {
-      "description": "The `[payload]` subset Census reads from a role slice. Tolerant: unknown\nkeys are ignored (Census reads only the Linux/payload subset of a format\nTessera owns). `pub` so the interface-contract test can schematize it.",
+      "description": "The `[payload]` subset Census reads from a role slice. Tolerant at the\npayload level: unknown keys are ignored (Census reads only the Linux/payload\nsubset of a format Tessera owns). The one strict spot is the inner\n`[[payload.files]]` grant, which reuses the catalog [`FileGrant`]\n(`deny_unknown_fields`) — a role file grant materializes as root, so a typo'd\nkey there must fail closed. `pub` so the interface-contract test can\nschematize it.",
       "type": "object",
       "properties": {
+        "files": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/FileGrant"
+          }
+        },
         "groups": {
           "type": [
             "array",

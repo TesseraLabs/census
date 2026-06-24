@@ -155,7 +155,7 @@
       "additionalProperties": false
     },
     "FileGrant": {
-      "description": "A single file-access grant as written in a catalog record, parsed *strictly*.\n\nStrict (`deny_unknown_fields`) for the same reason the whole catalog is: Census\nowns this format and materializes it as root (setfacl). An unrecognised key is a\ntypo or a smuggled field, not something to silently ignore.\n\nThe `path` is validated (absolute, no control chars, no `..` component) at the\nread boundary; `{param}` placeholders are filled and re-validated at resolve\ntime, mirroring the parametrized-sudo path exactly.",
+      "description": "A single file-access grant as written in a catalog record, parsed *strictly*.\n\nStrict (`deny_unknown_fields`) for the same reason the whole catalog is: Census\nowns this format and materializes it as root (setfacl). An unrecognised key is a\ntypo or a smuggled field, not something to silently ignore.\n\nThe `path` is validated (absolute, no control chars, no `..` component) at the\nread boundary. `{param}` placeholders here are filled and re-validated at\nresolve time, mirroring the parametrized-sudo path exactly — but this\nsubstitution path applies ONLY to a catalog permission grant, which has a\nparam source (the referencing role's `PermissionRef` params). A raw role\n`[payload].files` grant has no param source, so `crate::model` forbids\nplaceholders there entirely and validates the literal path in full; this type\nis shared by both, but only the catalog side ever substitutes.",
       "type": "object",
       "properties": {
         "access": {
