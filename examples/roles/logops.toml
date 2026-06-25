@@ -1,0 +1,18 @@
+role    = "logops"
+version = 1
+os      = "linux"
+name    = "Logging & telemetry operator"
+level   = 3
+
+[payload]
+# A logging/telemetry operator built from curated, all-contained app packages.
+# rsyslog.operate is lifecycle + READ-ONLY config: rsyslogd runs as root, so rw
+# config is escalation (omprog runs programs as root, module(load=…) loads a .so
+# into the root daemon) and lives in rsyslog.admin — deliberately NOT here.
+# telegraf.operate carries rw config but stays contained because the telegraf
+# daemon is pinned non-root by the unit User=telegraf (exec-as-app-user, the
+# redis precedent). No escalation permission here, so this role is a safe demo.
+permissions = [
+    "rsyslog.operate",
+    "telegraf.operate",
+]

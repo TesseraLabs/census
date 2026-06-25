@@ -1,0 +1,28 @@
+id       = "openvpn.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for OpenVPN. Pins service-observe to the modern
+# Debian-12 instance unit `openvpn-server@server` (template unit
+# openvpn-server@.service, default instance `server`) and binds the ro config
+# convention component (config tree /etc/openvpn follows /etc/{app}).
+#
+# DEPLOYMENT-SPECIFIC unit: OpenVPN ships as a TEMPLATE unit, one instance per
+# tunnel config — the instance name (the part after `@`) is the .conf basename
+# under /etc/openvpn/server (or .../client). `server` is only a sensible default;
+# a role overrides `units` to match its actual instance(s), and a client
+# deployment uses openvpn-client@<name>. The legacy single unit openvpn@<name>
+# applies to older targets. The `@`-form is a valid service-observe `{units}`
+# token (the token kind admits `@`).
+#
+# Contained: read-only status + ro ACL on /etc/openvpn, no mutation, no root path.
+# NOTE: /etc/openvpn holds the tunnel PRIVATE KEYS and certificates (server/*.key,
+# *.crt). Even read-only access therefore exposes secrets — this is credential
+# exposure, not privilege escalation, but it is why ro here is still sensitive.
+#
+# Values verified against openvpn on Debian 12 (template unit openvpn-server@,
+# config /etc/openvpn). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "openvpn-server@server" },
+    { id = "app-config-ro", app = "openvpn" },
+]

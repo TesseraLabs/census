@@ -1,0 +1,28 @@
+id       = "fluent-bit.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for Fluent Bit: read-only observe (service-observe on
+# the `fluent-bit` unit) PLUS service-control on the same unit and READ-ONLY
+# config (the ro convention component on /etc/fluent-bit). Lifecycle + read only
+# — NO rw config — so this stays contained.
+#
+# rw on /etc/fluent-bit is escalation-capable and lives in fluent-bit.admin:
+# Fluent Bit runs as ROOT on the baseline, and its config can run commands as
+# root (the `exec`/`exec_wasi` input plugin) and load external `.so` plugins into
+# the root process. So unlike a non-root daemon (redis/telegraf), Fluent Bit's rw
+# config is NOT a contained operate — keep rw out of operate.
+#
+# DEPLOYMENT-SPECIFIC unit: legacy upstream packaging ships the daemon as
+# `td-agent-bit.service` rather than `fluent-bit.service`. On targets still using
+# that name the unit differs and lands in a per-OS layer (the openvpn legacy
+# `openvpn@` callout precedent).
+#
+# Values verified against fluent-bit on Debian 12 (unit fluent-bit, config
+# /etc/fluent-bit, daemon runs as root — the upstream/td-agent-bit systemd unit
+# sets no User=). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "fluent-bit" },
+    { id = "service-control", units = "fluent-bit" },
+    { id = "app-config-ro", app = "fluent-bit" },
+]

@@ -846,3 +846,807 @@ fn packaged_app_scope_segment_guard_rejects_escapes() {
         );
     }
 }
+
+#[test]
+fn packaged_docker_observe_has_no_group_or_socket() {
+    // docker.observe is the contained tier: status + ro /etc/docker ONLY. There is
+    // no contained way to list containers (docker ps needs the root-equivalent
+    // daemon socket), so observe must grant NO docker group, NO socket file, and
+    // keep /etc/docker read-only. Any group/socket here would silently turn the
+    // contained tier into a root-equivalent one.
+    let resolved = resolve_app_package("docker.observe");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "docker.observe must be contained; got {:?}",
+        resolved.risk
+    );
+    assert!(
+        groups_of(&resolved).is_empty(),
+        "docker.observe must grant NO groups (no docker group); got {:?}",
+        groups_of(&resolved)
+    );
+    assert!(
+        !groups_of(&resolved).contains(&"docker"),
+        "docker.observe must NOT grant the root-equivalent docker group"
+    );
+    // No socket file grant of any kind — observe never touches the daemon socket.
+    assert!(
+        access_on(&resolved, "/var/run/docker.sock").is_none()
+            && access_on(&resolved, "/run/docker.sock").is_none(),
+        "docker.observe must NOT grant the docker socket; got {:?}",
+        resolved
+            .file_grants
+            .iter()
+            .map(|g| g.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/docker"),
+        Some(Access::RO),
+        "docker.observe /etc/docker must be read-only"
+    );
+}
+
+#[test]
+fn packaged_docker_operate_is_escalation_with_group() {
+    // docker.operate is escalation-capable, not a contained operate: the docker
+    // group is daemon-socket access, which is root-equivalent (bind-mount host
+    // root, --privileged). The label and the group membership must both reflect
+    // that — there is no contained operate for docker.
+    let resolved = resolve_app_package("docker.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "docker.operate must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert!(
+        groups_of(&resolved).contains(&"docker"),
+        "docker.operate must grant the docker group (socket = root-equivalent); got {:?}",
+        groups_of(&resolved)
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/docker-compose"),
+        "docker.operate must carry the docker-compose sudo; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_mosquitto_operate_is_contained_rw() {
+    // mosquitto.operate is contained on Debian 12 (the unit pins User=mosquitto):
+    // lifecycle + rw config + ro logs, with rw on /etc/mosquitto present. The
+    // containment caveat (units lacking User=) is carried in the doc/risk_note;
+    // here the packaged Debian-12 shape must be contained with rw config.
+    let resolved = resolve_app_package("mosquitto.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "mosquitto.operate must be contained on Debian 12; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/mosquitto"),
+        Some(Access::RW),
+        "mosquitto.operate must grant rw on /etc/mosquitto (non-root daemon, contained)"
+    );
+    assert_eq!(
+        access_on(&resolved, "/var/log/mosquitto"),
+        Some(Access::RO),
+        "mosquitto.operate logs must stay read-only"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart mosquitto"),
+        "mosquitto.operate must carry service-control on the mosquitto unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_pcscd_operate_is_contained_no_rw_config() {
+    // pcscd.operate is contained: lifecycle on both units + contained USB-reader
+    // access via device-usb (plugdev). The escalation lever for pcscd is rw on
+    // /etc/reader.conf.d (root .so load via LIBPATH) — operate must NOT carry it;
+    // that is pcscd.admin. So no rw on the config tree, but the plugdev group must
+    // be present.
+    let resolved = resolve_app_package("pcscd.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "pcscd.operate must be contained; got {:?}",
+        resolved.risk
+    );
+    assert_ne!(
+        access_on(&resolved, "/etc/reader.conf.d"),
+        Some(Access::RW),
+        "pcscd.operate must NOT grant rw on /etc/reader.conf.d (that is admin)"
+    );
+    assert!(
+        groups_of(&resolved).contains(&"plugdev"),
+        "pcscd.operate must grant the plugdev group via device-usb; got {:?}",
+        groups_of(&resolved)
+    );
+}
+
+#[test]
+fn packaged_pcscd_admin_is_escalation_with_rw_both_units() {
+    // pcscd.admin carries the escalation: rw /etc/reader.conf.d (LIBPATH → root .so
+    // load) plus service-control on BOTH the daemon and its socket-activation unit.
+    // pcscd is socket-activated, so collapsing to one unit would leave the socket
+    // unmanaged — both must resolve.
+    let resolved = resolve_app_package("pcscd.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "pcscd.admin must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/reader.conf.d"),
+        Some(Access::RW),
+        "pcscd.admin must grant rw on /etc/reader.conf.d"
+    );
+    let sudo = sudo_of(&resolved);
+    for unit in ["pcscd", "pcscd.socket"] {
+        assert!(
+            sudo.contains(&format!("/usr/bin/systemctl restart {unit}").as_str()),
+            "pcscd.admin must resolve a control set for {unit}; got {sudo:?}"
+        );
+    }
+}
+
+#[test]
+fn packaged_salt_minion_operate_is_ro_only() {
+    // salt-minion.operate is contained because it is READ-ONLY config: the minion
+    // runs as root, so rw /etc/salt (repoint master:) is escalation and lives in
+    // salt-minion.admin. operate must keep /etc/salt ro, never rw.
+    let resolved = resolve_app_package("salt-minion.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "salt-minion.operate must be contained; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/salt"),
+        Some(Access::RO),
+        "salt-minion.operate /etc/salt must be read-only"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart salt-minion"),
+        "salt-minion.operate must carry service-control on the salt-minion unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_salt_minion_admin_is_escalation_with_rw() {
+    // salt-minion.admin carries the escalation: rw /etc/salt, classed
+    // escalation-capable — the root minion's master: address is in /etc/salt, so
+    // rw repoints it at an attacker-controlled master = full host takeover.
+    let resolved = resolve_app_package("salt-minion.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "salt-minion.admin must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/salt"),
+        Some(Access::RW),
+        "salt-minion.admin must grant rw on /etc/salt"
+    );
+}
+
+#[test]
+fn packaged_rsyslog_observe_is_read_only_dropin_tree() {
+    // rsyslog.observe grants service-observe plus ro on the drop-in tree
+    // /etc/rsyslog.d only. The main /etc/rsyslog.conf is out of scope: a single
+    // system file cannot be granted rewrite-proof without granting all of /etc, so
+    // census (which requires a directory ACL for rewrite-proof enforcement) rejects
+    // a per-file grant at apply on targets without a per-file backend.
+    let resolved = resolve_app_package("rsyslog.observe");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "rsyslog.observe must be contained; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/rsyslog.d"),
+        Some(Access::RO),
+        "rsyslog.observe /etc/rsyslog.d must be read-only"
+    );
+    // Regression guard for the apply-rejection defect: the single-file grant on
+    // /etc/rsyslog.conf must be gone — no per-file grant on the main config.
+    assert_eq!(
+        access_on(&resolved, "/etc/rsyslog.conf"),
+        None,
+        "rsyslog.observe must NOT grant the single file /etc/rsyslog.conf"
+    );
+}
+
+#[test]
+fn packaged_rsyslog_operate_is_contained_ro() {
+    // rsyslog.operate is contained because it is READ-ONLY config: rsyslogd runs
+    // as root, so rw config (omprog runs programs as root, module(load=…) loads a
+    // .so into the root daemon) is escalation and lives in rsyslog.admin. operate
+    // keeps the drop-in tree /etc/rsyslog.d ro, never rw. The main
+    // /etc/rsyslog.conf is out of scope (a single-file grant is rejected at apply
+    // on targets without a per-file backend), so it must not appear.
+    let resolved = resolve_app_package("rsyslog.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "rsyslog.operate must be contained; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/rsyslog.d"),
+        Some(Access::RO),
+        "rsyslog.operate /etc/rsyslog.d must be read-only"
+    );
+    // Regression guard for the apply-rejection defect: no per-file grant on the
+    // main config /etc/rsyslog.conf.
+    assert_eq!(
+        access_on(&resolved, "/etc/rsyslog.conf"),
+        None,
+        "rsyslog.operate must NOT grant the single file /etc/rsyslog.conf"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart rsyslog"),
+        "rsyslog.operate must carry service-control on the rsyslog unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_rsyslog_admin_is_escalation_with_rw() {
+    // rsyslog.admin carries the escalation: rw on the drop-in tree /etc/rsyslog.d,
+    // classed escalation-capable — rsyslogd is root and a drop-in can load a .so /
+    // run a program (omprog) AS ROOT. The main /etc/rsyslog.conf is out of scope (a
+    // single-file grant is rejected at apply on targets without a per-file
+    // backend), so admin grants only the directory tree.
+    let resolved = resolve_app_package("rsyslog.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "rsyslog.admin must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/rsyslog.d"),
+        Some(Access::RW),
+        "rsyslog.admin must grant rw on the drop-in tree /etc/rsyslog.d"
+    );
+    // Regression guard for the apply-rejection defect: no per-file grant on the
+    // main config /etc/rsyslog.conf.
+    assert_eq!(
+        access_on(&resolved, "/etc/rsyslog.conf"),
+        None,
+        "rsyslog.admin must NOT grant the single file /etc/rsyslog.conf"
+    );
+}
+
+#[test]
+fn packaged_fluent_bit_admin_is_escalation_with_rw() {
+    // fluent-bit.admin is escalation-capable + rw /etc/fluent-bit: Fluent Bit runs
+    // as root on the baseline (the upstream/td-agent-bit unit sets no User=), so
+    // rw config runs commands (exec/exec_wasi input) and loads .so plugins AS ROOT.
+    let resolved = resolve_app_package("fluent-bit.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "fluent-bit.admin must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/fluent-bit"),
+        Some(Access::RW),
+        "fluent-bit.admin must grant rw on /etc/fluent-bit"
+    );
+}
+
+#[test]
+fn packaged_fluent_bit_operate_is_contained_ro() {
+    // fluent-bit.operate is contained because it is READ-ONLY config: the root
+    // daemon means rw config is escalation (exec input runs commands as root, .so
+    // plugin load) and lives in fluent-bit.admin. operate keeps /etc/fluent-bit ro.
+    let resolved = resolve_app_package("fluent-bit.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "fluent-bit.operate must be contained; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/fluent-bit"),
+        Some(Access::RO),
+        "fluent-bit.operate /etc/fluent-bit must be read-only"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart fluent-bit"),
+        "fluent-bit.operate must carry service-control on the fluent-bit unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_telegraf_operate_is_contained_rw() {
+    // Telegraf: the daemon is structurally pinned non-root by the unit
+    // User=telegraf, so operate MAY carry rw config and stay contained — rw config
+    // grants exec/execd input as the telegraf user, not root (exec-as-app-user, the
+    // redis precedent). There is no telegraf.admin tier. No log grant (journald).
+    let resolved = resolve_app_package("telegraf.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "telegraf.operate must be contained; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/telegraf"),
+        Some(Access::RW),
+        "telegraf.operate must grant rw on /etc/telegraf (non-root daemon, contained)"
+    );
+    assert_eq!(
+        access_on(&resolved, "/var/log/telegraf"),
+        None,
+        "telegraf.operate must NOT grant a log tree (telegraf logs to journald)"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart telegraf"),
+        "telegraf.operate must carry service-control on the telegraf unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_openvpn_observe_is_contained_ro() {
+    // openvpn.observe is contained: read-only status on the instance unit plus ro
+    // /etc/openvpn, no mutation. The whole reason rw is escalation (admin) is that
+    // up/down scripts and the plugin .so run as root, so observe must stay ro —
+    // /etc/openvpn holds private keys, so even ro is credential-sensitive.
+    let resolved = resolve_app_package("openvpn.observe");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "openvpn.observe must be contained; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/openvpn"),
+        Some(Access::RO),
+        "openvpn.observe /etc/openvpn must be read-only"
+    );
+    let sudo = sudo_of(&resolved);
+    // The instance-unit (`@`-form) status verb resolves; no mutating verbs leak.
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl status openvpn-server@server"),
+        "openvpn.observe must carry status on the instance unit; got {sudo:?}"
+    );
+    assert!(
+        !sudo.contains(&"/usr/bin/systemctl restart openvpn-server@server"),
+        "openvpn.observe must NOT carry a mutating verb; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_openvpn_admin_is_escalation_with_rw() {
+    // openvpn.admin carries the escalation: rw /etc/openvpn + control on the
+    // instance unit, classed escalation-capable — up/down/route-up scripts run as
+    // root under script-security 2 and the plugin directive loads a .so into the
+    // root process, so rw config is a root code-exec path.
+    let resolved = resolve_app_package("openvpn.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "openvpn.admin must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/openvpn"),
+        Some(Access::RW),
+        "openvpn.admin must grant rw on /etc/openvpn"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart openvpn-server@server"),
+        "openvpn.admin must carry service-control on the instance unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_wireguard_admin_is_escalation_with_rw() {
+    // wireguard.admin carries the escalation: rw /etc/wireguard + control on the
+    // wg-quick instance unit, classed escalation-capable — PostUp/PostDown/PreUp/
+    // PreDown run as root via wg-quick, so rw config is a root command-exec path.
+    let resolved = resolve_app_package("wireguard.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "wireguard.admin must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/wireguard"),
+        Some(Access::RW),
+        "wireguard.admin must grant rw on /etc/wireguard"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart wg-quick@wg0"),
+        "wireguard.admin must carry service-control on the wg-quick instance unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_node_red_operate_is_contained_rw() {
+    // node-red.operate is contained even with RW config because the official
+    // systemd install pins Node-RED non-root via the unit's User=: rw on the
+    // userDir is command-exec as the non-root node-red user (exec node /
+    // child_process), not root — the redis precedent (rw in operate, no admin
+    // tier). It also carries the gpio group via device-bus. Assert the contained
+    // non-root rw shape: rw on the userDir, the gpio group present, and NO root
+    // path — the userDir is a home-dir tree, never /etc and never /.
+    let resolved = resolve_app_package("node-red.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "node-red.operate must be contained; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/var/lib/node-red"),
+        Some(Access::RW),
+        "node-red.operate must grant rw on the userDir (non-root daemon, contained)"
+    );
+    assert!(
+        groups_of(&resolved).contains(&"gpio"),
+        "node-red.operate must grant the gpio group via device-bus; got {:?}",
+        groups_of(&resolved)
+    );
+    // No root path: the only file grant is the userDir, which is neither /etc nor
+    // the filesystem root — the containment claim rests on the grant staying off
+    // any system/root tree.
+    for grant in &resolved.file_grants {
+        assert!(
+            grant.path.starts_with("/var/lib/node-red"),
+            "node-red.operate must not grant any path outside the userDir; got {}",
+            grant.path
+        );
+    }
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart nodered"),
+        "node-red.operate must carry service-control on the nodered unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_openvpn_observe_keeps_config_ro() {
+    // The ro-ness of observe IS the containment claim: /etc/openvpn holds the tunnel
+    // private keys, and rw would be a root code-exec path (up/down scripts + plugin
+    // .so run as root). So observe must resolve /etc/openvpn strictly RO, never rw —
+    // this locks the private-key credential-exposure-but-contained contract.
+    let resolved = resolve_app_package("openvpn.observe");
+
+    let access = access_on(&resolved, "/etc/openvpn").expect("openvpn.observe grants /etc/openvpn");
+    assert_eq!(
+        access,
+        Access::RO,
+        "openvpn.observe /etc/openvpn must be read-only; got {access:?}"
+    );
+    assert!(
+        !access.contains(Access::WRITE),
+        "openvpn.observe /etc/openvpn must NOT carry the write bit"
+    );
+}
+
+#[test]
+fn packaged_wireguard_operate_keeps_config_ro() {
+    // The ro-ness of operate IS the containment claim: bringing the interface up runs
+    // the config's PostUp/PostDown hooks as root, so operate stays contained ONLY
+    // because it cannot rewrite that config — rw is escalation (wireguard.admin). So
+    // operate must resolve /etc/wireguard strictly RO, never rw, even though it
+    // carries the wg-quick lifecycle that triggers the root hooks.
+    let resolved = resolve_app_package("wireguard.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "wireguard.operate must be contained; got {:?}",
+        resolved.risk
+    );
+    let access =
+        access_on(&resolved, "/etc/wireguard").expect("wireguard.operate grants /etc/wireguard");
+    assert_eq!(
+        access,
+        Access::RO,
+        "wireguard.operate /etc/wireguard must be read-only; got {access:?}"
+    );
+    assert!(
+        !access.contains(Access::WRITE),
+        "wireguard.operate /etc/wireguard must NOT carry the write bit"
+    );
+}
+
+#[test]
+fn packaged_greengrass_admin_is_escalation() {
+    // greengrass.admin is escalation-capable, and there is NO contained operate
+    // tier: the installer needs a sudo-ALL (root-equivalent) entry, the Core runs
+    // as root, and rw on /greengrass/v2/config rewrites component recipes the root
+    // Core executes = root code-exec. Assert the label plus rw config + Core control.
+    let resolved = resolve_app_package("greengrass.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "greengrass.admin must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/greengrass/v2/config"),
+        Some(Access::RW),
+        "greengrass.admin must grant rw on /greengrass/v2/config (root code-exec via recipes)"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart greengrass"),
+        "greengrass.admin must carry control of the greengrass Core unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_azure_iot_edge_admin_is_escalation_with_docker_group() {
+    // azure-iot-edge.admin is escalation-capable, and there is NO contained operate
+    // tier: edgeAgent drives workload modules through the Docker socket, so the
+    // package carries the root-equivalent docker group; aziot-edged is a privileged
+    // security daemon; rw on /etc/aziot repoints provisioning + changes the module
+    // set the privileged daemon launches via the root socket. Assert the label, the
+    // docker group, and rw config.
+    let resolved = resolve_app_package("azure-iot-edge.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "azure-iot-edge.admin must be escalation-capable; got {:?}",
+        resolved.risk
+    );
+    assert!(
+        groups_of(&resolved).contains(&"docker"),
+        "azure-iot-edge.admin must grant the docker group (Moby socket = root-equivalent); got {:?}",
+        groups_of(&resolved)
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/aziot"),
+        Some(Access::RW),
+        "azure-iot-edge.admin must grant rw on /etc/aziot (provisioning/module control)"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart aziot-edged"),
+        "azure-iot-edge.admin must carry control of the aziot-edged unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_edgex_operate_is_contained() {
+    // edgex.operate (snap deployment) is contained as lifecycle + READ-ONLY config:
+    // the EdgeX snap services run as ROOT (no User= pin), so rw config is escalation
+    // (edgex.admin), and operate keeps config ro — the rsyslog/salt-minion
+    // root-daemon shape. It carries the dialout group via device-serial for Modbus
+    // RTU. Assert: contained, config RO (NOT rw), dialout present, snap-unit
+    // lifecycle, and no rw on the config tree.
+    let resolved = resolve_app_package("edgex.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "edgex.operate must be contained (lifecycle + ro only, root daemon); got {:?}",
+        resolved.risk
+    );
+    let config = access_on(&resolved, "/var/snap/edgexfoundry/current")
+        .expect("edgex.operate grants the snap config tree");
+    assert_eq!(
+        config,
+        Access::RO,
+        "edgex.operate snap config must be READ-ONLY (root daemon → rw is admin); got {config:?}"
+    );
+    assert!(
+        !config.contains(Access::WRITE),
+        "edgex.operate must NOT carry the write bit on the snap config tree"
+    );
+    assert!(
+        groups_of(&resolved).contains(&"dialout"),
+        "edgex.operate must grant the dialout group via device-serial (Modbus RTU); got {:?}",
+        groups_of(&resolved)
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart snap.edgexfoundry.device-modbus"),
+        "edgex.operate must carry control of the representative snap device-service unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_edgex_admin_is_escalation_with_rw() {
+    // edgex.admin carries the escalation: rw on the snap config tree + control of the
+    // snap services, classed escalation-capable — the EdgeX snap services run as ROOT
+    // (no User= pin), so rw config reconfigures what the root services load (device
+    // endpoints, driver settings, registry/secrets endpoints) = a root-level
+    // reconfiguration path. This is the rsyslog/salt-minion shape.
+    let resolved = resolve_app_package("edgex.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "edgex.admin must be escalation-capable (root snap daemon, rw config); got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/var/snap/edgexfoundry/current"),
+        Some(Access::RW),
+        "edgex.admin must grant rw on the snap config tree (root reconfiguration path)"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart snap.edgexfoundry.core-data"),
+        "edgex.admin must carry control of the snap services; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_x11vnc_operate_is_contained() {
+    // x11vnc.operate is contained ONLY for the kiosk / guest-user-session case: it
+    // attaches to a non-root kiosk session via console-access (a contained leaf), so
+    // no host privilege is gained. Assert the contained label, the lifecycle, and
+    // that no root file path leaks. ROOT-:0 CAVEAT (documented in the package and
+    // l10n risk_note, not assertable here): if x11vnc instead attaches to the
+    // display-manager / login screen on :0 it runs AS ROOT and injects into the root
+    // login session = escalation — such a deployment must NOT ship this as contained
+    // and must use a separate root-tier package. x11vnc always grants full live-
+    // session control (view + input injection), a high-sensitivity grant even when
+    // contained.
+    let resolved = resolve_app_package("x11vnc.operate");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "x11vnc.operate must be contained for the kiosk-session case; got {:?}",
+        resolved.risk
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart x11vnc"),
+        "x11vnc.operate must carry service-control on the x11vnc unit; got {sudo:?}"
+    );
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl status x11vnc"),
+        "x11vnc.operate must also carry the observe status verb; got {sudo:?}"
+    );
+    // No root file path: console-access is a group-only contained leaf, so operate
+    // grants no file path at all — and certainly none under a system/root tree.
+    for grant in &resolved.file_grants {
+        assert!(
+            grant.path != "/" && !grant.path.starts_with("/etc"),
+            "x11vnc.operate must not grant a root/system file path; got {}",
+            grant.path
+        );
+    }
+}
+
+#[test]
+fn packaged_portainer_edge_admin_is_escalation() {
+    // portainer-edge.admin is escalation-capable, and there is NO contained operate
+    // tier: the Edge Agent drives the host docker socket (root-equivalent), so the
+    // package composes docker.operate. The escalation comes from that docker-socket
+    // access, independent of the agent's unit name. Assert the label and that the
+    // composed docker.operate surface is present (docker group + compose sudo).
+    let resolved = resolve_app_package("portainer-edge.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::EscalationCapable),
+        "portainer-edge.admin must be escalation-capable (composes docker.operate); got {:?}",
+        resolved.risk
+    );
+    assert!(
+        groups_of(&resolved).contains(&"docker"),
+        "portainer-edge.admin must grant the docker group via docker.operate (socket = root-equiv); got {:?}",
+        groups_of(&resolved)
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/docker-compose"),
+        "portainer-edge.admin must carry the docker-compose sudo from docker.operate; got {sudo:?}"
+    );
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart PortainerEdgeAgent"),
+        "portainer-edge.admin must carry lifecycle control of the agent unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_chromium_admin_is_contained_rw() {
+    // chromium.admin grants rw on the enterprise managed-policy tree, but stays
+    // CONTAINED (not escalation): the managed-policy files are root-owned, yet
+    // Chromium reads them as the unprivileged guest browser user, so rw does not
+    // run code as root — the worst it does is control a guest-level browser.
+    // (The kiosk-escape / lockdown-integrity concern is real but contained — it is
+    // carried in the package doc + l10n risk_note, not the risk enum.)
+    let resolved = resolve_app_package("chromium.admin");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "chromium.admin must be contained (browser reads root-owned policy as the guest user, no root code-exec); got {:?}",
+        resolved.risk
+    );
+    assert_eq!(
+        access_on(&resolved, "/etc/chromium/policies/managed"),
+        Some(Access::RW),
+        "chromium.admin must grant rw on /etc/chromium/policies/managed"
+    );
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl restart kiosk"),
+        "chromium.admin must carry service-control on the kiosk session unit; got {sudo:?}"
+    );
+}
+
+#[test]
+fn packaged_chromium_observe_keeps_policy_ro() {
+    // The ro-ness of observe/operate IS the kiosk-lockdown integrity guarantee:
+    // the managed policy defines the kiosk confinement, so observe must resolve
+    // /etc/chromium/policies/managed strictly RO, never rw — rw (the kiosk-escape
+    // authoring surface) lives only in chromium.admin. Also assert observe carries
+    // no mutating session verb (status only).
+    let resolved = resolve_app_package("chromium.observe");
+
+    assert_eq!(
+        resolved.risk,
+        Some(Risk::Contained),
+        "chromium.observe must be contained; got {:?}",
+        resolved.risk
+    );
+    let access = access_on(&resolved, "/etc/chromium/policies/managed")
+        .expect("chromium.observe grants the managed-policy tree");
+    assert_eq!(
+        access,
+        Access::RO,
+        "chromium.observe /etc/chromium/policies/managed must be read-only; got {access:?}"
+    );
+    assert!(
+        !access.contains(Access::WRITE),
+        "chromium.observe managed-policy grant must NOT carry the write bit"
+    );
+
+    let sudo = sudo_of(&resolved);
+    assert!(
+        sudo.contains(&"/usr/bin/systemctl status kiosk"),
+        "chromium.observe must carry status on the kiosk session unit; got {sudo:?}"
+    );
+    assert!(
+        !sudo.contains(&"/usr/bin/systemctl restart kiosk"),
+        "chromium.observe must NOT carry a mutating session verb; got {sudo:?}"
+    );
+}

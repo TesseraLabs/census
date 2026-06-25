@@ -187,3 +187,183 @@ risk_note = "Contained: scoped service control plus read-only config — no rw, 
 title     = "HAProxy — admin"
 summary   = "Administer HAProxy: start/stop/restart the service and edit /etc/haproxy (rw)."
 risk_note = "Escalation-capable: the haproxy master process starts as root, and lua-load/external-check directives in /etc/haproxy run programs from that root-started process — a root program-exec path. That is why this is admin, not a contained operate."
+
+["mosquitto.observe"]
+title     = "Mosquitto MQTT broker — observe"
+summary   = "Read-only access to the Mosquitto broker: query the mosquitto service status and read /etc/mosquitto and /var/log/mosquitto."
+risk_note = "Contained: read-only service status plus ACL ro on the broker's own config and log trees, no root path."
+
+["mosquitto.operate"]
+title     = "Mosquitto MQTT broker — operate"
+summary   = "Operate the Mosquitto broker: start/stop/restart the mosquitto service, edit /etc/mosquitto (rw), read /var/log/mosquitto."
+risk_note = "Contained only because the Debian-12 mosquitto unit pins User=mosquitto. This is NOT structural non-root like redis: mosquitto starts as root and self-drops via the `user` directive in /etc/mosquitto (the tree this grants rw), so the unit's User=mosquitto is what actually pins it unprivileged. With that pin, rw /etc/mosquitto reaches only the mosquitto user — rw includes acl_file/password_file (broker authn/authz bypass), and auth_plugin loads a .so as the mosquitto user (code-exec contained to that user, not root). Caveat: on any per-OS layer whose unit omits User= and relies on the conf self-drop, rw-config + restart is a root path (blank `user`, restart → broker runs as root, auth_plugin .so loads as root) — such a layer must verify User=mosquitto before shipping operate as contained. No admin tier on Debian 12."
+
+["pcscd.observe"]
+title     = "PC/SC smartcard daemon — observe"
+summary   = "Read-only access to pcscd: query the pcscd and pcscd.socket unit status and read /etc/reader.conf.d."
+risk_note = "Contained: read-only service status (the daemon and its socket-activation unit) plus ACL ro on the driver config tree /etc/reader.conf.d, no root path."
+
+["pcscd.operate"]
+title     = "PC/SC smartcard daemon — operate"
+summary   = "Operate pcscd: start/stop/restart the pcscd and pcscd.socket units and access USB CCID readers via the device-usb leaf (plugdev/scanner groups)."
+risk_note = "Contained: scoped service control of the daemon and its socket-activation unit, plus contained USB-reader device access via the device-usb leaf (plugdev/scanner groups). No rw on /etc/reader.conf.d, so no root .so-load path — that is pcscd.admin."
+
+["pcscd.admin"]
+title     = "PC/SC smartcard daemon — admin"
+summary   = "Administer pcscd: start/stop/restart the pcscd and pcscd.socket units and edit /etc/reader.conf.d (rw)."
+risk_note = "Escalation-capable: pcscd runs as root and a /etc/reader.conf.d entry sets LIBPATH to a CCID driver shared object that pcscd dlopen()s into its own root process. So rw on /etc/reader.conf.d is a direct root code-load path — point LIBPATH at an attacker-controlled .so and pcscd (root) loads it. That is why this is admin, not a contained operate. (pcscd is socket-activated, so both pcscd and pcscd.socket are controlled.)"
+
+["salt-minion.observe"]
+title     = "Salt minion — observe"
+summary   = "Read-only access to the Salt minion: query the salt-minion service status and read /etc/salt and /var/log/salt."
+risk_note = "Contained: read-only service status plus ACL ro on the minion's own config and log trees, no root path."
+
+["salt-minion.operate"]
+title     = "Salt minion — operate"
+summary   = "Operate the Salt minion: start/stop/restart the salt-minion service and read /etc/salt and /var/log/salt (read-only config + logs)."
+risk_note = "Contained: scoped service control plus read-only config and logs — no rw, no root path. rw on /etc/salt is escalation and lives in salt-minion.admin."
+
+["salt-minion.admin"]
+title     = "Salt minion — admin"
+summary   = "Administer the Salt minion: start/stop/restart the salt-minion service and edit /etc/salt (rw)."
+risk_note = "Escalation-capable: the salt-minion runs as root, and /etc/salt/minion sets the master: address the minion obeys. rw on /etc/salt repoints the minion at an attacker-controlled Salt master, which then pushes arbitrary states/modules the minion runs AS ROOT — full host takeover. That is why this is admin, not a contained operate."
+
+["rsyslog.observe"]
+title     = "rsyslog — observe"
+summary   = "Read-only access to rsyslog: query the rsyslog service status and read the drop-in tree /etc/rsyslog.d."
+risk_note = "Contained: read-only service status plus ACL ro on the drop-in tree /etc/rsyslog.d, no root path. rsyslogd runs as root, so rw on the drop-in tree would be a root code-load path — but observe is ro only, so containment holds. Managed surface is the drop-in tree /etc/rsyslog.d (rsyslog's default $IncludeConfig /etc/rsyslog.d/*.conf pulls every drop-in in). The main /etc/rsyslog.conf is out of scope: it is a single system-global file, and census requires directory-level ACLs for rewrite-proof config access (a per-file ACL is defeated by atomic-replace), so a single file in /etc cannot be granted rewrite-proof without granting all of /etc — and a single-file grant is rejected at apply on targets without a per-file backend. Admins edit the main conf out-of-band."
+
+["rsyslog.operate"]
+title     = "rsyslog — operate"
+summary   = "Operate rsyslog: start/stop/restart the rsyslog service and read the drop-in tree /etc/rsyslog.d (read-only config)."
+risk_note = "Contained: scoped service control plus read-only config — no rw, no root path. rsyslogd runs as root, so rw config is escalation (omprog runs programs as root, module(load=…) loads a .so into the root daemon) and lives in rsyslog.admin, never in operate. Managed surface is the drop-in tree /etc/rsyslog.d (rsyslog's default $IncludeConfig /etc/rsyslog.d/*.conf pulls every drop-in in). The main /etc/rsyslog.conf is out of scope: it is a single system-global file, and census requires directory-level ACLs for rewrite-proof config access (a per-file ACL is defeated by atomic-replace), so a single file in /etc cannot be granted rewrite-proof without granting all of /etc — and a single-file grant is rejected at apply on targets without a per-file backend. Admins edit the main conf out-of-band."
+
+["rsyslog.admin"]
+title     = "rsyslog — admin"
+summary   = "Administer rsyslog: start/stop/restart the rsyslog service and edit the drop-in tree /etc/rsyslog.d (rw)."
+risk_note = "Escalation-capable: rsyslogd runs as root, and rw on its drop-in tree is a root code-load/code-exec path — a drop-in in /etc/rsyslog.d can carry the omprog output module (runs an external program as root) or module(load=\"im…\")/legacy $ModLoad (loads a shared object into the root rsyslogd). That is why this is admin, not a contained operate. Managed surface is the drop-in tree /etc/rsyslog.d (rsyslog's default $IncludeConfig /etc/rsyslog.d/*.conf pulls every drop-in in). The main /etc/rsyslog.conf is out of scope: it is a single system-global file, and census requires directory-level ACLs for rewrite-proof config access (a per-file ACL is defeated by atomic-replace), so a single file in /etc cannot be granted rewrite-proof without granting all of /etc — and a single-file grant is rejected at apply on targets without a per-file backend. Admins edit the main conf out-of-band."
+
+["fluent-bit.observe"]
+title     = "Fluent Bit — observe"
+summary   = "Read-only access to Fluent Bit: query the fluent-bit service status and read /etc/fluent-bit."
+risk_note = "Contained: read-only service status plus ACL ro on the shipper's own config tree, no root path. Fluent Bit runs as root on the baseline, so rw config would be a root code-exec path — but observe is ro only, so containment holds."
+
+["fluent-bit.operate"]
+title     = "Fluent Bit — operate"
+summary   = "Operate Fluent Bit: start/stop/restart the fluent-bit service and read /etc/fluent-bit (read-only config)."
+risk_note = "Contained: scoped service control plus read-only config — no rw, no root path. Fluent Bit runs as root on the baseline, so rw config is escalation (the exec/exec_wasi input runs commands as root, and .so plugins load into the root process) and lives in fluent-bit.admin, never in operate."
+
+["fluent-bit.admin"]
+title     = "Fluent Bit — admin"
+summary   = "Administer Fluent Bit: start/stop/restart the fluent-bit service and edit /etc/fluent-bit (rw)."
+risk_note = "Escalation-capable: Fluent Bit runs as root on the baseline (the upstream/td-agent-bit unit sets no User=), and rw on /etc/fluent-bit is a root code-exec/code-load path — the exec/exec_wasi input runs commands as root and external .so plugins load into the root process. That is why this is admin, not a contained operate. A per-OS layer that pins User=<non-root> would make rw config contained instead."
+
+["telegraf.observe"]
+title     = "Telegraf — observe"
+summary   = "Read-only access to Telegraf: query the telegraf service status and read /etc/telegraf."
+risk_note = "Contained: read-only service status plus ACL ro on the agent's own config tree, no root path. No log grant: Telegraf logs to journald by default (no /var/log/telegraf), so journald reads belong to a journald/log-read grant, not this package."
+
+["telegraf.operate"]
+title     = "Telegraf — operate"
+summary   = "Operate Telegraf: start/stop/restart the telegraf service and edit /etc/telegraf (rw)."
+risk_note = "Contained: the Telegraf daemon is pinned non-root by the unit User=telegraf, so rw on /etc/telegraf grants exec/execd input = command-exec as the telegraf user (not root) and output plugins may carry credentials — exec-as-app-user, not escalation. This is the redis precedent (non-root daemon → rw in operate, no admin tier). Caveat: a per-OS layer whose unit omits User= runs the daemon as root and must re-evaluate (rw config + restart becomes a root code-exec path)."
+
+["openvpn.observe"]
+title     = "OpenVPN — observe"
+summary   = "Read-only access to OpenVPN: query the openvpn-server@server instance unit status and read /etc/openvpn."
+risk_note = "Contained: read-only service status plus ACL ro on /etc/openvpn, no mutation, no root path. The instance name is deployment-specific (the unit is a template, one instance per tunnel config) — a role overrides it. NOTE: /etc/openvpn holds the tunnel PRIVATE KEYS and certificates, so even read-only access exposes secrets — credential exposure, not escalation."
+
+["openvpn.operate"]
+title     = "OpenVPN — operate"
+summary   = "Operate OpenVPN: start/stop/restart the openvpn-server@server instance and read /etc/openvpn (read-only config)."
+risk_note = "Contained: scoped service control plus read-only config — no rw, no root path. Starting the tunnel runs only the vetted on-disk config and its existing hooks. rw on /etc/openvpn is escalation (up/down/route-up scripts run as root under script-security 2, and the plugin directive loads a .so into the root process) and lives in openvpn.admin, never in operate. NOTE: /etc/openvpn holds the tunnel private keys, so the bundled ro grant still exposes secrets."
+
+["openvpn.admin"]
+title     = "OpenVPN — admin"
+summary   = "Administer OpenVPN: start/stop/restart the openvpn-server@server instance and edit /etc/openvpn (rw)."
+risk_note = "Escalation-capable: OpenVPN creates the tun device and runs its up/down/route-up/learn-address scripts as root under script-security 2, and the plugin directive loads a .so into the root openvpn process. It can self-drop to user nobody after init, but scripts and the plugin run as root, so rw on /etc/openvpn points the root process at attacker-supplied scripts/code — a root code-exec path. That is why this is admin, not a contained operate. The instance name is deployment-specific; a role overrides it."
+
+["wireguard.observe"]
+title     = "WireGuard — observe"
+summary   = "Read-only access to WireGuard: query the wg-quick@wg0 instance unit status and read /etc/wireguard."
+risk_note = "Contained: read-only service status plus ACL ro on /etc/wireguard, no mutation, no root path. WireGuard has no long-lived daemon — wg-quick@<iface> is a oneshot; the interface name is deployment-specific and a role overrides it. NOTE: /etc/wireguard/<iface>.conf CONTAINS THE INTERFACE PRIVATE KEY, so even read-only access exposes the VPN private key — credential exposure, not escalation."
+
+["wireguard.operate"]
+title     = "WireGuard — operate"
+summary   = "Operate WireGuard: bring the wg-quick@wg0 interface up/down and read /etc/wireguard (read-only config)."
+risk_note = "Contained: scoped service control plus read-only config — no rw, no root path. Bringing the interface up uses only the vetted on-disk config. rw on /etc/wireguard is escalation (PostUp/PostDown/PreUp/PreDown run as root via wg-quick) and lives in wireguard.admin, never in operate. NOTE: /etc/wireguard holds the interface private key, so the bundled ro grant still exposes it."
+
+["wireguard.admin"]
+title     = "WireGuard — admin"
+summary   = "Administer WireGuard: bring the wg-quick@wg0 interface up/down and edit /etc/wireguard (rw)."
+risk_note = "Escalation-capable: wg-quick runs the config's PostUp/PostDown/PreUp/PreDown lines as root when bringing the interface up or down, so rw on /etc/wireguard points wg-quick at attacker-supplied commands that run as root — a root command-exec path. That is why this is admin, not a contained operate. The interface name is deployment-specific; a role overrides it."
+
+["node-red.observe"]
+title     = "Node-RED — observe"
+summary   = "Read-only access to Node-RED: query the nodered service status and read the userDir (default /var/lib/node-red)."
+risk_note = "Contained: read-only service status plus ACL ro on the userDir, no mutation, no root path. The userDir path is deployment-specific: this package defaults to /var/lib/node-red (a hardened/systemd-system convention), but the UPSTREAM installer's userDir is /home/<user>/.node-red (pinned by WorkingDirectory=$HOME) — that path cannot be a literal inline grant, so a per-OS layer / role overrides it. NOTE: flows_cred.json in the userDir holds encrypted node credentials, so ro access exposes that credential material."
+
+["node-red.operate"]
+title     = "Node-RED — operate"
+summary   = "Operate Node-RED: start/stop/restart the nodered service, edit the userDir (default /var/lib/node-red, rw), and access GPIO via the device-bus leaf (gpio group)."
+risk_note = "Contained: the upstream systemd install pins Node-RED non-root via the unit's User= (upstream pins User=<invoking-user>), so rw on the userDir grants command-exec only as that service user (the exec node and a function node's child_process run as the non-root node-red user, not root) — exec-as-app-user, not escalation. This is the redis precedent (non-root daemon → rw in operate, no admin tier). The userDir defaults to /var/lib/node-red here (a hardened/systemd-system convention); the upstream installer's userDir is /home/<user>/.node-red, which a per-OS layer / role overrides. GPIO via device-bus grants the gpio group (digital-I/O on /dev/gpiomem and /dev/gpiochip*), itself a contained leaf. BREADTH: device-bus also grants the i2c and spi groups, which Node-RED does not use — on a board with an i2c/spi EEPROM/TPM/RTC that raw bus access is a hardware-tamper path (still contained, but the gpio justification does not extend to i2c/spi; no narrower gpio-only leaf exists). flows_cred.json holds encrypted credentials. CAVEAT: the common hobby-Pi images run Node-RED as root, or as pi with passwordless sudo — on any such deployment rw flows = root code-exec (the exec node runs as root), so the layer must re-evaluate and move rw config into a node-red.admin escalation tier before shipping operate as contained."
+
+["greengrass.observe"]
+title     = "AWS IoT Greengrass v2 — observe"
+summary   = "Read-only access to Greengrass v2: query the greengrass Core service status and read /greengrass/v2/logs."
+risk_note = "Contained: read-only service status plus ACL ro on the Core log tree, no root path. Config (/greengrass/v2/config) is deliberately NOT bundled even read-only — it holds the device private key and certificate, so a ro grant there is credential exposure; a deployment that needs it adds the ro grant knowingly at the role level."
+
+["greengrass.admin"]
+title     = "AWS IoT Greengrass v2 — admin"
+summary   = "Administer Greengrass v2: start/stop/restart the greengrass Core service and edit /greengrass/v2/config (rw)."
+risk_note = "Escalation-capable, and there is NO contained operate tier: the Greengrass installer requires a sudo-ALL (root-equivalent) sudoers entry, and the Core runs as root and launches components (some as root). rw on /greengrass/v2/config rewrites component recipes/lifecycle scripts the root Core executes — a root code-exec path — and that tree also holds the device private key and certificate. Managing Greengrass is inherently root."
+
+["azure-iot-edge.observe"]
+title     = "Azure IoT Edge — observe"
+summary   = "Read-only access to Azure IoT Edge: query the aziot-edged service status and read /etc/aziot."
+risk_note = "Contained: read-only service status plus ACL ro on the config tree, no root path. NOTE: /etc/aziot holds the device provisioning identity and the keys/certificates the daemon authenticates to the IoT Hub with, so even read-only access exposes that credential material — credential exposure, not escalation."
+
+["azure-iot-edge.admin"]
+title     = "Azure IoT Edge — admin"
+summary   = "Administer Azure IoT Edge: start/stop/restart the aziot-edged security daemon, edit /etc/aziot (rw), and drive the Moby/Docker socket via the docker group."
+risk_note = "Escalation-capable, and there is NO contained operate tier: edgeAgent lifecycles workload modules through the Docker socket and the docker group IS that socket, which is root-equivalent (bind-mount host root, --privileged). aziot-edged is a privileged security daemon, and rw on /etc/aziot repoints the device at attacker-controlled provisioning/certificates and changes which modules (and CreateOptions/Binds) the privileged daemon launches via the root docker socket — a root code-exec path."
+
+["edgex.observe"]
+title     = "EdgeX Foundry — observe"
+summary   = "Read-only access to EdgeX Foundry (snap deployment): query the snap service status (default snap.edgexfoundry.core-data + .device-modbus) and read the snap config tree under /var/snap/edgexfoundry/current."
+risk_note = "Contained: read-only service status plus ACL ro on the snap config tree, no mutation. This targets the EdgeX SNAP — the only deployment that installs systemd units (docker-compose is containers with no units). The snap services run as ROOT (no User= pin), which is why rw config is escalation (edgex.admin), but read-only observe stays contained. The unit set is deployment-specific (EdgeX is many snap.edgexfoundry.<service> units); a role overrides it. Config lives under /var/snap/edgexfoundry/current (the snap-data layout, NOT /etc/edgex); the exact subpath is pinned per deployment."
+
+["edgex.operate"]
+title     = "EdgeX Foundry — operate"
+summary   = "Operate EdgeX Foundry (snap deployment): start/stop/restart the snap services (default snap.edgexfoundry.core-data + .device-modbus), read the snap config tree (read-only), and access serial devices for Modbus RTU (device-serial, dialout group)."
+risk_note = "Contained: lifecycle plus read-only config only. The EdgeX snap services run as ROOT (no User= pin), so rw config is escalation and is kept OUT of operate (it lives in edgex.admin) — this is the rsyslog/salt-minion root-daemon shape, NOT the redis/telegraf non-root-operate shape. Starting/stopping a snap service runs only the vetted on-disk config; the operator cannot introduce new code because config stays read-only. device-serial carries the dialout group for Modbus RTU serial access, itself a contained leaf. The unit set and config path are deployment-specific (see observe)."
+
+["edgex.admin"]
+title     = "EdgeX Foundry — admin"
+summary   = "Administer EdgeX Foundry (snap deployment): start/stop/restart the snap services and edit the snap config tree under /var/snap/edgexfoundry/current (rw)."
+risk_note = "Escalation-capable: the EdgeX snap services run as ROOT (no User= pin). The per-service config drives the device-service endpoints, driver settings, and the bind/registry/secrets-store endpoints the root services load, so rw on the snap config tree reconfigures what the root services connect to and load — a root-level reconfiguration / code-influence path. This is the rsyslog/salt-minion shape (root daemon → rw config is escalation, held in admin)."
+
+["x11vnc.observe"]
+title     = "x11vnc — observe"
+summary   = "Read-only access to x11vnc: query the x11vnc service status."
+risk_note = "Contained: read-only unit status only. No password file is granted (x11vnc's -rfbauth file has no fixed system path — commonly ~/.vnc/passwd or a unit-flag path). NOTE: x11vnc exports a live X session (screen view plus keyboard/mouse input injection) whenever it operates, so it is a high-sensitivity capability — observe itself is only status."
+
+["x11vnc.operate"]
+title     = "x11vnc — operate"
+summary   = "Operate x11vnc: start/stop/restart the x11vnc service and attach to the local graphical session (console-access)."
+risk_note = "High-sensitivity even when contained: x11vnc gives full live-session control — screen contents AND keyboard/mouse input injection (interactive remote control, not view-only). Contained ONLY for the kiosk / guest-user-session case (it injects into a non-root kiosk session, and console-access is a contained leaf). ROOT-:0 CAVEAT: if x11vnc instead attaches to the display-manager/login screen on :0 it runs AS ROOT and injects into the root login session = escalation, NOT contained — such a deployment must NOT ship x11vnc.operate as contained and must use a separate root-tier package. Verify which display x11vnc attaches to before trusting the contained label."
+
+["chromium.observe"]
+title     = "Chromium kiosk — observe"
+summary   = "Read-only access to a Chromium kiosk: query the kiosk session unit status and read the enterprise managed-policy tree /etc/chromium/policies/managed (read-only)."
+risk_note = "Contained: read-only unit status plus ACL ro on the managed-policy tree, no mutation. The no-root-path claim holds for the baseline where the kiosk session runs the browser as a non-root guest user (see the run-as-user caveat in operate/admin); observe is ro-only so it stays contained regardless. Chromium is not a daemon — the privileged surfaces are the root-owned managed policy and the kiosk session unit, not the browser. The kiosk session unit name is DEPLOYMENT-SPECIFIC (lightdm autologin / custom kiosk.service / getty-autologin + .xinitrc); `kiosk` is a default a role overrides. Google Chrome reads policies from the sibling path /etc/opt/chrome/policies/managed — a per-OS/variant delta a layer adds once verified, NOT shipped here."
+
+["chromium.operate"]
+title     = "Chromium kiosk — operate"
+summary   = "Operate a Chromium kiosk: start/stop/restart the kiosk session unit and read the managed-policy tree /etc/chromium/policies/managed (read-only)."
+risk_note = "Contained: scoped session control plus read-only policy — no rw. Restarting the session runs only the vetted on-disk policy; the operator cannot weaken the lockdown because the policy stays read-only. rw on the managed policy is held in chromium.admin (the lockdown-authoring tier) rather than folded into operate — the pcscd/rsyslog split, driven here by the kiosk-escape integrity surface. RUN-AS-USER CAVEAT: contained ASSUMES the `kiosk` session unit runs the browser as a non-root user — a property of the specific unit, not intrinsic (the mosquitto User= / x11vnc :0 deployment-dependence). A per-OS layer / role whose session unit starts Chromium as root (no User=, or `:0`/display-manager attachment) must NOT ship chromium.operate/admin as contained without verifying the unit's run-as-user — a root-run browser reads the policy as root, so rw policy + restart is then a root code path. DEPLOYMENT-SPECIFIC kiosk session unit and the Google Chrome policy-path variant: see chromium.observe."
+
+["chromium.admin"]
+title     = "Chromium kiosk — admin"
+summary   = "Administer a Chromium kiosk lockdown: start/stop/restart the kiosk session unit and edit the enterprise managed-policy tree /etc/chromium/policies/managed (rw)."
+risk_note = "Contained, NOT escalation ON THE BASELINE: the managed-policy files are root-owned, but Chromium READS them as the unprivileged guest browser user, so rw does NOT run code as root — the worst it does is control a guest-level browser. BUT it is a security-critical INTEGRITY surface (sensitive-but-contained, like mosquitto.admin's authn-bypass): rw lets the holder BLANK/RELAX the policy → walk-up KIOSK ESCAPE (file://, arbitrary navigation, DevTools), and FORCE-INSTALL extensions / set NATIVE-MESSAGING hosts → guest-level code-exec inside the browser user (still not root). RUN-AS-USER CAVEAT: the guest-user fact is a property of the specific `kiosk` unit, not intrinsic (the mosquitto User= / x11vnc :0 deployment-dependence). If the `kiosk` session starts Chromium as ROOT (no User=, or `:0`/display-manager attachment), a root-run browser reads the rewritten policy as root → rw policy + restart force-installs code AS ROOT = escalation, NOT contained — such a deployment must NOT ship chromium.admin as contained without verifying the unit's run-as-user. Kept a separate admin tier because authoring the lockdown is a distinct integrity action, not routine operation. DEPLOYMENT-SPECIFIC kiosk session unit and the Google Chrome policy-path variant: see chromium.observe."

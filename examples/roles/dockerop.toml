@@ -5,9 +5,9 @@ name    = "Container operator"
 level   = 6
 
 [payload]
-# Exercises the docker add-on namespace (docker.admin bundle → docker.ps,
-# docker.compose) plus an observability bundle and a parametrized app-config
-# editor with explicit paths.
+# Exercises the docker add-on namespace (docker.admin bundle → docker.operate:
+# docker group + socket + compose, plus restart of the docker daemon) alongside an
+# observability bundle and a parametrized app-config editor with explicit paths.
 permissions = [
     "docker.admin",
     "observability",

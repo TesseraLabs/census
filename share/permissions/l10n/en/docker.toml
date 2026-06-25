@@ -1,14 +1,24 @@
-["docker.ps"]
-title     = "Docker inspect"
-summary   = "List and inspect containers via the docker group."
-risk_note = "The docker group equals root: the daemon socket can mount the host and run privileged containers."
+["docker.observe"]
+title     = "Docker engine — observe"
+summary   = "Read-only access to the Docker engine: query the docker service status and read /etc/docker (daemon.json)."
+risk_note = "Contained: status plus read-only daemon config only. Deliberately NO socket and NO docker group — there is no contained way to list containers (docker ps needs the root-equivalent daemon socket), so observe stops at status + ro config. Anything needing the socket is escalation and lives in docker.operate."
 
-["docker.compose"]
-title     = "Docker Compose"
-summary   = "Run docker-compose stacks via the docker group."
-risk_note = "The docker group equals root: compose can bind-mount host paths and gain full control."
+["docker.operate"]
+title     = "Docker engine — operate"
+summary   = "Operate the Docker engine: start/stop/restart the docker service, run docker-compose, and use the daemon via the docker group."
+risk_note = "Escalation-capable: the docker group grants access to the daemon socket, which is root-equivalent — it can bind-mount the host root filesystem into a container and run --privileged, executing code as root on the host. The docker daemon itself runs as root. There is NO contained operate for docker; the socket is the whole point and the socket is root."
 
 ["docker.admin"]
-title     = "Docker administration (bundle)"
-summary   = "Inspect and Compose plus restarting the Docker daemon."
-risk_note = "The docker group equals root: managing the daemon is full host compromise."
+title     = "Docker engine — admin"
+summary   = "Administer the Docker engine: everything in operate (docker group, socket, compose) plus restart the docker daemon."
+risk_note = "Escalation-capable, like docker.operate: the docker group / daemon socket is root-equivalent (bind-mount host root, --privileged) and the daemon runs as root. Restarting it adds root-level daemon management on top of the already root-equivalent socket access."
+
+["portainer-edge.observe"]
+title     = "Portainer Edge Agent — observe"
+summary   = "Read-only access to the Portainer Edge Agent: query the PortainerEdgeAgent service status."
+risk_note = "Contained: read-only unit status only. No log file is granted (the agent logs to the container runtime / journal, no stable host-side path). The unit name PortainerEdgeAgent is the community systemd-wrapper convention and is deployment-specific (a role overrides it); the agent is usually a bare container with no host unit, in which case this package does not apply."
+
+["portainer-edge.admin"]
+title     = "Portainer Edge Agent — admin"
+summary   = "Administer the Portainer Edge Agent: start/stop/restart the PortainerEdgeAgent service plus docker.operate (the host docker socket the agent drives)."
+risk_note = "Escalation-capable, and there is NO contained operate tier: the Edge Agent manages container stacks through the host docker socket, which is root-equivalent (bind-mount host root, --privileged). portainer-edge.admin IS docker-socket access by design — it composes docker.operate and so overlaps docker.admin; the only thing it adds over docker.operate is lifecycle control of the agent unit itself."

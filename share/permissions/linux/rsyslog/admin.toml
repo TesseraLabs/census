@@ -1,0 +1,32 @@
+id       = "rsyslog.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for rsyslog: service-control on the `rsyslog` unit plus
+# READ-WRITE config on the drop-in tree /etc/rsyslog.d (via the convention
+# component).
+#
+# Managed surface is the drop-in tree /etc/rsyslog.d — the modern,
+# rewrite-proof-grantable surface (rsyslog's default `$IncludeConfig
+# /etc/rsyslog.d/*.conf` on Debian/Astra pulls every drop-in in). The main
+# /etc/rsyslog.conf is deliberately OUT OF SCOPE: it is a single system-global
+# file, and census enforces rewrite-proof config access through DIRECTORY-level
+# ACLs (a per-file ACL is defeated by atomic-replace). A single file in /etc
+# cannot be granted rewrite-proof without granting all of /etc, and a single-file
+# grant is rejected at apply by any target without a per-file ACL backend (stock
+# Astra/Debian). Admins who must edit the main conf do so out-of-band.
+#
+# This is escalation-capable, NOT a contained operate: rsyslogd runs as ROOT, and
+# rw on its drop-in tree is a direct root code-load / code-exec path. A drop-in in
+# /etc/rsyslog.d can carry the `omprog` output module (runs an external program as
+# root) or `module(load="im...")` / legacy `$ModLoad` (loads a shared object into
+# the root rsyslogd). So rw on /etc/rsyslog.d points the root daemon at
+# attacker-supplied code. The file access is contained ACL, but the content it
+# grants write to is a root code-load surface.
+#
+# Values verified against rsyslog on Debian 12 (unit rsyslog, drop-in tree
+# /etc/rsyslog.d, daemon runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "rsyslog" },
+    { id = "app-config-rw", app = "rsyslog.d" },
+]

@@ -66,3 +66,19 @@ uid  = 9011
 [[role_account]]
 role = "webops"
 uid  = 9012
+
+[[role_account]]
+role = "edgeops"
+uid  = 9013
+
+[[role_account]]
+role = "logops"
+uid  = 9014
+
+[[role_account]]
+role = "iotedgeops"
+uid  = 9015
+
+[[role_account]]
+role = "kioskops"
+uid  = 9016

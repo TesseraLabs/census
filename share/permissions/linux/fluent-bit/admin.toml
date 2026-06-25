@@ -1,0 +1,34 @@
+id       = "fluent-bit.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for Fluent Bit: service-control on the `fluent-bit` unit
+# plus the rw config convention component (config tree /etc/fluent-bit follows
+# /etc/{app}).
+#
+# This is escalation-capable, NOT a contained operate: Fluent Bit runs as ROOT on
+# the baseline, and rw on its config is a direct root code-exec / code-load path.
+# The `exec`/`exec_wasi` input plugin runs commands, and external `.so` plugins
+# load into the process — both AS ROOT. So rw on /etc/fluent-bit points the root
+# shipper at attacker-supplied commands and shared objects. The file access is
+# contained ACL, but the content it grants write to is a root code-exec surface.
+#
+# CAVEAT for per-OS layers: this escalation rests on the unit running as root
+# (no User=). The upstream `init/systemd.in` ships no User=, so root is the
+# baseline (confirmed). A per-OS layer whose unit pins User=<non-root> would make
+# rw config contained (exec-as-app-user, the redis/telegraf precedent) rather than
+# escalation — such a layer must re-evaluate and may move rw config into a
+# contained operate.
+#
+# DEPLOYMENT-SPECIFIC unit: legacy upstream packaging ships the daemon as
+# `td-agent-bit.service` rather than `fluent-bit.service`. On targets still using
+# that name the unit differs and lands in a per-OS layer (the openvpn legacy
+# `openvpn@` callout precedent). The escalation label is unaffected — both names
+# run the same root daemon.
+#
+# Values verified against fluent-bit on Debian 12 (unit fluent-bit, config
+# /etc/fluent-bit, daemon runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "fluent-bit" },
+    { id = "app-config-rw", app = "fluent-bit" },
+]

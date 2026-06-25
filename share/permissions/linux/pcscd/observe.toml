@@ -1,0 +1,18 @@
+id       = "pcscd.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for the PC/SC smartcard resource manager (pcscd).
+# pcscd is socket-activated, so service-observe pins BOTH the daemon unit `pcscd`
+# AND its activating socket unit `pcscd.socket`. Binds ro on the driver config
+# tree — pcscd's config lives at /etc/reader.conf.d (NOT /etc/pcscd), bound via
+# the convention component with app = "reader.conf.d" (a single segment under
+# /etc → /etc/reader.conf.d). Contained: read-only status + ro ACL, no root path.
+#
+# Values verified against pcscd on Debian 12 (units pcscd + pcscd.socket, config
+# /etc/reader.conf.d, daemon runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "pcscd" },
+    { id = "service-observe", units = "pcscd.socket" },
+    { id = "app-config-ro", app = "reader.conf.d" },
+]

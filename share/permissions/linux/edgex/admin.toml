@@ -1,0 +1,37 @@
+id       = "edgex.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for EdgeX Foundry: service-control on the representative
+# snap service units plus READ-WRITE config (the inline rw snap config tree).
+#
+# This is escalation-capable, NOT a contained operate: the EdgeX snap services run
+# AS ROOT (there is no User= pin). The per-service config under
+# /var/snap/edgexfoundry/current drives the device-service endpoints and driver
+# settings the ROOT services load — device protocol targets, driver options, the
+# REST/command bind addresses and registry/secrets-store endpoints. rw on that tree
+# reconfigures what the root services connect to and load, a root-level
+# reconfiguration / code-influence path. This is the rsyslog/salt-minion shape (root
+# daemon → rw config is escalation, held in admin), not the redis/telegraf
+# non-root-operate shape.
+#
+# DEPLOYMENT-SPECIFIC unit set + config path: see edgex.observe. The default units
+# are snap.edgexfoundry.core-data + snap.edgexfoundry.device-modbus; a role
+# overrides `units` to its real snap service set. Config is the snap-data tree under
+# /var/snap/edgexfoundry/current; the exact subpath is pinned per deployment.
+#
+# Values verified against the EdgeX snap (snap.edgexfoundry.<service> units,
+# services run as root, snap data under /var/snap/edgexfoundry). The exact config
+# subpath is the snap-data layout and is pinned per deployment — unverified precise
+# subpaths are not shipped as fact.
+includes = [
+    { id = "service-control", units = "snap.edgexfoundry.core-data" },
+    { id = "service-control", units = "snap.edgexfoundry.device-modbus" },
+]
+
+# Inline literal-path grant on the EdgeX snap config tree, read-write — the snap
+# services run as root, so rw here reconfigures what the root services load = a
+# root-level reconfiguration path. Off the /etc/{app} convention, so granted inline.
+[[file]]
+path      = "/var/snap/edgexfoundry/current"
+access    = "rw"
+recursive = true

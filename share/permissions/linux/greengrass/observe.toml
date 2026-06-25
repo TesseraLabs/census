@@ -1,0 +1,33 @@
+id       = "greengrass.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for AWS IoT Greengrass v2. Pins service-observe to the
+# unit `greengrass` (the Core systemd service, started at boot) and grants an
+# inline ro [[file]] on the Core's log tree under /greengrass/v2/logs.
+#
+# Config is DELIBERATELY NOT bundled here, even read-only: /greengrass/v2/config
+# holds the device private key and X.509 certificate the Core authenticates to AWS
+# IoT with. A ro grant on that tree is credential exposure (it leaks the device
+# identity), so observe stops at status + ro logs. A deployment that genuinely
+# needs to read config knowingly adds an inline ro [[file]] on /greengrass/v2/config
+# at the role level, accepting the credential exposure.
+#
+# Install path is off the /etc/{app} convention (Greengrass installs under
+# /greengrass/v2), so the log grant is an inline literal-path [[file]]
+# (postgresql/node-red precedent), not the app-logs-ro component.
+#
+# Contained: read-only status + ro ACL on the log tree, no mutation, no root path.
+#
+# Values verified against the Greengrass v2 default install (unit greengrass,
+# install root /greengrass/v2, Core runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "greengrass" },
+]
+
+# Inline literal-path grant on the Core log tree — Greengrass installs under
+# /greengrass/v2, not /etc/{app}, so it cannot use the app-logs-ro component.
+[[file]]
+path      = "/greengrass/v2/logs"
+access    = "ro"
+recursive = true

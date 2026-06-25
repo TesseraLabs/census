@@ -1,0 +1,80 @@
+id       = "chromium.admin"
+risk     = "contained"
+category = "app"
+# Curated admin package for a Chromium KIOSK deployment: service-control on the
+# `kiosk` session unit plus an inline READ-WRITE [[file]] on the enterprise
+# managed-policy tree /etc/chromium/policies/managed. This is the lockdown-
+# AUTHORING tier — write the managed policy that defines the kiosk's confinement.
+#
+# *** CONTAINED, NOT escalation-capable — and why ***
+# The managed-policy files are ROOT-OWNED, but Chromium READS them as the
+# UNPRIVILEGED guest browser user; editing them does NOT run code as root. So rw
+# here grants control of a GUEST-level browser only: the worst it does is
+# force-install guest-level extensions, set native-messaging hosts, and steer
+# navigation — and any code that runs (an extension, a native-messaging host) runs
+# as the guest browser user, never as root. There is no root code-exec path, so
+# this is `contained`, NOT escalation-capable. This is the deciding fact: the
+# browser runs as the guest user, unlike the rsyslog/openvpn admin tiers where the
+# config-reading process is root.
+#
+# *** RUN-AS-USER CAVEAT — `contained` ASSUMES a non-root kiosk session ***
+# That "browser runs as the guest user" deciding fact is a property of the specific
+# `kiosk` unit, NOT intrinsic to the browser — the same deployment-dependence as
+# mosquitto's User= pin and x11vnc's :0 attachment, which carry the analogous
+# caveat. If a deployment's `kiosk` session starts Chromium AS ROOT (a kiosk.service
+# with no User=, or attachment to the display-manager `:0`), the guest-user
+# reasoning collapses: a root-run browser reads the rewritten managed policy AS
+# ROOT, so rw policy + restart force-installs extensions / native-messaging code
+# AS ROOT = a real root code path, i.e. escalation, NOT contained. A per-OS layer /
+# role whose session unit runs the browser as root MUST NOT ship chromium.admin as
+# contained without verifying the unit's run-as-user — verify which user the
+# `kiosk` unit runs before trusting the label.
+#
+# *** SECURITY NOTE — kiosk-escape / lockdown-integrity (contained, not escalation) ***
+# Although contained, this is a security-CRITICAL INTEGRITY surface, in the same
+# sense that mosquitto.admin is an authn-bypass surface and openvpn is a
+# credential-exposure surface — sensitive but contained. The managed policy IS the
+# kiosk confinement. rw on it lets the holder:
+#   - BLANK or RELAX the policy → a walk-up attacker escapes the kiosk: file://
+#     access to the local filesystem, arbitrary navigation off the kiosk URL, and
+#     DevTools / view-source all become reachable;
+#   - FORCE-INSTALL extensions and set NATIVE-MESSAGING hosts → guest-level
+#     code-exec inside the browser user (NOT root, but arbitrary code as the kiosk
+#     guest user, with that user's access to any local files/devices it can reach).
+# Treat chromium.admin as a sensitive grant even though its risk label is
+# contained: it controls whether the kiosk stays locked down at all.
+#
+# Kept as a SEPARATE admin tier (not folded into operate, the redis precedent):
+# authoring the lockdown is a distinct integrity action, not routine operation.
+# Routine operators (chromium.operate) restart the session and read the policy;
+# only chromium.admin may rewrite the confinement. This is the pcscd/rsyslog split
+# shape, with the split driven by the kiosk-escape integrity surface rather than
+# by daemon privilege.
+#
+# The managed-policy tree is a deep path off the flat /etc/{app} convention
+# (/etc/chromium/policies/managed, not /etc/chromium), so it is an inline literal
+# [[file]], not the app-config-rw convention component — the postgresql precedent.
+#
+# *** DEPLOYMENT-SPECIFIC unit `kiosk` *** — see chromium.observe. The kiosk
+# session unit name has no canonical value; `kiosk` is a default a role overrides.
+#
+# *** CHROME PATH VARIANT (NOT shipped) *** — Google Chrome reads
+# /etc/opt/chrome/policies/managed; that sibling path is a per-OS/variant delta a
+# layer/role adds once verified, not granted here. See chromium.observe.
+#
+# Values verified against Chromium managed policies on Debian 12 (policy tree
+# /etc/chromium/policies/managed, browser runs as an unprivileged guest user).
+# Per-OS unit/path deltas land in linux-<distro> layers once verified — unverified
+# values are not shipped.
+includes = [
+    { id = "service-control", units = "kiosk" },
+]
+
+# Managed-policy tree granted inline, read-write — the lockdown-authoring grant. A
+# deep path off the flat /etc/{app} convention, so it is a literal inline [[file]]
+# (the postgresql precedent). rw is contained (the browser reads it as the guest
+# user, no root code-exec) but is the kiosk-escape integrity surface noted above.
+[[file]]
+path      = "/etc/chromium/policies/managed"
+access    = "rw"
+recursive = true
