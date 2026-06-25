@@ -47,31 +47,58 @@ use crate::catalog::{Access, ResolvedFileGrant, Shape};
 /// revoke — and only the entry prefix differs (`u:<account>` vs `g:<group>`). This
 /// mirror is the whole point: a group grant is a user grant with a different first
 /// letter, nothing else changes.
+///
+/// A principal's qualifier is either a *name* (`User`/`Group`) or a *numeric id*
+/// (`Uid`/`Gid`). Materialization always uses the name (readable, and the account
+/// exists at that point). Revocation of a principal that has already been removed
+/// from the system databases must use the numeric id: `setfacl` resolves a named
+/// qualifier through `getpwnam`/`getgrnam`, so once the account or group is gone
+/// the name no longer resolves and `setfacl -x u:<name>` is rejected as an invalid
+/// argument. The kernel stores every ACL entry by numeric id regardless, so
+/// `setfacl -x u:<uid>` precisely targets the orphaned entry without needing the
+/// name to resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
-    /// A role-account; materialized as `u:<account>`.
+    /// A role-account by name; materialized as `u:<account>`.
     User(String),
-    /// A Unix group; materialized as `g:<group>`. Every member (including
+    /// A Unix group by name; materialized as `g:<group>`. Every member (including
     /// effectively-nested LDAP members) inherits the access.
     Group(String),
+    /// A role-account by numeric UID; rendered as `u:<uid>`. Used to revoke the ACL
+    /// entry of an account that has already been deleted, when the name no longer
+    /// resolves.
+    Uid(u32),
+    /// A Unix group by numeric GID; rendered as `g:<gid>`. Used to revoke the ACL
+    /// entry of a group that has already been removed, when the name no longer
+    /// resolves.
+    Gid(u32),
 }
 
 impl Principal {
-    /// The ACL entry prefix: `"u"` for a user, `"g"` for a group. The single point
-    /// where the `u:`/`g:` mirror diverges.
+    /// The ACL entry prefix: `"u"` for a user (named or numeric), `"g"` for a group.
+    /// The single point where the `u:`/`g:` mirror diverges.
     pub fn acl_prefix(&self) -> &'static str {
         match self {
-            Principal::User(_) => "u",
-            Principal::Group(_) => "g",
+            Principal::User(_) | Principal::Uid(_) => "u",
+            Principal::Group(_) | Principal::Gid(_) => "g",
         }
     }
 
-    /// The principal's name (the account or group identifier) placed after the
-    /// prefix in the ACL entry.
-    pub fn name(&self) -> &str {
+    /// The qualifier placed after the prefix in the ACL entry: the name for a named
+    /// principal, the decimal id for a numeric one. This is what `setfacl` parses, so
+    /// a numeric qualifier lets a revoke succeed after the principal's name has been
+    /// removed from the passwd/group databases.
+    pub fn qualifier(&self) -> String {
         match self {
-            Principal::User(name) | Principal::Group(name) => name,
+            Principal::User(name) | Principal::Group(name) => name.clone(),
+            Principal::Uid(id) | Principal::Gid(id) => id.to_string(),
         }
+    }
+
+    /// A human-facing label for logging: the name for a named principal, the decimal
+    /// id (uid/gid) for a numeric one.
+    pub fn name(&self) -> String {
+        self.qualifier()
     }
 }
 
@@ -222,7 +249,12 @@ fn acl_perm(access: Access) -> String {
 /// files created later inherit the access.
 pub fn setfacl_args(principal: &Principal, grant: &ResolvedFileGrant) -> Vec<Vec<String>> {
     let perm = acl_perm(grant.access);
-    let entry = format!("{}:{}:{}", principal.acl_prefix(), principal.name(), perm);
+    let entry = format!(
+        "{}:{}:{}",
+        principal.acl_prefix(),
+        principal.qualifier(),
+        perm
+    );
     vec![
         vec![
             "-R".to_owned(),
@@ -244,9 +276,14 @@ pub fn setfacl_args(principal: &Principal, grant: &ResolvedFileGrant) -> Vec<Vec
 
 /// Build the two `setfacl` argv vectors that revoke `principal`'s entry for one
 /// directory grant: the access entry (`-x`) and the default entry (`-d -x`). Only
-/// `<u|g>:<principal>` is removed; no other entry, owner, or mode is touched. Pure.
+/// `<u|g>:<qualifier>` is removed; no other entry, owner, or mode is touched. Pure.
+///
+/// The qualifier is the principal's name for a live account/group and its numeric
+/// id once the account/group has been deleted — a removed principal's name no
+/// longer resolves, so revoking by name would be rejected; the numeric id always
+/// matches the entry the kernel stored.
 pub fn revoke_args(principal: &Principal, grant: &ResolvedFileGrant) -> Vec<Vec<String>> {
-    let entry = format!("{}:{}", principal.acl_prefix(), principal.name());
+    let entry = format!("{}:{}", principal.acl_prefix(), principal.qualifier());
     vec![
         vec![
             "-R".to_owned(),
@@ -852,6 +889,134 @@ mod tests {
         for a in args.iter().flatten() {
             assert!(!a.contains("g:") && a != "u:other");
         }
+    }
+
+    #[test]
+    fn revoke_args_numeric_uid_targets_orphaned_entry() {
+        // After `userdel`, the account name no longer resolves through getpwnam, so
+        // `setfacl -x u:<name>` is rejected as an invalid argument and the teardown
+        // aborts. Revoking by the recorded numeric UID removes the exact entry the
+        // kernel stored, which needs no passwd lookup. The argv must read `u:9010`,
+        // not `u:<name>`, on both the access and default passes.
+        let g = grant("/etc/salt", Access::RW, true, Shape::Dir);
+        let args = revoke_args(&Principal::Uid(9010), &g);
+        assert_eq!(args.len(), 2);
+        assert_eq!(
+            args[0],
+            vec!["-R", "--physical", "-x", "u:9010", "/etc/salt"]
+        );
+        assert_eq!(
+            args[1],
+            vec!["-d", "-R", "--physical", "-x", "u:9010", "/etc/salt"]
+        );
+    }
+
+    #[test]
+    fn revoke_args_numeric_gid_uses_g_prefix() {
+        // The group mirror of the numeric revoke: a removed group is revoked by GID.
+        let g = grant("/srv/shared", Access::RW, true, Shape::Dir);
+        let args = revoke_args(&Principal::Gid(4242), &g);
+        assert_eq!(
+            args[0],
+            vec!["-R", "--physical", "-x", "g:4242", "/srv/shared"]
+        );
+        assert_eq!(
+            args[1],
+            vec!["-d", "-R", "--physical", "-x", "g:4242", "/srv/shared"]
+        );
+    }
+
+    #[test]
+    fn principal_numeric_qualifier_and_prefix() {
+        let uid = Principal::Uid(9010);
+        let gid = Principal::Gid(4242);
+        assert_eq!(uid.acl_prefix(), "u");
+        assert_eq!(uid.qualifier(), "9010");
+        assert_eq!(gid.acl_prefix(), "g");
+        assert_eq!(gid.qualifier(), "4242");
+    }
+
+    #[test]
+    fn acl_revoke_by_uid_emits_numeric_argv_and_succeeds() {
+        // End-to-end through the backend control flow: a revoke of a `Uid` principal
+        // emits the numeric argv on both passes and (with a runner that returns exit
+        // 0) reports success.
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant("/etc/salt", Access::RW, true, Shape::Dir);
+        b.revoke(&Principal::Uid(9010), &g).unwrap();
+        assert_eq!(b.runner.calls.len(), 2);
+        assert_eq!(
+            b.runner.calls[0].1,
+            vec!["-R", "--physical", "-x", "u:9010", "/etc/salt"]
+        );
+        assert_eq!(
+            b.runner.calls[1].1,
+            vec!["-d", "-R", "--physical", "-x", "u:9010", "/etc/salt"]
+        );
+    }
+
+    #[test]
+    fn acl_revoke_surfaces_setfacl_exit_two_as_setfacl_error() {
+        // Pins how the backend interprets a non-zero setfacl exit on revoke: the
+        // exact failure mode the live teardown hit — `setfacl` exiting 2 with an
+        // "invalid argument" stderr because the (deleted) name no longer resolved.
+        // A non-empty stderr alone must NOT be treated as failure; only a non-zero
+        // status is, and it must surface as a `Setfacl` error naming the grant path,
+        // carrying the underlying NonZero (binary/status/stderr) verbatim.
+        struct ExitTwoRunner;
+        impl CommandRunner for ExitTwoRunner {
+            fn run(&mut self, binary: &str, _args: &[String]) -> Result<Vec<u8>, CommandError> {
+                Err(CommandError::NonZero {
+                    binary: binary.to_owned(),
+                    status: "exit status: 2".to_owned(),
+                    stderr: "setfacl: Option -x: Invalid argument near character 3".to_owned(),
+                })
+            }
+        }
+        let mut b = AclBackend::new(ExitTwoRunner, "setfacl", "getfacl", std::env::temp_dir());
+        let g = grant("/etc/salt", Access::RW, true, Shape::Dir);
+        let err = b
+            .revoke(&Principal::Uid(9010), &g)
+            .expect_err("a non-zero setfacl exit must surface as an error");
+        match err {
+            FileAccessError::Setfacl { path, source } => {
+                assert_eq!(path, "/etc/salt");
+                assert!(
+                    matches!(source, CommandError::NonZero { ref status, .. } if status == "exit status: 2"),
+                    "must carry the underlying non-zero exit: {source:?}"
+                );
+            }
+            other => panic!("expected Setfacl error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acl_revoke_treats_exit_zero_with_stderr_as_success() {
+        // The dual: setfacl can emit advisory stderr while still exiting 0 (e.g. a
+        // recursive pass over a tree where some files never carried the entry). The
+        // runner keys success on the exit STATUS, not on stderr being empty, so a
+        // zero exit with noisy stderr is a success and the revoke completes.
+        struct ZeroWithStderrRunner {
+            calls: usize,
+        }
+        impl CommandRunner for ZeroWithStderrRunner {
+            fn run(&mut self, _binary: &str, _args: &[String]) -> Result<Vec<u8>, CommandError> {
+                // The production ProcessRunner returns Ok(stdout) whenever the exit
+                // status is success regardless of stderr; model that here.
+                self.calls += 1;
+                Ok(Vec::new())
+            }
+        }
+        let mut b = AclBackend::new(
+            ZeroWithStderrRunner { calls: 0 },
+            "setfacl",
+            "getfacl",
+            std::env::temp_dir(),
+        );
+        let g = grant("/etc/salt", Access::RW, true, Shape::Dir);
+        b.revoke(&Principal::Uid(9010), &g)
+            .expect("a zero exit must be a success even with stderr output");
+        assert_eq!(b.runner.calls, 2, "both revoke passes ran");
     }
 
     #[test]
