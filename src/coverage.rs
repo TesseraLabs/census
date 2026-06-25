@@ -1982,7 +1982,10 @@ mod tests {
 
     fn includes_def(id: &str, includes: &[&str]) -> PermissionDef {
         PermissionDef {
-            includes: includes.iter().map(|s| s.to_string()).collect(),
+            includes: includes
+                .iter()
+                .map(|s| crate::catalog::Include::bare(*s))
+                .collect(),
             ..def(id)
         }
     }
@@ -2107,6 +2110,40 @@ mod tests {
         )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         assert!(find(&r, "/sbin/shutdown").covered);
+    }
+
+    #[test]
+    fn literal_bound_bundle_member_sudo_is_covered() {
+        // Coverage-regression guard: a bundle whose include LITERALLY binds a
+        // parametrized leaf (e.g. `{ id = "svc-restart", units = "nginx" }`, no
+        // role `{param}`) must contribute the rendered member command to the
+        // covered set. coverage() resolves every id via `resolve()` WITHOUT params;
+        // before eager literal-bound expansion the member's sudo was deferred and
+        // silently missing, so the bound binary read as uncovered. With the fix the
+        // concrete `/usr/sbin/svcctl` is on the catalog surface.
+        let leaf = PermissionDef {
+            sudo: ListOverride::Replace(vec!["/usr/sbin/svcctl restart {units}".to_owned()]),
+            params: token_params_for(&["/usr/sbin/svcctl restart {units}"]),
+            ..def("svc-restart")
+        };
+        let bundle = PermissionDef {
+            includes: vec![crate::catalog::Include {
+                id: "svc-restart".to_owned(),
+                bindings: std::iter::once(("units".to_owned(), "nginx".to_owned())).collect(),
+            }],
+            ..def("nginx.operate")
+        };
+        let cat = FakeCatalog::new().with("linux", leaf).with("linux", bundle);
+        let surface = vec![obj(
+            SurfaceClass::SudoBin,
+            "/usr/sbin/svcctl",
+            Provenance::Vendor,
+        )];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert!(
+            find(&r, "/usr/sbin/svcctl").covered,
+            "a literal-bound bundle member's sudo binary must be covered via resolve() without params"
+        );
     }
 
     #[test]

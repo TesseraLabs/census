@@ -1,0 +1,21 @@
+id       = "cups.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for CUPS: service-control on the `cups` unit, the rw
+# config convention component (config tree /etc/cups follows /etc/{app}), and
+# membership in the `lpadmin` group for print administration.
+#
+# This is escalation-capable, NOT a contained operate: cupsd runs as root, and
+# rw on /etc/cups plus lpadmin lets one install a printer backend / filter / PPD
+# that cupsd executes as root — a historical root RCE class. The file access is
+# contained ACL, but the content it grants write to (plus the admin group) is a
+# root-equivalent control surface.
+#
+# Values verified against cups on Debian 12 (unit cups, config /etc/cups, print
+# admin group lpadmin). Per-OS unit/path deltas land in linux-<distro> layers
+# once verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "cups" },
+    { id = "app-config-rw", app = "cups" },
+]
+groups = ["lpadmin"]

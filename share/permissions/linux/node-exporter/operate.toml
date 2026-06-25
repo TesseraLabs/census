@@ -1,0 +1,27 @@
+id       = "node-exporter.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for the Prometheus node exporter — a trivial
+# single-service metrics daemon. Literal-bound: service-control pinned to the
+# Debian unit name `prometheus-node-exporter` (the upstream binary is
+# node-exporter, but the Debian package ships the unit and config under the
+# prometheus- prefix). A deployment that installs node-exporter under a custom
+# unit name overrides this binding in its own catalog layer.
+#
+# Config is the single Debian env file /etc/default/prometheus-node-exporter
+# (not a directory) — a single-file grant, not recursive. This grant stays INLINE
+# rather than using the app-config-rw convention component: the path is
+# /etc/default/<file>, NOT /etc/{app}, so it is off-convention and the component
+# would resolve the wrong path. node-exporter logs to journald, not a /var/log
+# tree, so there is no log file grant here; journald read access is granted by
+# the separate `log-read` permission.
+#
+# Values verified against prometheus-node-exporter on Debian 12. Per-OS deltas
+# are added as linux-<distro> layer overrides only once verified.
+includes = [
+    { id = "service-control", units = "prometheus-node-exporter" },
+]
+
+[[file]]
+path      = "/etc/default/prometheus-node-exporter"
+access    = "rw"

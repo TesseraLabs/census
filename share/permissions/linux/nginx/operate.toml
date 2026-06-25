@@ -1,0 +1,22 @@
+id       = "nginx.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for nginx: read-only observe (service-observe on the
+# `nginx` unit) plus service-control on the same unit and READ-ONLY config + logs
+# (the ro convention components). Lifecycle + read only — NO rw config — so this
+# stays contained.
+#
+# rw on /etc/nginx is escalation-capable and lives in nginx.admin: the nginx
+# master process runs as root and the `load_module` directive loads a shared
+# object into that root master, so rw on the config tree is a root code-load
+# path, not a contained operate.
+#
+# Values verified against nginx on Debian 12 (unit nginx, config /etc/nginx, logs
+# /var/log/nginx). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "nginx" },
+    { id = "service-control", units = "nginx" },
+    { id = "app-config-ro", app = "nginx" },
+    { id = "app-logs-ro", app = "nginx" },
+]

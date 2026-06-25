@@ -1,0 +1,20 @@
+id       = "usbguard.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for USBGuard: read-only observe (service-observe on the
+# `usbguard` unit) plus service-control on the same unit and the rw config
+# convention component (config tree /etc/usbguard follows /etc/{app}).
+#
+# Contained: editing USB-device rules in /etc/usbguard gates which peripherals
+# are admitted, which is security-relevant, but it is not a root path — the rule
+# set controls device authorization, not system privilege. Scoped service control
+# + ACL file access, no root path.
+#
+# Values verified against usbguard on Debian 12 (unit usbguard, config
+# /etc/usbguard). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "usbguard" },
+    { id = "service-control", units = "usbguard" },
+    { id = "app-config-rw", app = "usbguard" },
+]

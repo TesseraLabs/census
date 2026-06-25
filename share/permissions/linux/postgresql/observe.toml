@@ -1,0 +1,30 @@
+id       = "postgresql.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for PostgreSQL. Pins service-observe to the unit
+# `postgresql` — the Debian wrapper that controls all clusters. (Per-cluster
+# instance units are `postgresql@<ver>-<cluster>`, e.g. postgresql@15-main; a
+# deployment needing per-cluster scope binds those via a token param instead.)
+#
+# Config and logs are granted INLINE, not via the app-config/app-logs components:
+# the Debian config tree is VERSIONED (/etc/postgresql/<ver>/<cluster>/...), so
+# the path is /etc/postgresql/<ver>/..., off the flat /etc/{app} convention. The
+# ro grant on /etc/postgresql (recursive) covers every cluster's config; logs are
+# ro on /var/log/postgresql (recursive). Contained: read-only status + ro ACL.
+#
+# Values verified against postgresql on Debian 12 (wrapper unit postgresql,
+# config /etc/postgresql, logs /var/log/postgresql). Per-OS unit/path deltas land
+# in linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "postgresql" },
+]
+
+[[file]]
+path      = "/etc/postgresql"
+access    = "ro"
+recursive = true
+
+[[file]]
+path      = "/var/log/postgresql"
+access    = "ro"
+recursive = true

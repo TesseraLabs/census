@@ -1,0 +1,21 @@
+id       = "zabbix-agent.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for the Zabbix agent — a single-service monitoring
+# daemon. Literal-bound bundle: it pins service-observe to the fixed unit name
+# `zabbix-agent`, and binds the reusable convention file components for the
+# agent's own config and log trees (both follow the /etc/{app} // /var/log/{app}
+# convention, so app="zabbix" resolves to /etc/zabbix and /var/log/zabbix).
+# Contained: no editor-as-root, file access is ACL, service access is read-only
+# status/query.
+#
+# Values verified against zabbix-agent on Debian 12 (config tree /etc/zabbix,
+# logs /var/log/zabbix, unit zabbix-agent). Per-OS deltas (unit-name or
+# config-path divergence on other distros) are added as linux-<distro> layer
+# overrides only once verified — unverified values are not shipped, because a
+# wrong curated grant materializes as root.
+includes = [
+    { id = "service-observe", units = "zabbix-agent" },
+    { id = "app-config-ro", app = "zabbix" },
+    { id = "app-logs-ro", app = "zabbix" },
+]

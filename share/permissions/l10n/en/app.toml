@@ -2,3 +2,188 @@
 title     = "Application config editing"
 summary   = "Edit specific application config files via a wrapped editor (parameter: path)."
 risk_note = "Escalation-capable: the editor runs as root and can spawn a shell, so root is reachable regardless of which file is edited; allow_prefix limits the target file, not the escape."
+
+[app-scope]
+title     = "Per-app access by app name"
+summary   = "Per-app access by app name: manage the app's service (start/stop/restart), edit /etc/<app>, read /var/log/<app> (parameter: app)."
+risk_note = "Contained: file access is ACL on the app's own /etc and /var/log trees, and service control is the scoped service-control permission (no editor-as-root). The app name is a single path segment / unit name — plain unit names only, not instance units (name@inst)."
+
+[app-config-ro]
+title     = "App config — read-only"
+summary   = "Read-only ACL on an application's own config tree /etc/<app> (parameter: app)."
+risk_note = "Contained for the intended use — an application's own /etc/<app> config tree, not a root path. The segment param bounds <app> to one subdir under /etc (no /, no ..), but it can still name a sensitive directory; the safety of the concrete bound value is a curation/review concern, exactly as for an inline grant. Do not point it at a system dir."
+
+[app-config-rw]
+title     = "App config — read-write"
+summary   = "Read-write ACL on an application's own config tree /etc/<app> (parameter: app)."
+risk_note = "Contained for the intended use — an application's own /etc/<app> config tree, not a root path. The segment param bounds <app> to one subdir under /etc (no /, no ..), but it can still name a sensitive directory; the safety of the concrete bound value is a curation/review concern, exactly as for an inline grant. Do not point it at a system dir."
+
+[app-logs-ro]
+title     = "App logs — read-only"
+summary   = "Read-only ACL on an application's own log tree /var/log/<app> (parameter: app)."
+risk_note = "Contained for the intended use — an application's own /var/log/<app> log tree, not a root path. The segment param bounds <app> to one subdir under /var/log (no /, no ..), but it can still name a sensitive directory; the safety of the concrete bound value is a curation/review concern, exactly as for an inline grant. Do not point it at a system dir."
+
+["zabbix-agent.observe"]
+title     = "Zabbix agent — observe"
+summary   = "Read-only access to the Zabbix agent: query its service status and read /etc/zabbix and /var/log/zabbix."
+risk_note = "Contained: read-only service status (no start/stop) plus ACL ro on the agent's own config and log trees, no root path."
+
+["zabbix-agent.operate"]
+title     = "Zabbix agent — operate"
+summary   = "Operate the Zabbix agent: start/stop/restart its service, edit /etc/zabbix (rw), read /var/log/zabbix (bundles observe)."
+risk_note = "Contained: scoped service control on the zabbix-agent unit plus ACL file access (rw config, ro logs), no root path."
+
+["node-exporter.operate"]
+title     = "Node exporter — operate"
+summary   = "Operate the Prometheus node exporter: start/stop/restart prometheus-node-exporter and edit /etc/default/prometheus-node-exporter."
+risk_note = "Contained: scoped service control on the prometheus-node-exporter unit plus ACL rw on its single config file, no root path."
+
+["nut.operate"]
+title     = "NUT — operate"
+summary   = "Operate NUT (Network UPS Tools): start/stop/restart both nut-server and nut-monitor, read /etc/nut (read-only config)."
+risk_note = "Contained: scoped service control on the two NUT units plus read-only config, lifecycle only — no rw, no root path."
+
+["nut.admin"]
+title     = "NUT — admin"
+summary   = "Administer NUT: start/stop/restart both nut-server and nut-monitor, edit /etc/nut (rw)."
+risk_note = "Escalation-capable: upsmon keeps a privileged parent running as root to execute SHUTDOWNCMD/NOTIFYCMD, so rw on /etc/nut lets one set an arbitrary SHUTDOWNCMD in upsmon.conf and trigger it (restart/FSD nut-monitor) → root command exec. That is why this is admin, not a contained operate."
+
+["filebeat.observe"]
+title     = "Filebeat — observe"
+summary   = "Read-only access to Filebeat: query its service status and read /etc/filebeat."
+risk_note = "Contained: read-only service status plus ACL ro on the shipper's own config tree, no root path. Note: filebeat runs as root (it reads all logs); the config has no code-exec, but a root-running shipper whose config can be rewritten could be repointed to exfiltrate arbitrary root-readable files — contained, but security-relevant."
+
+["filebeat.operate"]
+title     = "Filebeat — operate"
+summary   = "Operate Filebeat: start/stop/restart its service and edit /etc/filebeat (rw)."
+risk_note = "Contained: scoped service control on the filebeat unit plus ACL rw on its config tree, no root path. Note: filebeat runs as root (it reads all logs); the config has no code-exec, but rw config on a root-running shipper can repoint it to exfiltrate arbitrary root-readable files — contained, but security-relevant."
+
+["ssh.observe"]
+title     = "OpenSSH server — observe"
+summary   = "Read-only access to the OpenSSH server: query the ssh service status and read /etc/ssh."
+risk_note = "Contained: read-only service status plus ACL ro on /etc/ssh, no mutation, no root path."
+
+["ssh.admin"]
+title     = "OpenSSH server — admin"
+summary   = "Administer the OpenSSH server: start/stop/restart the ssh service and edit /etc/ssh (rw)."
+risk_note = "Escalation-capable: rw on /etc/ssh lets one edit sshd_config (PermitRootLogin, AuthorizedKeysFile, ForceCommand, Match blocks), a direct path to root login. That is why this is admin/escalation-capable, not a contained operate — the file access is contained ACL, but the content it writes is a root-equivalent control surface."
+
+["usbguard.observe"]
+title     = "USBGuard — observe"
+summary   = "Read-only access to USBGuard: query its service status and read /etc/usbguard."
+risk_note = "Contained: read-only service status plus ACL ro on /etc/usbguard, no root path."
+
+["usbguard.operate"]
+title     = "USBGuard — operate"
+summary   = "Operate USBGuard: start/stop/restart its service and edit /etc/usbguard (rw)."
+risk_note = "Contained: editing USB-device rules in /etc/usbguard gates which peripherals are admitted — security-relevant, but not a root path. Scoped service control plus ACL file access, no root path."
+
+["cups.observe"]
+title     = "CUPS — observe"
+summary   = "Read-only access to CUPS: query the print service status and read /etc/cups."
+risk_note = "Contained: read-only service status plus ACL ro on /etc/cups, no root path."
+
+["cups.operate"]
+title     = "CUPS — operate"
+summary   = "Operate CUPS: start/stop/restart the print service and read /etc/cups (read-only config)."
+risk_note = "Contained: scoped service control plus read-only config — no rw, no lpadmin group, no root path."
+
+["cups.admin"]
+title     = "CUPS — admin"
+summary   = "Administer CUPS: start/stop/restart the print service, edit /etc/cups (rw), and manage printers via the lpadmin group."
+risk_note = "Escalation-capable: cupsd runs as root, and rw on /etc/cups plus lpadmin lets one install a printer backend/filter/PPD that cupsd then runs as root — a historical root RCE class. That is why this is admin, not a contained operate."
+
+["chrony.observe"]
+title     = "chrony — observe"
+summary   = "Read-only access to chrony: query the time-sync service status and read /etc/chrony."
+risk_note = "Contained: read-only service status plus ACL ro on /etc/chrony, no root path."
+
+["chrony.operate"]
+title     = "chrony — operate"
+summary   = "Operate chrony: start/stop/restart the time-sync service and edit /etc/chrony (rw)."
+risk_note = "Contained: changing time sync can shift the clock, which affects certificate validity windows — security-relevant, not root. Scoped service control plus ACL file access, no root path."
+
+["smartmontools.observe"]
+title     = "smartmontools — observe"
+summary   = "Read-only access to smartmontools: query the smartd service status and read /etc/smartd.conf."
+risk_note = "Contained: read-only service status plus ACL ro on the single config file /etc/smartd.conf, no root path."
+
+["smartmontools.operate"]
+title     = "smartmontools — operate"
+summary   = "Operate smartmontools: start/stop/restart the smartd service and read /etc/smartd.conf (read-only config)."
+risk_note = "Contained: scoped service control on the smartd unit plus read-only config — no rw, no root path."
+
+["smartmontools.admin"]
+title     = "smartmontools — admin"
+summary   = "Administer smartmontools: start/stop/restart the smartd service and edit /etc/smartd.conf (rw)."
+risk_note = "Escalation-capable: smartd runs as root, and the -M exec directive in /etc/smartd.conf runs an arbitrary script as root on SMART events — rw on this file is a root code-exec path. That is why this is admin, not a contained operate."
+
+["nginx.observe"]
+title     = "nginx — observe"
+summary   = "Read-only access to nginx: query the service status and read /etc/nginx and /var/log/nginx."
+risk_note = "Contained: read-only service status plus ACL ro on config and logs, no root path."
+
+["nginx.operate"]
+title     = "nginx — operate"
+summary   = "Operate nginx: start/stop/restart the service and read /etc/nginx and /var/log/nginx (read-only config + logs)."
+risk_note = "Contained: scoped service control plus read-only config and logs — no rw, no root path."
+
+["nginx.admin"]
+title     = "nginx — admin"
+summary   = "Administer nginx: start/stop/restart the service and edit /etc/nginx (rw)."
+risk_note = "Escalation-capable: the nginx master process runs as root, and the load_module directive in /etc/nginx loads a shared object into that root master — a direct root code-load path. That is why this is admin, not a contained operate."
+
+["apache2.observe"]
+title     = "Apache HTTP server — observe"
+summary   = "Read-only access to Apache: query the apache2 service status and read /etc/apache2 and /var/log/apache2."
+risk_note = "Contained: read-only service status plus ACL ro on config and logs, no root path."
+
+["apache2.operate"]
+title     = "Apache HTTP server — operate"
+summary   = "Operate Apache: start/stop/restart the apache2 service and read /etc/apache2 and /var/log/apache2 (read-only config + logs)."
+risk_note = "Contained: scoped service control plus read-only config and logs — no rw, no root path."
+
+["apache2.admin"]
+title     = "Apache HTTP server — admin"
+summary   = "Administer Apache: start/stop/restart the apache2 service and edit /etc/apache2 (rw)."
+risk_note = "Escalation-capable: the apache master process runs as root, and LoadModule/Include directives in /etc/apache2 load code into that root master — a direct root code-load path. That is why this is admin, not a contained operate."
+
+["postgresql.observe"]
+title     = "PostgreSQL — observe"
+summary   = "Read-only access to PostgreSQL: query the postgresql service status and read /etc/postgresql and /var/log/postgresql."
+risk_note = "Contained: read-only service status plus ACL ro on the config and log trees, no root path."
+
+["postgresql.operate"]
+title     = "PostgreSQL — operate"
+summary   = "Operate PostgreSQL: start/stop/restart the postgresql service and read /etc/postgresql and /var/log/postgresql (read-only config + logs)."
+risk_note = "Contained: scoped service control plus read-only config and logs — no rw, no root path."
+
+["postgresql.admin"]
+title     = "PostgreSQL — admin"
+summary   = "Administer PostgreSQL: start/stop/restart the postgresql service and edit /etc/postgresql (rw)."
+risk_note = "Escalation-capable: rw on the postgres config tree lets one set pg_hba.conf to trust (any local connection becomes a DB superuser) and shared_preload_libraries (load code run inside the postgres process) — data-root plus code-exec as the postgres user. That is why this is admin, not a contained operate."
+
+["redis.observe"]
+title     = "Redis — observe"
+summary   = "Read-only access to Redis: query the redis-server service status and read /etc/redis."
+risk_note = "Contained: read-only service status plus ACL ro on /etc/redis, no root path."
+
+["redis.operate"]
+title     = "Redis — operate"
+summary   = "Operate Redis: start/stop/restart the redis-server service and edit /etc/redis (rw)."
+risk_note = "Contained: the Redis daemon runs as the unprivileged redis user, so rw on /etc/redis and runtime MODULE LOAD execute code as the redis user, not root — exec-as-app-user, not escalation. No admin tier is needed."
+
+["haproxy.observe"]
+title     = "HAProxy — observe"
+summary   = "Read-only access to HAProxy: query the service status and read /etc/haproxy."
+risk_note = "Contained: read-only service status plus ACL ro on /etc/haproxy, no root path."
+
+["haproxy.operate"]
+title     = "HAProxy — operate"
+summary   = "Operate HAProxy: start/stop/restart the service and read /etc/haproxy (read-only config)."
+risk_note = "Contained: scoped service control plus read-only config — no rw, no root path."
+
+["haproxy.admin"]
+title     = "HAProxy — admin"
+summary   = "Administer HAProxy: start/stop/restart the service and edit /etc/haproxy (rw)."
+risk_note = "Escalation-capable: the haproxy master process starts as root, and lua-load/external-check directives in /etc/haproxy run programs from that root-started process — a root program-exec path. That is why this is admin, not a contained operate."

@@ -1,0 +1,29 @@
+id       = "nut.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for NUT (Network UPS Tools) — a multi-service app: the
+# UPS driver/server (nut-server) and the monitor (nut-monitor) run as two
+# separate units. The package binds service-control TWICE, once per unit: two
+# table-includes of the SAME member id with DIFFERENT literal bindings. The
+# resolver's binding-aware dedup keeps both (it dedups on id + bindings, not id
+# alone), so both nut-server and nut-monitor get their own service-control set.
+# Plus service-observe on both and READ-ONLY config. Lifecycle + read only — NO
+# rw config — so this stays contained.
+#
+# rw on /etc/nut is escalation-capable and lives in nut.admin: upsmon keeps a
+# privileged parent running as root to execute SHUTDOWNCMD / NOTIFYCMD, so write
+# access to upsmon.conf is a root command-exec path (structurally identical to
+# smartd's -M exec). NUT config follows the /etc/{app} convention, so it is bound
+# via the ro convention component on app="nut". No logs component: NUT logs to
+# journald, not /var/log/nut.
+#
+# Values verified against NUT on Debian 12 (units nut-server / nut-monitor,
+# config /etc/nut). Older/other distros name the units upsd / upsmon — that
+# delta is added as a linux-<distro> layer override only once verified.
+includes = [
+    { id = "service-observe", units = "nut-server" },
+    { id = "service-observe", units = "nut-monitor" },
+    { id = "service-control", units = "nut-server" },
+    { id = "service-control", units = "nut-monitor" },
+    { id = "app-config-ro", app = "nut" },
+]

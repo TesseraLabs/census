@@ -1,0 +1,24 @@
+id       = "smartmontools.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for smartmontools: service-control on the `smartd` unit
+# plus READ-WRITE access to the config file /etc/smartd.conf.
+#
+# This is escalation-capable, NOT a contained operate: smartd runs as root, and
+# the `-M exec <script>` directive in /etc/smartd.conf runs an arbitrary script
+# as root whenever a SMART event fires. rw on this file is therefore a root
+# code-exec path, even though the file access itself is contained ACL (not
+# editor-as-root) — the content it grants write to is a root-equivalent control
+# surface. The config is a single file (off the /etc/{app} convention), so the
+# grant is inline; recursive=false because it is one file.
+#
+# Values verified against smartmontools on Debian 12 (unit smartd, config
+# /etc/smartd.conf). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "smartd" },
+]
+
+[[file]]
+path   = "/etc/smartd.conf"
+access = "rw"

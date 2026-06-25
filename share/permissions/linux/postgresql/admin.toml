@@ -1,0 +1,34 @@
+id       = "postgresql.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for PostgreSQL: service-control on the `postgresql`
+# wrapper unit plus READ-WRITE config (inline, recursive on /etc/postgresql) and
+# read-only logs.
+#
+# This is escalation-capable, NOT a contained operate: rw on the postgres config
+# tree lets one set pg_hba.conf to `trust` (any local connection becomes a DB
+# superuser) and set shared_preload_libraries (load a library executed inside the
+# postgres process). That is data-root plus code-exec as the postgres user — the
+# daemon runs as non-root `postgres`, but the config tree is the data-root control
+# surface, so writing it is escalation.
+#
+# Config/logs are INLINE rather than the app-config/app-logs components: the
+# Debian config tree is versioned (/etc/postgresql/<ver>/<cluster>/...), off the
+# flat /etc/{app} convention.
+#
+# Values verified against postgresql on Debian 12 (wrapper unit postgresql,
+# config /etc/postgresql, logs /var/log/postgresql). Per-OS unit/path deltas land
+# in linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "postgresql" },
+]
+
+[[file]]
+path      = "/etc/postgresql"
+access    = "rw"
+recursive = true
+
+[[file]]
+path      = "/var/log/postgresql"
+access    = "ro"
+recursive = true

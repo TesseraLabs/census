@@ -1,0 +1,20 @@
+id       = "apache2.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for the Apache HTTP server: service-control on the
+# `apache2` unit plus the rw config convention component (config tree
+# /etc/apache2 follows /etc/{app}).
+#
+# This is escalation-capable, NOT a contained operate: the apache master process
+# runs as root, and LoadModule / Include directives in /etc/apache2 load code
+# into that root master process — a direct root code-load path. The file access
+# is contained ACL, but the content it grants write to is a root-equivalent
+# control surface.
+#
+# Values verified against apache2 on Debian 12 (unit apache2, config
+# /etc/apache2). RHEL/SUSE name the unit `httpd` — that delta lands in a
+# linux-<distro> layer once verified.
+includes = [
+    { id = "service-control", units = "apache2" },
+    { id = "app-config-rw", app = "apache2" },
+]

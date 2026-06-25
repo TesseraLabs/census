@@ -1,0 +1,20 @@
+id       = "smartmontools.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for smartmontools — the SMART disk-health monitor.
+# Pins service-observe to the unit `smartd`. The config is a single file
+# /etc/smartd.conf (NOT a directory), so it is off the /etc/{app} convention and
+# the grant is inline rather than the app-config-ro component — recursive=false
+# because it is one file. Contained: read-only status + ro ACL on the config
+# file, no root path.
+#
+# Values verified against smartmontools on Debian 12 (unit smartd, config
+# /etc/smartd.conf). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "smartd" },
+]
+
+[[file]]
+path   = "/etc/smartd.conf"
+access = "ro"

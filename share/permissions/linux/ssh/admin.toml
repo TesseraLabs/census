@@ -1,0 +1,20 @@
+id       = "ssh.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for the OpenSSH server: service-control on the unit `ssh`
+# plus rw on the config tree /etc/ssh (the /etc/{app} convention component).
+#
+# This is escalation-capable, NOT a contained "operate", and that is the whole
+# point of classing it admin: rw on /etc/ssh lets one edit sshd_config —
+# PermitRootLogin, AuthorizedKeysFile, ForceCommand, Match blocks — which is a
+# direct path to root login. The file access is contained ACL (not editor-as-
+# root), but the CONTENT it grants write to is a root-equivalent control surface,
+# so the honest risk class is escalation-capable.
+#
+# Values verified against openssh-server on Debian 12 (unit ssh, config
+# /etc/ssh). Non-Debian distros name the unit `sshd` — that delta lands in a
+# linux-<distro> layer once verified.
+includes = [
+    { id = "service-control", units = "ssh" },
+    { id = "app-config-rw", app = "ssh" },
+]

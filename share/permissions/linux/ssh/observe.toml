@@ -1,0 +1,19 @@
+id       = "ssh.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for the OpenSSH server. Pins service-observe to the
+# unit `ssh` (the Debian unit name; non-Debian distros name it `sshd` — that
+# delta lands in a linux-<distro> layer once verified) and binds the ro config
+# convention component (config tree /etc/ssh follows /etc/{app}). Contained:
+# read-only status + ro ACL on /etc/ssh, no mutation, no root path.
+#
+# There is deliberately NO ssh.operate: write access to /etc/ssh is a path to
+# root login (see ssh.admin), so the mutating capability is classed admin /
+# escalation-capable, not a contained "operate".
+#
+# Values verified against openssh-server on Debian 12 (unit ssh, config
+# /etc/ssh). Per-OS unit/path deltas land in linux-<distro> layers once verified.
+includes = [
+    { id = "service-observe", units = "ssh" },
+    { id = "app-config-ro", app = "ssh" },
+]

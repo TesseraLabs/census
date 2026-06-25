@@ -2,3 +2,188 @@
 title     = "应用配置编辑"
 summary   = "通过包装的编辑器编辑指定的应用配置文件（参数：path）。"
 risk_note = "具备提权能力：编辑器以 root 运行且可派生 shell，因此无论编辑哪个文件都能获得 root；allow_prefix 限制目标文件，但不限制编辑器的逃逸。"
+
+[app-scope]
+title     = "按应用名授予的逐应用访问权限"
+summary   = "按应用名授予的逐应用访问权限：管理该应用的服务（start/stop/restart）、编辑 /etc/<app>、读取 /var/log/<app>（参数：app）。"
+risk_note = "受限（contained）：文件访问是对该应用自身 /etc 和 /var/log 目录树的 ACL，服务管理是受限的 service-control 权限（不使用以 root 运行的编辑器）。应用名是单个路径段／单元名——仅限普通单元名，不支持实例单元（name@inst）。"
+
+[app-config-ro]
+title     = "应用配置——只读"
+summary   = "对应用自身配置目录树 /etc/<app> 的只读 ACL（参数：app）。"
+risk_note = "对预期用途而言受限（contained）——应用自身的 /etc/<app> 配置目录树，并非 root 路径。segment 参数将 <app> 限定为 /etc 下的单个子目录（无 /、无 ..），但它仍可指向敏感目录；具体绑定值的安全性是策展／审查（供应链）问题，与 inline 授权完全相同。请勿将其指向系统目录。"
+
+[app-config-rw]
+title     = "应用配置——读写"
+summary   = "对应用自身配置目录树 /etc/<app> 的读写 ACL（参数：app）。"
+risk_note = "对预期用途而言受限（contained）——应用自身的 /etc/<app> 配置目录树，并非 root 路径。segment 参数将 <app> 限定为 /etc 下的单个子目录（无 /、无 ..），但它仍可指向敏感目录；具体绑定值的安全性是策展／审查（供应链）问题，与 inline 授权完全相同。请勿将其指向系统目录。"
+
+[app-logs-ro]
+title     = "应用日志——只读"
+summary   = "对应用自身日志目录树 /var/log/<app> 的只读 ACL（参数：app）。"
+risk_note = "对预期用途而言受限（contained）——应用自身的 /var/log/<app> 日志目录树，并非 root 路径。segment 参数将 <app> 限定为 /var/log 下的单个子目录（无 /、无 ..），但它仍可指向敏感目录；具体绑定值的安全性是策展／审查（供应链）问题，与 inline 授权完全相同。请勿将其指向系统目录。"
+
+["zabbix-agent.observe"]
+title     = "Zabbix 代理——观察"
+summary   = "对 Zabbix 代理的只读访问：查询其服务状态，读取 /etc/zabbix 和 /var/log/zabbix。"
+risk_note = "受限（contained）：只读服务状态（不可 start/stop），加上对代理自身配置和日志目录树的只读 ACL，无 root 路径。"
+
+["zabbix-agent.operate"]
+title     = "Zabbix 代理——运维"
+summary   = "运维 Zabbix 代理：start/stop/restart 其服务、编辑 /etc/zabbix（可读写）、读取 /var/log/zabbix（包含观察权限）。"
+risk_note = "受限（contained）：对 zabbix-agent 单元的受限服务管理，加上 ACL 文件访问（配置可读写、日志只读），无 root 路径。"
+
+["node-exporter.operate"]
+title     = "Node exporter——运维"
+summary   = "运维 Prometheus node exporter：start/stop/restart prometheus-node-exporter，编辑 /etc/default/prometheus-node-exporter。"
+risk_note = "受限（contained）：对 prometheus-node-exporter 单元的受限服务管理，加上对其单个配置文件的 ACL 可读写，无 root 路径。"
+
+["nut.operate"]
+title     = "NUT——运维"
+summary   = "运维 NUT（Network UPS Tools）：start/stop/restart nut-server 和 nut-monitor 两个单元，读取 /etc/nut（只读配置）。"
+risk_note = "受限（contained）：对两个 NUT 单元的受限服务管理，加上只读配置，仅生命周期——无可读写，无 root 路径。"
+
+["nut.admin"]
+title     = "NUT——管理"
+summary   = "管理 NUT：start/stop/restart nut-server 和 nut-monitor 两个单元，编辑 /etc/nut（可读写）。"
+risk_note = "具备提权能力：upsmon 保留一个以 root 运行的特权父进程来执行 SHUTDOWNCMD/NOTIFYCMD，因此对 /etc/nut 的可读写允许在 upsmon.conf 中设置任意 SHUTDOWNCMD 并触发它（restart/FSD nut-monitor）→ 以 root 执行命令。因此它属于管理（admin），而非受限的 operate。"
+
+["filebeat.observe"]
+title     = "Filebeat——观察"
+summary   = "对 Filebeat 的只读访问：查询其服务状态，读取 /etc/filebeat。"
+risk_note = "受限（contained）：只读服务状态，加上对该采集器自身配置目录树的只读 ACL，无 root 路径。注意：filebeat 以 root 运行（它读取所有日志）；配置本身没有代码执行，但配置可被改写的 root 采集器可能被重新指向以窃取任意 root 可读文件——受限，但与安全相关。"
+
+["filebeat.operate"]
+title     = "Filebeat——运维"
+summary   = "运维 Filebeat：start/stop/restart 其服务，编辑 /etc/filebeat（可读写）。"
+risk_note = "受限（contained）：对 filebeat 单元的受限服务管理，加上对其配置目录树的 ACL 可读写，无 root 路径。注意：filebeat 以 root 运行（它读取所有日志）；配置本身没有代码执行，但 root 采集器上的可读写配置可将其重新指向以窃取任意 root 可读文件——受限，但与安全相关。"
+
+["ssh.observe"]
+title     = "OpenSSH 服务器——观察"
+summary   = "对 OpenSSH 服务器的只读访问：查询 ssh 服务状态，读取 /etc/ssh。"
+risk_note = "受限（contained）：只读服务状态，加上对 /etc/ssh 的只读 ACL，不可修改，无 root 路径。"
+
+["ssh.admin"]
+title     = "OpenSSH 服务器——管理"
+summary   = "管理 OpenSSH 服务器：start/stop/restart ssh 服务，编辑 /etc/ssh（可读写）。"
+risk_note = "具备提权能力：对 /etc/ssh 的可读写允许编辑 sshd_config（PermitRootLogin、AuthorizedKeysFile、ForceCommand、Match 块），是通往 root 登录的直接途径。因此它属于管理／提权能力，而非受限的 operate——文件访问是受限的 ACL，但其可写入的内容是等同于 root 的控制面。"
+
+["usbguard.observe"]
+title     = "USBGuard——观察"
+summary   = "对 USBGuard 的只读访问：查询其服务状态，读取 /etc/usbguard。"
+risk_note = "受限（contained）：只读服务状态，加上对 /etc/usbguard 的只读 ACL，无 root 路径。"
+
+["usbguard.operate"]
+title     = "USBGuard——运维"
+summary   = "运维 USBGuard：start/stop/restart 其服务，编辑 /etc/usbguard（可读写）。"
+risk_note = "受限（contained）：编辑 /etc/usbguard 中的 USB 设备规则决定允许接入哪些外设——与安全相关，但并非 root 路径。受限服务管理加上 ACL 文件访问，无 root 路径。"
+
+["cups.observe"]
+title     = "CUPS——观察"
+summary   = "对 CUPS 的只读访问：查询打印服务状态，读取 /etc/cups。"
+risk_note = "受限（contained）：只读服务状态，加上对 /etc/cups 的只读 ACL，无 root 路径。"
+
+["cups.operate"]
+title     = "CUPS——运维"
+summary   = "运维 CUPS：start/stop/restart 打印服务，读取 /etc/cups（只读配置）。"
+risk_note = "受限（contained）：受限服务管理，加上只读配置——无可读写，无 lpadmin 组，无 root 路径。"
+
+["cups.admin"]
+title     = "CUPS——管理"
+summary   = "管理 CUPS：start/stop/restart 打印服务，编辑 /etc/cups（可读写），并通过 lpadmin 组管理打印机。"
+risk_note = "具备提权能力：cupsd 以 root 运行，对 /etc/cups 的可读写加上 lpadmin 允许安装由 cupsd 以 root 运行的打印机后端／过滤器／PPD——历史上的 root RCE 类别。因此它属于管理（admin），而非受限的 operate。"
+
+["chrony.observe"]
+title     = "chrony——观察"
+summary   = "对 chrony 的只读访问：查询时间同步服务状态，读取 /etc/chrony。"
+risk_note = "受限（contained）：只读服务状态，加上对 /etc/chrony 的只读 ACL，无 root 路径。"
+
+["chrony.operate"]
+title     = "chrony——运维"
+summary   = "运维 chrony：start/stop/restart 时间同步服务，编辑 /etc/chrony（可读写）。"
+risk_note = "受限（contained）：更改时间同步会移动时钟，从而影响证书有效期窗口——与安全相关，但并非 root。受限服务管理加上 ACL 文件访问，无 root 路径。"
+
+["smartmontools.observe"]
+title     = "smartmontools——观察"
+summary   = "对 smartmontools 的只读访问：查询 smartd 服务状态，读取 /etc/smartd.conf。"
+risk_note = "受限（contained）：只读服务状态，加上对单个配置文件 /etc/smartd.conf 的只读 ACL，无 root 路径。"
+
+["smartmontools.operate"]
+title     = "smartmontools——运维"
+summary   = "运维 smartmontools：start/stop/restart smartd 服务，读取 /etc/smartd.conf（只读配置）。"
+risk_note = "受限（contained）：对 smartd 单元的受限服务管理，加上只读配置——无可读写，无 root 路径。"
+
+["smartmontools.admin"]
+title     = "smartmontools——管理"
+summary   = "管理 smartmontools：start/stop/restart smartd 服务，编辑 /etc/smartd.conf（可读写）。"
+risk_note = "具备提权能力：smartd 以 root 运行，/etc/smartd.conf 中的 -M exec 指令会在 SMART 事件时以 root 运行任意脚本——对该文件的可读写是 root 代码执行路径。因此它属于管理（admin），而非受限的 operate。"
+
+["nginx.observe"]
+title     = "nginx——观察"
+summary   = "对 nginx 的只读访问：查询服务状态，读取 /etc/nginx 和 /var/log/nginx。"
+risk_note = "受限（contained）：只读服务状态，加上对配置和日志的只读 ACL，无 root 路径。"
+
+["nginx.operate"]
+title     = "nginx——运维"
+summary   = "运维 nginx：start/stop/restart 服务，读取 /etc/nginx 和 /var/log/nginx（只读配置和日志）。"
+risk_note = "受限（contained）：受限服务管理，加上只读配置和日志——无可读写，无 root 路径。"
+
+["nginx.admin"]
+title     = "nginx——管理"
+summary   = "管理 nginx：start/stop/restart 服务，编辑 /etc/nginx（可读写）。"
+risk_note = "具备提权能力：nginx 主进程以 root 运行，/etc/nginx 中的 load_module 指令会将共享对象加载进该 root 主进程——直接的 root 代码加载路径。因此它属于管理（admin），而非受限的 operate。"
+
+["apache2.observe"]
+title     = "Apache HTTP 服务器——观察"
+summary   = "对 Apache 的只读访问：查询 apache2 服务状态，读取 /etc/apache2 和 /var/log/apache2。"
+risk_note = "受限（contained）：只读服务状态，加上对配置和日志的只读 ACL，无 root 路径。"
+
+["apache2.operate"]
+title     = "Apache HTTP 服务器——运维"
+summary   = "运维 Apache：start/stop/restart apache2 服务，读取 /etc/apache2 和 /var/log/apache2（只读配置和日志）。"
+risk_note = "受限（contained）：受限服务管理，加上只读配置和日志——无可读写，无 root 路径。"
+
+["apache2.admin"]
+title     = "Apache HTTP 服务器——管理"
+summary   = "管理 Apache：start/stop/restart apache2 服务，编辑 /etc/apache2（可读写）。"
+risk_note = "具备提权能力：Apache 主进程以 root 运行，/etc/apache2 中的 LoadModule/Include 指令会将代码加载进该 root 主进程——直接的 root 代码加载路径。因此它属于管理（admin），而非受限的 operate。"
+
+["postgresql.observe"]
+title     = "PostgreSQL——观察"
+summary   = "对 PostgreSQL 的只读访问：查询 postgresql 服务状态，读取 /etc/postgresql 和 /var/log/postgresql。"
+risk_note = "受限（contained）：只读服务状态，加上对配置和日志目录树的只读 ACL，无 root 路径。"
+
+["postgresql.operate"]
+title     = "PostgreSQL——运维"
+summary   = "运维 PostgreSQL：start/stop/restart postgresql 服务，读取 /etc/postgresql 和 /var/log/postgresql（只读配置和日志）。"
+risk_note = "受限（contained）：受限服务管理，加上只读配置和日志——无可读写，无 root 路径。"
+
+["postgresql.admin"]
+title     = "PostgreSQL——管理"
+summary   = "管理 PostgreSQL：start/stop/restart postgresql 服务，编辑 /etc/postgresql（可读写）。"
+risk_note = "具备提权能力：对 postgres 配置目录树的可读写允许将 pg_hba.conf 设为 trust（任何本地连接都成为数据库超级用户）以及设置 shared_preload_libraries（加载在 postgres 进程中执行的代码）——data-root 加上以 postgres 用户执行代码。因此它属于管理（admin），而非受限的 operate。"
+
+["redis.observe"]
+title     = "Redis——观察"
+summary   = "对 Redis 的只读访问：查询 redis-server 服务状态，读取 /etc/redis。"
+risk_note = "受限（contained）：只读服务状态，加上对 /etc/redis 的只读 ACL，无 root 路径。"
+
+["redis.operate"]
+title     = "Redis——运维"
+summary   = "运维 Redis：start/stop/restart redis-server 服务，编辑 /etc/redis（可读写）。"
+risk_note = "受限（contained）：Redis 守护进程以非特权用户 redis 运行，因此对 /etc/redis 的可读写以及运行时 MODULE LOAD 都以 redis 用户而非 root 执行代码——以应用用户身份执行，而非提权。无需管理（admin）层级。"
+
+["haproxy.observe"]
+title     = "HAProxy——观察"
+summary   = "对 HAProxy 的只读访问：查询服务状态，读取 /etc/haproxy。"
+risk_note = "受限（contained）：只读服务状态，加上对 /etc/haproxy 的只读 ACL，无 root 路径。"
+
+["haproxy.operate"]
+title     = "HAProxy——运维"
+summary   = "运维 HAProxy：start/stop/restart 服务，读取 /etc/haproxy（只读配置）。"
+risk_note = "受限（contained）：受限服务管理，加上只读配置——无可读写，无 root 路径。"
+
+["haproxy.admin"]
+title     = "HAProxy——管理"
+summary   = "管理 HAProxy：start/stop/restart 服务，编辑 /etc/haproxy（可读写）。"
+risk_note = "具备提权能力：haproxy 主进程以 root 启动，/etc/haproxy 中的 lua-load/external-check 指令会从该 root 进程运行程序——root 程序执行路径。因此它属于管理（admin），而非受限的 operate。"

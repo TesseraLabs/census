@@ -1,0 +1,17 @@
+role    = "monops"
+version = 1
+os      = "linux"
+name    = "Monitoring operator"
+level   = 3
+
+[payload]
+# Monitoring operator built entirely from curated, all-contained app packages
+# plus journald read. zabbix-agent.operate and node-exporter.operate are
+# literal-bound bundles (no parameters): each pins service-control to a fixed
+# unit and carries its own contained file grants. log-read adds the journald
+# group access node-exporter relies on (it logs to journald, not /var/log).
+permissions = [
+    "zabbix-agent.operate",
+    "node-exporter.operate",
+    "log-read",
+]

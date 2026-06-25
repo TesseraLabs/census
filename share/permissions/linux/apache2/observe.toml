@@ -1,0 +1,17 @@
+id       = "apache2.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for the Apache HTTP server. Pins service-observe to
+# the unit `apache2` (the Debian unit name; RHEL/SUSE name it `httpd` — that
+# delta lands in a linux-<distro> layer once verified) and binds the ro config +
+# ro logs convention components (config /etc/apache2 and logs /var/log/apache2
+# both follow the convention). Contained: read-only status + ro ACL, no root path.
+#
+# Values verified against apache2 on Debian 12 (unit apache2, config
+# /etc/apache2, logs /var/log/apache2). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "apache2" },
+    { id = "app-config-ro", app = "apache2" },
+    { id = "app-logs-ro", app = "apache2" },
+]

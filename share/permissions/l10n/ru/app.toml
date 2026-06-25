@@ -2,3 +2,188 @@
 title     = "Правка конфигов приложения"
 summary   = "Правка конкретных конфигов приложения через обёрнутый редактор (параметр: path)."
 risk_note = "Escalation-capable: редактор запускается под root и может породить shell, поэтому root достижим независимо от того, какой файл правится; allow_prefix ограничивает целевой файл, но не escape из редактора."
+
+[app-scope]
+title     = "Доступ к приложению по имени"
+summary   = "Доступ к приложению по имени: управление сервисом приложения (start/stop/restart), правка /etc/<app>, чтение /var/log/<app> (параметр: app)."
+risk_note = "Contained: доступ к файлам — это ACL на собственные деревья приложения /etc и /var/log, а управление сервисом — это ограниченное разрешение service-control (без редактора под root). Имя приложения — это один сегмент пути / имя юнита: только простые имена юнитов, не инстанс-юниты (name@inst)."
+
+[app-config-ro]
+title     = "Конфиг приложения — только чтение"
+summary   = "ACL только на чтение собственного дерева конфигов приложения /etc/<app> (параметр: app)."
+risk_note = "Contained для предполагаемого использования — собственное дерево конфигов приложения /etc/<app>, не путь к root. Параметр segment ограничивает <app> одним подкаталогом под /etc (без /, без ..), но он всё ещё может указать на чувствительный каталог; безопасность конкретного связанного значения — это вопрос курирования/ревью, ровно как для inline-гранта. Не направляйте его на системный каталог."
+
+[app-config-rw]
+title     = "Конфиг приложения — чтение и запись"
+summary   = "ACL на чтение и запись собственного дерева конфигов приложения /etc/<app> (параметр: app)."
+risk_note = "Contained для предполагаемого использования — собственное дерево конфигов приложения /etc/<app>, не путь к root. Параметр segment ограничивает <app> одним подкаталогом под /etc (без /, без ..), но он всё ещё может указать на чувствительный каталог; безопасность конкретного связанного значения — это вопрос курирования/ревью, ровно как для inline-гранта. Не направляйте его на системный каталог."
+
+[app-logs-ro]
+title     = "Логи приложения — только чтение"
+summary   = "ACL только на чтение собственного дерева логов приложения /var/log/<app> (параметр: app)."
+risk_note = "Contained для предполагаемого использования — собственное дерево логов приложения /var/log/<app>, не путь к root. Параметр segment ограничивает <app> одним подкаталогом под /var/log (без /, без ..), но он всё ещё может указать на чувствительный каталог; безопасность конкретного связанного значения — это вопрос курирования/ревью, ровно как для inline-гранта. Не направляйте его на системный каталог."
+
+["zabbix-agent.observe"]
+title     = "Zabbix-агент — наблюдение"
+summary   = "Только чтение для Zabbix-агента: запрос статуса его сервиса и чтение /etc/zabbix и /var/log/zabbix."
+risk_note = "Contained: только чтение статуса сервиса (без start/stop) плюс ACL ro на собственные деревья конфигов и логов агента, без пути к root."
+
+["zabbix-agent.operate"]
+title     = "Zabbix-агент — управление"
+summary   = "Управление Zabbix-агентом: start/stop/restart его сервиса, правка /etc/zabbix (rw), чтение /var/log/zabbix (включает наблюдение)."
+risk_note = "Contained: ограниченное управление сервисом юнита zabbix-agent плюс ACL-доступ к файлам (rw для конфигов, ro для логов), без пути к root."
+
+["node-exporter.operate"]
+title     = "Node exporter — управление"
+summary   = "Управление Prometheus node exporter: start/stop/restart prometheus-node-exporter и правка /etc/default/prometheus-node-exporter."
+risk_note = "Contained: ограниченное управление сервисом юнита prometheus-node-exporter плюс ACL rw на его единственный файл конфига, без пути к root."
+
+["nut.operate"]
+title     = "NUT — управление"
+summary   = "Управление NUT (Network UPS Tools): start/stop/restart обоих юнитов nut-server и nut-monitor, чтение /etc/nut (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом двух юнитов NUT плюс конфиг только для чтения, только жизненный цикл — без rw, без пути к root."
+
+["nut.admin"]
+title     = "NUT — администрирование"
+summary   = "Администрирование NUT: start/stop/restart обоих юнитов nut-server и nut-monitor, правка /etc/nut (rw)."
+risk_note = "Escalation-capable: upsmon держит привилегированный родительский процесс под root для выполнения SHUTDOWNCMD/NOTIFYCMD, поэтому rw на /etc/nut позволяет задать произвольный SHUTDOWNCMD в upsmon.conf и инициировать его (restart/FSD nut-monitor) → выполнение команды под root. Именно поэтому это admin, а не contained operate."
+
+["filebeat.observe"]
+title     = "Filebeat — наблюдение"
+summary   = "Только чтение для Filebeat: запрос статуса сервиса и чтение /etc/filebeat."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на собственное дерево конфигов шиппера, без пути к root. Примечание: filebeat работает под root (он читает все логи); в конфиге нет выполнения кода, но шиппер под root, чей конфиг можно переписать, может быть перенаправлен на эксфильтрацию произвольных файлов, читаемых root, — contained, но security-relevant."
+
+["filebeat.operate"]
+title     = "Filebeat — управление"
+summary   = "Управление Filebeat: start/stop/restart сервиса и правка /etc/filebeat (rw)."
+risk_note = "Contained: ограниченное управление сервисом юнита filebeat плюс ACL rw на его дерево конфигов, без пути к root. Примечание: filebeat работает под root (он читает все логи); в конфиге нет выполнения кода, но rw-конфиг на шиппере под root позволяет перенаправить его на эксфильтрацию произвольных файлов, читаемых root, — contained, но security-relevant."
+
+["ssh.observe"]
+title     = "Сервер OpenSSH — наблюдение"
+summary   = "Только чтение для сервера OpenSSH: запрос статуса сервиса ssh и чтение /etc/ssh."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/ssh, без изменений, без пути к root."
+
+["ssh.admin"]
+title     = "Сервер OpenSSH — администрирование"
+summary   = "Администрирование сервера OpenSSH: start/stop/restart сервиса ssh и правка /etc/ssh (rw)."
+risk_note = "Escalation-capable: rw на /etc/ssh позволяет править sshd_config (PermitRootLogin, AuthorizedKeysFile, ForceCommand, блоки Match) — прямой путь к входу под root. Именно поэтому это admin/escalation-capable, а не contained operate: доступ к файлам — это contained ACL, но контент, в который даётся запись, — это root-эквивалентная поверхность управления."
+
+["usbguard.observe"]
+title     = "USBGuard — наблюдение"
+summary   = "Только чтение для USBGuard: запрос статуса сервиса и чтение /etc/usbguard."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/usbguard, без пути к root."
+
+["usbguard.operate"]
+title     = "USBGuard — управление"
+summary   = "Управление USBGuard: start/stop/restart сервиса и правка /etc/usbguard (rw)."
+risk_note = "Contained: правка правил USB-устройств в /etc/usbguard определяет, какие периферийные устройства допускаются, — это security-relevant, но не путь к root. Ограниченное управление сервисом плюс ACL-доступ к файлам, без пути к root."
+
+["cups.observe"]
+title     = "CUPS — наблюдение"
+summary   = "Только чтение для CUPS: запрос статуса сервиса печати и чтение /etc/cups."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/cups, без пути к root."
+
+["cups.operate"]
+title     = "CUPS — управление"
+summary   = "Управление CUPS: start/stop/restart сервиса печати и чтение /etc/cups (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг только для чтения — без rw, без группы lpadmin, без пути к root."
+
+["cups.admin"]
+title     = "CUPS — администрирование"
+summary   = "Администрирование CUPS: start/stop/restart сервиса печати, правка /etc/cups (rw) и управление принтерами через группу lpadmin."
+risk_note = "Escalation-capable: cupsd работает под root, и rw на /etc/cups плюс lpadmin позволяет установить бэкенд/фильтр/PPD принтера, который cupsd затем запускает под root, — исторический класс root RCE. Именно поэтому это admin, а не contained operate."
+
+["chrony.observe"]
+title     = "chrony — наблюдение"
+summary   = "Только чтение для chrony: запрос статуса сервиса синхронизации времени и чтение /etc/chrony."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/chrony, без пути к root."
+
+["chrony.operate"]
+title     = "chrony — управление"
+summary   = "Управление chrony: start/stop/restart сервиса синхронизации времени и правка /etc/chrony (rw)."
+risk_note = "Contained: изменение синхронизации времени может сдвинуть часы, что влияет на окна валидности сертификатов, — это security-relevant, но не root. Ограниченное управление сервисом плюс ACL-доступ к файлам, без пути к root."
+
+["smartmontools.observe"]
+title     = "smartmontools — наблюдение"
+summary   = "Только чтение для smartmontools: запрос статуса сервиса smartd и чтение /etc/smartd.conf."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на единственный файл конфига /etc/smartd.conf, без пути к root."
+
+["smartmontools.operate"]
+title     = "smartmontools — управление"
+summary   = "Управление smartmontools: start/stop/restart сервиса smartd и чтение /etc/smartd.conf (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом юнита smartd плюс конфиг только для чтения — без rw, без пути к root."
+
+["smartmontools.admin"]
+title     = "smartmontools — администрирование"
+summary   = "Администрирование smartmontools: start/stop/restart сервиса smartd и правка /etc/smartd.conf (rw)."
+risk_note = "Escalation-capable: smartd работает под root, и директива -M exec в /etc/smartd.conf запускает произвольный скрипт под root при SMART-событиях — rw на этот файл является путём к выполнению кода под root. Именно поэтому это admin, а не contained operate."
+
+["nginx.observe"]
+title     = "nginx — наблюдение"
+summary   = "Только чтение для nginx: запрос статуса сервиса и чтение /etc/nginx и /var/log/nginx."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на конфиг и логи, без пути к root."
+
+["nginx.operate"]
+title     = "nginx — управление"
+summary   = "Управление nginx: start/stop/restart сервиса и чтение /etc/nginx и /var/log/nginx (конфиг и логи только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг и логи только для чтения — без rw, без пути к root."
+
+["nginx.admin"]
+title     = "nginx — администрирование"
+summary   = "Администрирование nginx: start/stop/restart сервиса и правка /etc/nginx (rw)."
+risk_note = "Escalation-capable: master-процесс nginx работает под root, и директива load_module в /etc/nginx загружает разделяемый объект в этот root-master — прямой путь к загрузке кода под root. Именно поэтому это admin, а не contained operate."
+
+["apache2.observe"]
+title     = "Веб-сервер Apache — наблюдение"
+summary   = "Только чтение для Apache: запрос статуса сервиса apache2 и чтение /etc/apache2 и /var/log/apache2."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на конфиг и логи, без пути к root."
+
+["apache2.operate"]
+title     = "Веб-сервер Apache — управление"
+summary   = "Управление Apache: start/stop/restart сервиса apache2 и чтение /etc/apache2 и /var/log/apache2 (конфиг и логи только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг и логи только для чтения — без rw, без пути к root."
+
+["apache2.admin"]
+title     = "Веб-сервер Apache — администрирование"
+summary   = "Администрирование Apache: start/stop/restart сервиса apache2 и правка /etc/apache2 (rw)."
+risk_note = "Escalation-capable: master-процесс Apache работает под root, и директивы LoadModule/Include в /etc/apache2 загружают код в этот root-master — прямой путь к загрузке кода под root. Именно поэтому это admin, а не contained operate."
+
+["postgresql.observe"]
+title     = "PostgreSQL — наблюдение"
+summary   = "Только чтение для PostgreSQL: запрос статуса сервиса postgresql и чтение /etc/postgresql и /var/log/postgresql."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на деревья конфигов и логов, без пути к root."
+
+["postgresql.operate"]
+title     = "PostgreSQL — управление"
+summary   = "Управление PostgreSQL: start/stop/restart сервиса postgresql и чтение /etc/postgresql и /var/log/postgresql (конфиг и логи только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг и логи только для чтения — без rw, без пути к root."
+
+["postgresql.admin"]
+title     = "PostgreSQL — администрирование"
+summary   = "Администрирование PostgreSQL: start/stop/restart сервиса postgresql и правка /etc/postgresql (rw)."
+risk_note = "Escalation-capable: rw на дерево конфигов postgres позволяет выставить pg_hba.conf в trust (любое локальное подключение становится суперпользователем БД) и shared_preload_libraries (загрузка кода, исполняемого в процессе postgres) — data-root плюс выполнение кода под пользователем postgres. Именно поэтому это admin, а не contained operate."
+
+["redis.observe"]
+title     = "Redis — наблюдение"
+summary   = "Только чтение для Redis: запрос статуса сервиса redis-server и чтение /etc/redis."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/redis, без пути к root."
+
+["redis.operate"]
+title     = "Redis — управление"
+summary   = "Управление Redis: start/stop/restart сервиса redis-server и правка /etc/redis (rw)."
+risk_note = "Contained: демон Redis работает под непривилегированным пользователем redis, поэтому rw на /etc/redis и MODULE LOAD во время выполнения исполняют код под пользователем redis, а не root, — exec-под-пользователем-приложения, не эскалация. Тир admin не нужен."
+
+["haproxy.observe"]
+title     = "HAProxy — наблюдение"
+summary   = "Только чтение для HAProxy: запрос статуса сервиса и чтение /etc/haproxy."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/haproxy, без пути к root."
+
+["haproxy.operate"]
+title     = "HAProxy — управление"
+summary   = "Управление HAProxy: start/stop/restart сервиса и чтение /etc/haproxy (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг только для чтения — без rw, без пути к root."
+
+["haproxy.admin"]
+title     = "HAProxy — администрирование"
+summary   = "Администрирование HAProxy: start/stop/restart сервиса и правка /etc/haproxy (rw)."
+risk_note = "Escalation-capable: master-процесс haproxy стартует под root, и директивы lua-load/external-check в /etc/haproxy запускают программы из этого root-процесса — путь к выполнению программ под root. Именно поэтому это admin, а не contained operate."
