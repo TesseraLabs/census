@@ -1,0 +1,38 @@
+id       = "portainer-edge.admin"
+risk     = "escalation-capable"
+category = "container"
+# Curated admin package for the Portainer Edge Agent: read-only observe plus
+# service-control on the `PortainerEdgeAgent` unit and — the substance of it —
+# docker.operate.
+#
+# This is escalation-capable, and there is DELIBERATELY NO contained operate tier.
+# The Portainer Edge Agent's whole job is to manage container stacks on the edge
+# node THROUGH THE HOST DOCKER SOCKET (the agent is deployed with
+# /var/run/docker.sock mounted). The docker socket is root-equivalent — it can
+# bind-mount the host root filesystem into a container and run --privileged,
+# executing code as root on the host. That root-equivalence is what carries the
+# escalation label, independent of the agent's unit name.
+#
+# So portainer-edge.admin IS docker-socket access, by design: it composes
+# docker.operate (docker group + socket + compose) to model exactly that, and
+# therefore OVERLAPS docker.admin. A deployment that already grants docker.admin
+# gains nothing extra from this package's docker side — the only thing
+# portainer-edge.admin adds over docker.operate is lifecycle control of the agent
+# unit itself. Choose this package when you want to name the capability as
+# "administer the Portainer edge agent (which is root-equivalent docker access)";
+# choose docker.admin/operate directly when you are granting raw docker.
+#
+# DEPLOYMENT-SPECIFIC unit: PortainerEdgeAgent is the community-standard
+# systemd-wrapper unit name; the agent is usually a bare container with no host unit
+# at all (see observe). A role overrides `units` to its actual wrapper name. The
+# escalation label does not depend on the unit — it comes from docker.operate.
+#
+# Values verified against the community systemd-wrapper deployment of the Portainer
+# Edge Agent (unit PortainerEdgeAgent, host docker socket mounted). Per-OS unit/path
+# deltas land in linux-<distro> layers once verified — unverified values are not
+# shipped.
+includes = [
+    { id = "service-observe", units = "PortainerEdgeAgent" },
+    { id = "service-control", units = "PortainerEdgeAgent" },
+    "docker.operate",
+]

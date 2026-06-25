@@ -1,0 +1,21 @@
+id       = "haproxy.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for HAProxy: read-only observe (service-observe on the
+# `haproxy` unit) plus service-control on the same unit and READ-ONLY config (the
+# ro convention component). Lifecycle + read only — NO rw config — so this stays
+# contained. No logs component: HAProxy logs to journald, not /var/log/haproxy.
+#
+# rw on /etc/haproxy is escalation-capable and lives in haproxy.admin: the
+# haproxy master process starts as root, and `lua-load` / `external-check`
+# directives in the config run programs from that root-started process, so rw on
+# the config tree is a root code/program-exec path, not a contained operate.
+#
+# Values verified against haproxy on Debian 12 (unit haproxy, config
+# /etc/haproxy). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "haproxy" },
+    { id = "service-control", units = "haproxy" },
+    { id = "app-config-ro", app = "haproxy" },
+]

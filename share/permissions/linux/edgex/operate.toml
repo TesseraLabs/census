@@ -1,0 +1,50 @@
+id       = "edgex.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for EdgeX Foundry: read-only observe (service-observe on
+# the representative snap service units) plus service-control on those units, the
+# device-serial leaf for Modbus RTU, and READ-ONLY config (the inline ro snap
+# config tree). Lifecycle + read only — NO rw config — so this stays contained.
+#
+# rw config is DELIBERATELY kept OUT of operate and lives in edgex.admin, because
+# the EdgeX snap services run AS ROOT. This is the rsyslog/salt-minion shape (root
+# daemon → operate is lifecycle + ro only, rw is a separate escalation admin tier),
+# NOT the redis/telegraf shape: redis/telegraf pin User= IN THE PACKAGED UNIT (a
+# structural non-root guarantee), and EdgeX snap has no such pin. Starting/stopping
+# a snap service runs only the vetted, already-on-disk config; the operator cannot
+# introduce new code because config stays read-only.
+#
+# SERIAL: a Modbus RTU device service talks to a serial transceiver (e.g.
+# /dev/ttyUSB0). device-serial carries the `dialout` group, which owns the serial
+# device nodes — that group membership is what grants the access, and device-serial
+# is itself a contained leaf, so it does not widen the package's risk. (Note: the
+# snap services run as root and so already have device access; device-serial is
+# carried for the deployment where the device-service binary is run under a
+# non-root account, and is contained either way.)
+#
+# DEPLOYMENT-SPECIFIC unit set + config path: see edgex.observe. The default units
+# are snap.edgexfoundry.core-data + snap.edgexfoundry.device-modbus (the latter
+# being the device service that needs the serial access); a role overrides `units`
+# to its real snap service set. Config is the ro snap-data tree under
+# /var/snap/edgexfoundry/current (inline literal-path, off the /etc/{app}
+# convention); the exact subpath is pinned per deployment.
+#
+# Values verified against the EdgeX snap (snap.edgexfoundry.<service> units,
+# services run as root, snap data under /var/snap/edgexfoundry, Modbus RTU needs
+# serial). The exact config subpath is the snap-data layout and is pinned per
+# deployment — unverified precise subpaths are not shipped as fact.
+includes = [
+    { id = "service-observe", units = "snap.edgexfoundry.core-data" },
+    { id = "service-observe", units = "snap.edgexfoundry.device-modbus" },
+    { id = "service-control", units = "snap.edgexfoundry.core-data" },
+    { id = "service-control", units = "snap.edgexfoundry.device-modbus" },
+    "device-serial",
+]
+
+# Inline literal-path grant on the EdgeX snap config tree, READ-ONLY — the snap
+# services run as root, so rw config is escalation (edgex.admin); operate keeps it
+# ro. Off the /etc/{app} convention, so granted inline; subpath pinned per layer.
+[[file]]
+path      = "/var/snap/edgexfoundry/current"
+access    = "ro"
+recursive = true

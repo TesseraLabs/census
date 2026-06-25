@@ -1,0 +1,20 @@
+id       = "haproxy.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for HAProxy: service-control on the `haproxy` unit plus
+# the rw config convention component (config tree /etc/haproxy follows
+# /etc/{app}).
+#
+# This is escalation-capable, NOT a contained operate: the haproxy master process
+# starts as root, and `lua-load` / `external-check` directives in /etc/haproxy
+# run arbitrary programs / Lua from that root-started process — a root program-
+# exec path. The file access is contained ACL, but the content it grants write to
+# is a root-equivalent control surface.
+#
+# Values verified against haproxy on Debian 12 (unit haproxy, config
+# /etc/haproxy). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "haproxy" },
+    { id = "app-config-rw", app = "haproxy" },
+]

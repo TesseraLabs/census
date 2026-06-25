@@ -1,0 +1,18 @@
+role    = "baseops"
+version = 1
+os      = "linux"
+name    = "Base host operator"
+level   = 4
+
+[payload]
+# A representative mix of the base curated app packages: operate on a log shipper
+# (filebeat) and the print server (cups, which also grants the lpadmin group),
+# read-only observe on the OpenSSH server (ssh has no contained operate — its
+# mutating capability is ssh.admin / escalation-capable), and operate on the
+# time-sync daemon (chrony). All contained — no escalation-capable package here.
+permissions = [
+    "filebeat.operate",
+    "cups.operate",
+    "ssh.observe",
+    "chrony.operate",
+]

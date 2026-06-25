@@ -1,0 +1,35 @@
+id       = "telegraf.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for Telegraf: read-only observe (service-observe on the
+# `telegraf` unit) plus service-control on the same unit and the rw config
+# convention component (config tree /etc/telegraf follows /etc/{app}).
+#
+# rw config is in operate (and there is deliberately NO telegraf.admin tier)
+# because the Telegraf daemon is structurally pinned non-root by the packaged unit
+# `User=telegraf` — the InfluxData deb/rpm telegraf.service sets it, so systemd
+# starts it unprivileged. With that pin, rw on /etc/telegraf grants `exec`/`execd`
+# input = command-exec AS THE telegraf USER (contained, not root), and output
+# plugins may carry credentials — security-relevant, but exec-as-app-user, not
+# escalation. This is the redis precedent (non-root daemon → rw in operate, no
+# admin tier).
+#
+# No log grant: Telegraf logs to journald by default (no /var/log/telegraf on the
+# baseline), so journald reads belong to a journald/log-read grant, not this
+# package.
+#
+# CAVEAT for per-OS layers (the mosquitto User= lesson): containment here rests on
+# the unit carrying User=telegraf. A per-OS layer whose telegraf unit OMITS User=
+# would run the daemon as root, turning rw config + restart into a root code-exec
+# path (`exec` input runs as root) — such a layer must re-evaluate and move rw
+# config into a telegraf.admin escalation tier before shipping operate as
+# contained.
+#
+# Values verified against telegraf on Debian 12 (unit telegraf with
+# User=telegraf, config /etc/telegraf, logs to journald). Per-OS unit/path deltas
+# land in linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "telegraf" },
+    { id = "service-control", units = "telegraf" },
+    { id = "app-config-rw", app = "telegraf" },
+]

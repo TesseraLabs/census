@@ -1,0 +1,21 @@
+id       = "salt-minion.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for the Salt minion: read-only observe (service-observe
+# on the `salt-minion` unit) plus service-control on the same unit and READ-ONLY
+# config + logs (the ro convention components). Lifecycle + read only — NO rw
+# config — so this stays contained.
+#
+# rw on /etc/salt is escalation-capable and lives in salt-minion.admin: the minion
+# runs as root and its config sets the `master:` it connects to, so rw on the
+# config tree is a full-host-takeover path, not a contained operate.
+#
+# Values verified against salt-minion on Debian 12 (unit salt-minion, config
+# /etc/salt, logs /var/log/salt, runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "salt-minion" },
+    { id = "service-control", units = "salt-minion" },
+    { id = "app-config-ro", app = "salt" },
+    { id = "app-logs-ro", app = "salt" },
+]

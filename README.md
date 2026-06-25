@@ -119,6 +119,21 @@ coverage counts), `risk` (undermines it — surfaced by `framework risk`), or `r
 (neutrally touches it).
 `framework coverage` then reports which `owned` controls no role yet satisfies.
 
+## Documentation
+
+Full guides live under [`docs/`](docs/), in **English**, **Russian**, and
+**Chinese**:
+
+- **[Getting started](docs/en/getting-started.md)** — install, configure, first
+  `apply`, and operate a device end to end.
+- **[TOML format reference](docs/en/toml-reference.md)** — every field of the
+  declaration and role slice, plus the `plan --diff` preview mode.
+- Index: [English](docs/en/index.md) · [Русский](docs/ru/index.md) ·
+  [中文](docs/zh/index.md).
+
+Catalog/package authoring: [`docs/catalog-authoring.md`](docs/catalog-authoring.md)
+and [`docs/authoring-packages.md`](docs/authoring-packages.md) (Russian).
+
 ## Build
 
 ```sh

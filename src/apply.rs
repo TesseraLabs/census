@@ -641,11 +641,23 @@ pub fn run<C: crate::catalog::CatalogSource>(
         ));
     }
     // Revoke every grant of a deleted account (the account is gone; its ACL
-    // entries must go too).
+    // entries must go too). The account's `userdel` already ran in the phase above,
+    // so its name no longer resolves — revoke by the recorded numeric UID, which is
+    // how the kernel stored the entry, rather than by a name `setfacl` can no longer
+    // look up. The deleted account always has a managed record (the `Delete` came
+    // from diffing it), so its UID is present.
     for action in &plan.actions {
         if let Action::Delete { name } = action {
+            let uid = managed_now.get(name).map(|m| m.uid);
             for removed in removed_grants(name, &[], &managed_now) {
-                if let Err(e) = revoke_one(inputs.file_access, name, &removed) {
+                let result = match uid {
+                    Some(uid) => revoke_one_deleted(inputs.file_access, uid, &removed),
+                    // No recorded UID (a record without one should not occur for a
+                    // managed Delete): fall back to the name so teardown still
+                    // attempts the revoke rather than silently skipping it.
+                    None => revoke_one(inputs.file_access, name, &removed),
+                };
+                if let Err(e) = result {
                     return Err(phase_failure_file_access(
                         provisioner,
                         inputs.file_access,
@@ -1094,17 +1106,35 @@ fn removed_grants(
 }
 
 /// Revoke one recorded grant via the backend (re-hydrating it to the resolved
-/// form the SPI expects).
+/// form the SPI expects), keying the ACL entry on the account's name.
+///
+/// Use this only while the account still exists (a grant dropped from an account
+/// that survives the apply). For a *deleted* account the name no longer resolves,
+/// so revoke by UID via [`revoke_one_deleted`] instead.
 fn revoke_one(
     file_access: &mut dyn crate::fileaccess::FileAccessBackend,
     account: &str,
     grant: &ManagedFileGrant,
 ) -> Result<(), crate::fileaccess::FileAccessError> {
     let resolved = resolved_from_managed(grant);
-    // File-access on a role-account is the `u:` principal; group materialization
-    // (the `g:` principal) is wired in a later slice. Behavior for accounts is
-    // unchanged.
     let principal = crate::fileaccess::Principal::User(account.to_owned());
+    file_access.revoke(&principal, &resolved)
+}
+
+/// Revoke one recorded grant of an account that has already been deleted, keying
+/// the ACL entry on the recorded numeric UID rather than the name.
+///
+/// The account-delete phase runs `userdel` before this file-access teardown, so by
+/// now the name no longer resolves through `getpwnam`. `setfacl` resolves a named
+/// qualifier and would reject `-x u:<name>` for a vanished name; the kernel stored
+/// the entry by UID, so `-x u:<uid>` removes exactly the orphaned entry.
+fn revoke_one_deleted(
+    file_access: &mut dyn crate::fileaccess::FileAccessBackend,
+    uid: u32,
+    grant: &ManagedFileGrant,
+) -> Result<(), crate::fileaccess::FileAccessError> {
+    let resolved = resolved_from_managed(grant);
+    let principal = crate::fileaccess::Principal::Uid(uid);
     file_access.revoke(&principal, &resolved)
 }
 
@@ -3217,9 +3247,17 @@ mod tests {
     }
 
     #[test]
-    fn deleted_account_grants_are_revoked() {
+    fn deleted_account_grants_are_revoked_by_numeric_uid() {
         // The declaration drops `oper`; the registry recorded a grant for it →
         // the grant is revoked (no live session, so the delete runs).
+        //
+        // Regression: the account-delete phase runs `userdel` BEFORE this
+        // file-access teardown, so by the time the ACL is revoked the name `oper`
+        // no longer resolves through `getpwnam`. `setfacl -x u:oper` would then be
+        // rejected ("Option -x: invalid argument") and abort the whole apply. The
+        // revoke must therefore key the entry on the recorded numeric UID
+        // (`u:9010`), which is how the kernel stored it and which resolves with no
+        // passwd entry. Asserts the principal is `Uid(9010)`, NOT `User("oper")`.
         let (_t, d) = empty_decl();
         let mut prior = managed("oper", 9010, &[], 4);
         prior.file_grants = vec![crate::state::ManagedFileGrant {
@@ -3241,9 +3279,18 @@ mod tests {
             fa.calls
                 .iter()
                 .any(|c| matches!(c, FakeCall::Revoke { principal, path }
-                if principal == &crate::fileaccess::Principal::User("oper".to_owned())
+                if principal == &crate::fileaccess::Principal::Uid(9010)
                     && path == "/etc/ssh")),
-            "the deleted account's grant must be revoked: {:?}",
+            "the deleted account's grant must be revoked by numeric UID (u:9010): {:?}",
+            fa.calls
+        );
+        // And never by the deleted name, which would not resolve once userdel ran.
+        assert!(
+            !fa.calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::Revoke { principal, .. }
+                if principal == &crate::fileaccess::Principal::User("oper".to_owned()))),
+            "must not revoke a deleted account by its (now-unresolvable) name: {:?}",
             fa.calls
         );
     }

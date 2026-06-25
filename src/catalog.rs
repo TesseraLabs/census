@@ -317,6 +317,27 @@ pub enum ParamConstraint {
         /// parse — an empty set would reject every value).
         values: Vec<String>,
     },
+    /// A single safe path segment that doubles as a plain name. The substituted
+    /// value must be non-empty, within the length bound, and drawn from a
+    /// deliberately narrow charset — ASCII alphanumerics plus `.`, `_`, `-`
+    /// only — with the bare `.` and `..` components rejected outright. Because it
+    /// cannot contain `/`, `\`, `:`, `@`, or any control character, one value is
+    /// safe to drop into both a single path component (`/etc/{seg}`) and a token
+    /// position (a unit name, a login), without risking traversal, an absolute
+    /// path, or a sudoers/shell metacharacter.
+    ///
+    /// This is strictly narrower than [`ParamConstraint::Token`]: `token` admits
+    /// `/`, `\`, `:`, and `@` (needed for path-like and instance/slice unit
+    /// names) and so is *not* safe as a path segment. The exclusion of `@` and
+    /// `:` here is the known limitation — `segment` cannot express a systemd
+    /// instance or slice unit name (`wg-quick@wg0`, `system.slice`); those still
+    /// require `token`.
+    #[serde(rename = "segment")]
+    Segment {
+        /// Maximum accepted length; defaults to [`PARAM_DEFAULT_MAX_LEN`].
+        #[serde(default)]
+        max_len: Option<usize>,
+    },
 }
 
 /// The safe punctuation a `kind = "token"` value may use beyond ASCII
@@ -328,6 +349,15 @@ pub enum ParamConstraint {
 /// the slash and dot appear in path-like unit names; the hyphen and underscore
 /// are ubiquitous in identifiers.
 const TOKEN_EXTRA_CHARS: &[char] = &['-', '_', '.', '@', ':', '\\', '/'];
+
+/// The safe punctuation a `kind = "segment"` value may use beyond ASCII
+/// alphanumerics. Strictly narrower than [`TOKEN_EXTRA_CHARS`]: only the dot,
+/// underscore, and hyphen that appear inside a single filename or plain
+/// identifier. Excludes every path separator (`/`, `\`), the `@`/`:` of
+/// instance/slice unit names, and all shell/sudoers metacharacters, so a
+/// segment value can never widen a path component into a traversal, an absolute
+/// path, or a second path level.
+const SEGMENT_EXTRA_CHARS: &[char] = &['.', '_', '-'];
 
 impl ParamConstraint {
     /// Validate the constraint declaration itself (independent of any value).
@@ -356,6 +386,10 @@ impl ParamConstraint {
                     None
                 }
             }
+            // A segment declaration carries only an optional length bound; like a
+            // token, there is nothing in the declaration itself that can be
+            // malformed.
+            ParamConstraint::Segment { .. } => None,
         }
     }
 
@@ -381,6 +415,9 @@ impl ParamConstraint {
             },
             ParamConstraint::Enum { values } => ParamConstraint::Enum {
                 values: values.clone(),
+            },
+            ParamConstraint::Segment { max_len } => ParamConstraint::Segment {
+                max_len: Some(max_len.unwrap_or(PARAM_DEFAULT_MAX_LEN)),
             },
         }
     }
@@ -438,6 +475,30 @@ impl ParamConstraint {
                 } else {
                     Some("value is not one of the allowed enum values")
                 }
+            }
+            ParamConstraint::Segment { max_len } => {
+                if value.is_empty() {
+                    return Some("segment value is empty");
+                }
+                if value.len() > max_len.unwrap_or(PARAM_DEFAULT_MAX_LEN) {
+                    return Some("segment value exceeds max_len");
+                }
+                // `.` and `..` are valid filenames to the charset check below but
+                // are the current-directory and parent-directory components; a
+                // value that is exactly one of them must never reach a path, so
+                // reject them before the charset gate.
+                if value == "." || value == ".." {
+                    return Some("segment value must not be `.` or `..`");
+                }
+                if value
+                    .chars()
+                    .any(|c| !(c.is_ascii_alphanumeric() || SEGMENT_EXTRA_CHARS.contains(&c)))
+                {
+                    return Some(
+                        "segment value contains a character outside the safe path-segment charset",
+                    );
+                }
+                None
             }
         }
     }
@@ -879,6 +940,128 @@ impl FileGrant {
     }
 }
 
+/// One entry in a bundle's `includes` list: the member permission id, plus an
+/// optional set of *bindings* that thread the bundle's own parameters into the
+/// member's `{placeholder}`s.
+///
+/// Two surface forms parse into this one type:
+///
+/// * a **bare string** (`"service-observe"`) — the member is pulled in verbatim,
+///   with no bindings. This is the only form slices before param-mapping knew,
+///   so every existing `includes = ["a", "b"]` keeps working unchanged.
+/// * a **table** (`{ id = "service-control", units = "{app}" }`) — every key
+///   other than `id` is a binding: its name is a *member* parameter and its
+///   value is a template over the *bundle's* parameters. At resolve time the
+///   template is rendered with the bundle's params (guard 1) to produce the
+///   member's concrete param value, which the member then validates against its
+///   own constraint (guard 2).
+///
+/// The two scopes never mix: `bindings` keys live in the member's parameter
+/// namespace, while the placeholders inside the binding *values* live in the
+/// bundle's. A bundle's role-facing surface is only its own `[params.*]`; member
+/// parameters are internal and reachable only through a binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Include {
+    /// The member permission id this entry aggregates.
+    pub id: String,
+    /// Member-parameter-name → binding template over the bundle's parameters.
+    /// Empty for the bare-string form (no binding — back-compat).
+    pub bindings: std::collections::BTreeMap<String, String>,
+}
+
+impl Include {
+    /// A bare include with no bindings — the back-compatible string form.
+    pub fn bare(id: impl Into<String>) -> Self {
+        Include {
+            id: id.into(),
+            bindings: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Does this include carry at least one binding (the table form)?
+    fn is_bound(&self) -> bool {
+        !self.bindings.is_empty()
+    }
+}
+
+impl From<&str> for Include {
+    fn from(id: &str) -> Self {
+        Include::bare(id)
+    }
+}
+
+impl From<String> for Include {
+    fn from(id: String) -> Self {
+        Include::bare(id)
+    }
+}
+
+impl<'de> Deserialize<'de> for Include {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept either a bare string (id, no bindings) or a table whose `id`
+        // key names the member and whose every *other* key is a binding
+        // (member-param → template). Unlike most catalog tables this one cannot
+        // use `deny_unknown_fields`: the binding keys are author-chosen member
+        // parameter names, not a fixed schema, so they are captured into a flat
+        // map and `id` is lifted out of it. A table missing `id`, or carrying a
+        // non-string binding value, is rejected.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bare(String),
+            // A binding value must be a string template; a non-string (array,
+            // table, integer) is not a template and is rejected by this typing.
+            Table(std::collections::BTreeMap<String, String>),
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Bare(id) => Ok(Include::bare(id)),
+            Raw::Table(mut map) => {
+                let id = map.remove("id").ok_or_else(|| {
+                    serde::de::Error::custom("include table is missing the required `id` key")
+                })?;
+                Ok(Include { id, bindings: map })
+            }
+        }
+    }
+}
+
+/// Hand-written schema for [`Include`]: the custom `Deserialize` accepts a bare
+/// string OR a table `{ id = "...", <member_param> = "<template>", ... }` whose
+/// non-`id` keys are author-chosen, so a derive cannot describe it. The two arms
+/// are a plain string, or an object requiring `id` with additional string
+/// properties (the bindings). Behind the `schema` feature — schema generation is
+/// a CI/contract concern, not part of the default public API.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Include {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Include".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let id = <String>::json_schema(generator);
+        let binding = <String>::json_schema(generator);
+        schemars::json_schema!({
+            "oneOf": [
+                {
+                    "type": "string",
+                },
+                {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": id,
+                    },
+                    "additionalProperties": binding,
+                },
+            ],
+        })
+    }
+}
+
 /// A single catalog policy record, parsed strictly.
 ///
 /// One `PermissionDef` is one *layer's* statement about an id. The cross-layer
@@ -929,9 +1112,11 @@ pub struct PermissionDef {
     // --- aggregation fields: parsed and stored so slice-1 catalog files that
     //     already use them are accepted, but NOT resolved here (leaf-only
     //     resolve). Wired transitively in slice 2. ---
-    /// Explicit ids this permission aggregates. Inert in slice 1.
+    /// Explicit members this permission aggregates. Each entry is either a bare
+    /// id string or a table binding the member's parameters to templates over
+    /// this bundle's own parameters (see [`Include`]). Inert in slice 1.
     #[serde(default)]
-    pub includes: Vec<String>,
+    pub includes: Vec<Include>,
     /// Categories this permission aggregates. Inert in slice 1.
     #[serde(default)]
     pub include_categories: Vec<String>,
@@ -1044,6 +1229,28 @@ impl PermissionDef {
             }
         }
 
+        // 1b. Every placeholder inside an include *binding* must name a parameter
+        //     this bundle declares. A binding value is a template over the
+        //     bundle's own params, so a reference to a param the bundle does not
+        //     have (`units = "{xyz}"` with no `[params.xyz]`) is dead — and worse,
+        //     a binding the author believes threads a value actually threads
+        //     nothing. Rejected with a precise error before the generic
+        //     unconstrained-placeholder check below, which would otherwise report
+        //     the same gap less helpfully.
+        for inc in &self.includes {
+            for template in inc.bindings.values() {
+                for name in extract_placeholders(template) {
+                    if !self.params.contains_key(name) {
+                        return Err(CatalogError::UnknownBundleParam {
+                            bundle: self.id.clone(),
+                            member: inc.id.clone(),
+                            param: name.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+
         // 2. Every placeholder used in ANY of this record's templates must have a
         //    matching `[params.<name>]`. A placeholder a role could fill with an
         //    unconstrained value is the fail-open class this guard closes, so a
@@ -1075,11 +1282,19 @@ impl PermissionDef {
     }
 
     /// Every distinct `{placeholder}` name this record's templates reference,
-    /// across sudo commands, group names, and file-grant paths.
+    /// across sudo commands, group names, file-grant paths, **and the binding
+    /// templates in its `includes`**.
     ///
     /// The single source of truth for "which parameters does this record take",
     /// used by [`PermissionDef::validate`] to require a constraint per
     /// placeholder. Order is first-seen; duplicates are collapsed.
+    ///
+    /// Binding templates are included deliberately: a bundle parameter that
+    /// appears *only* inside an include binding (never in this record's own
+    /// sudo/group/file template) is still a real, role-supplied input that must
+    /// be constrained. Were it omitted here, that parameter's `[params.*]` entry
+    /// would be rejected as an orphan and the value would reach the binding-render
+    /// step unconstrained — the fail-open the binding guard exists to close.
     fn placeholder_names(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         let mut push_from = |template: &str| {
@@ -1099,6 +1314,13 @@ impl PermissionDef {
         }
         for grant in &self.files {
             push_from(&grant.path);
+        }
+        // Bundle parameters consumed by an include binding count as used: the
+        // binding value is a template over this bundle's params.
+        for inc in &self.includes {
+            for template in inc.bindings.values() {
+                push_from(template);
+            }
         }
         names
     }
@@ -1753,6 +1975,18 @@ pub struct SourcedPrimitive {
     /// run-spec); this type is shared by both the groups and sudo vectors, and
     /// only the sudo path ever sets the field.
     pub runas: Option<String>,
+    /// When this primitive reached the result through a *parametrized* bundle
+    /// include, the binding that produced it, rendered as `param=value` pairs
+    /// (e.g. `units=Supervisor`). Audit (`census compile`/`show`) reads it to show
+    /// not just which member a primitive came from (`via`) but with which
+    /// substitution. `None` for a primitive that came in verbatim or through a
+    /// bare include.
+    ///
+    /// Provenance only: it is deliberately **excluded** from every drift /
+    /// dedup key (sudo dedups on `(value, runas)`, the plan layer keys file/sudo
+    /// drift on the materialized primitive, not its source), so recording it can
+    /// never perturb plan/apply.
+    pub binding: Option<String>,
 }
 
 /// A file-access grant after resolve: its path, access, recursion, derived
@@ -1787,6 +2021,33 @@ pub struct SourcedFileGrant {
     /// The member permission id that pulled it in via a bundle, or `None` for a
     /// grant the resolved permission declares itself (leaf resolve sets `None`).
     pub via: Option<String>,
+    /// When this grant reached the result through a *parametrized* bundle
+    /// include, the binding that produced it, rendered as `param=value` pairs
+    /// (e.g. `path=/etc/Supervisor`). Provenance only — excluded from the drift
+    /// key (file drift keys on `(path, access, recursive)`), so it never
+    /// perturbs plan/apply. `None` for a verbatim or bare-include grant.
+    pub binding: Option<String>,
+}
+
+/// A bundle member pulled in with parameter *bindings* (the `includes` table
+/// form), resolved through the OS layer chain but **not yet substituted**.
+///
+/// A bare include is flattened into the bundle's own primitives at resolve time.
+/// A bound include cannot be: its member templates carry the member's own
+/// `{placeholder}`s, which are filled from the bundle's role-supplied parameters
+/// through this entry's `bindings` — a two-stage substitution that only
+/// [`resolve_with_params`] (where role parameters are known) can perform. So the
+/// member is resolved here (layer merge, risk fold, cycle detection) and carried
+/// intact, with its own `[params.*]` constraints preserved on `member.params`
+/// for the member-side guard, until binding expansion runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundMember {
+    /// The include entry: the member id plus its bindings (member-param-name →
+    /// template over the bundle's parameters).
+    pub include: Include,
+    /// The member resolved through the layer chain, un-substituted. Its
+    /// `params` are the member's own constraints (the member-side guard).
+    pub member: ResolvedPermission,
 }
 
 /// A fully-resolved single permission: primitives with per-primitive provenance.
@@ -1837,6 +2098,15 @@ pub struct ResolvedPermission {
     /// [`resolve_with_params`] enforces on each substituted value, before the
     /// static sudo/path gates.
     pub params: std::collections::BTreeMap<String, ParamConstraint>,
+    /// Members pulled in with parameter bindings (the `includes` table form),
+    /// resolved but **not yet substituted**. Empty for a leaf, a bare-only
+    /// bundle, or once binding expansion has consumed them. These are expanded by
+    /// [`resolve_with_params`], which renders each binding with the bundle's
+    /// role-supplied parameters (the bundle-side guard) and then substitutes the
+    /// member against its own constraints (the member-side guard). A plain
+    /// [`resolve`] leaves them here unexpanded — their primitives are absent from
+    /// the flat vectors above — because binding expansion needs role parameters.
+    pub bound_members: Vec<BoundMember>,
 }
 
 /// Errors compiling/resolving the catalog.
@@ -2112,6 +2382,94 @@ pub enum CatalogError {
         /// The placeholder name with conflicting constraints.
         param: String,
     },
+    /// An include binding's template references a parameter the bundle does not
+    /// declare (`{ id = "m", units = "{xyz}" }` with no `[params.xyz]` on the
+    /// bundle). A binding value is a template over the bundle's *own* parameters,
+    /// so a reference to a non-existent one threads nothing — the author's intent
+    /// silently fails. Rejected at the read boundary, before resolve.
+    #[error(
+        "bundle {bundle}: include {member} binds against {{{param}}}, which is not a parameter of the bundle"
+    )]
+    UnknownBundleParam {
+        /// The bundle id carrying the binding.
+        bundle: String,
+        /// The member the binding targets.
+        member: String,
+        /// The bundle-parameter name the binding template referenced.
+        param: String,
+    },
+    /// An include binding names a member parameter the member does not have
+    /// (`{ id = "m", nope = "{app}" }` where `m` has no `{nope}` placeholder).
+    /// The binding would feed a value into a placeholder that does not exist —
+    /// dead config that silently grants nothing. Rejected before resolve.
+    #[error(
+        "bundle {bundle}: include {member} binds parameter {param}, which the member does not use"
+    )]
+    OrphanIncludeBinding {
+        /// The bundle id carrying the binding.
+        bundle: String,
+        /// The member the binding targets.
+        member: String,
+        /// The member-parameter name that matches no member placeholder.
+        param: String,
+    },
+    /// A bound member has a `{placeholder}` that no include binding fills (and
+    /// that the bundle does not otherwise supply). A bundle's role-facing surface
+    /// is only its own `[params.*]`; member parameters are internal and reachable
+    /// only through a binding, so a member placeholder left unbound could never be
+    /// filled — the expansion would carry a literal `{placeholder}` into a root
+    /// primitive. Rejected before resolve, fail-closed.
+    #[error(
+        "bundle {bundle}: include {member} leaves member parameter {{{param}}} unbound; \
+         a parametrized include must bind every member placeholder"
+    )]
+    UnboundMemberParam {
+        /// The bundle id carrying the binding.
+        bundle: String,
+        /// The member with the unbound placeholder.
+        member: String,
+        /// The member-placeholder name left unbound.
+        param: String,
+    },
+    /// A bundle includes a member that is itself a parametrized bundle (its
+    /// resolution carries un-substituted bound members). This applies to BOTH
+    /// include forms: a bound include `{ id = "...", p = "..." }` and a bare
+    /// include `"..."` of such a bundle are equally rejected. Nested/transitive
+    /// param-mapping is out of scope for v1: it would require per-level binding
+    /// scopes the engine does not model, so a bundle may include only leaf or
+    /// unparametrized members. Rejected rather than silently dropping the inner
+    /// bindings (a bound include) or under-granting the inner bound members (a
+    /// bare include). The fix is to bind the inner bundle's members directly.
+    #[error(
+        "bundle {bundle}: include {member} is itself a parametrized bundle; \
+         nested parameter mapping is not supported"
+    )]
+    NestedParamMapping {
+        /// The outer bundle id.
+        bundle: String,
+        /// The member that is itself a parametrized bundle.
+        member: String,
+    },
+    /// A bundle's binding fan-out and a member's internal list parameter would
+    /// together produce more than one list dimension across the whole expansion.
+    /// Census expands a single list by emitting one rendered copy per element; two
+    /// independent list dimensions (a bundle list parameter threaded into a
+    /// member that also takes a list, or a binding template referencing two list
+    /// bundle parameters) would require a cartesian product whose blast radius is
+    /// rarely intended. At most one list dimension per bundle expansion, rejected
+    /// here rather than silently multiplying root grants.
+    #[error(
+        "bundle {bundle}: more than one list dimension across the expansion ({first}, {second}); \
+         at most one list parameter is supported per bundle expansion"
+    )]
+    MultipleExpansionLists {
+        /// The bundle being expanded.
+        bundle: String,
+        /// The first list dimension seen (a bundle or member parameter name).
+        first: String,
+        /// The second list dimension that triggered the error.
+        second: String,
+    },
 }
 
 /// Maximum number of nested bundle includes expanded from a single root before
@@ -2252,6 +2610,9 @@ pub fn resolve_leaf(
             category_members: Vec::new(),
             resolved_catalog_version: None,
             params,
+            // A leaf resolve never expands bindings (it has no `includes`); the
+            // bundle resolve attaches bound members.
+            bound_members: Vec::new(),
         },
         warnings,
     ))
@@ -2274,6 +2635,7 @@ pub(crate) fn union_file_grants(
         let source = SourcedFileGrant {
             layer,
             via: via.map(str::to_owned),
+            binding: None,
         };
         if let Some(existing) = out.iter_mut().find(|g| g.path == grant.path) {
             existing.access |= grant.access;
@@ -2349,6 +2711,7 @@ fn apply_list_override(
                     layer: layer.to_owned(),
                     via: via.map(str::to_owned),
                     runas: None,
+                    binding: None,
                 });
             }
         }
@@ -2359,6 +2722,7 @@ fn apply_list_override(
                     layer: layer.to_owned(),
                     via: via.map(str::to_owned),
                     runas: None,
+                    binding: None,
                 });
             }
         }
@@ -2389,8 +2753,8 @@ fn aggregation_for(
     id: &str,
     chain: &[String],
     catalog: &dyn CatalogSource,
-) -> Result<(Vec<String>, Vec<String>), CatalogError> {
-    let mut includes: Vec<String> = Vec::new();
+) -> Result<(Vec<Include>, Vec<String>), CatalogError> {
+    let mut includes: Vec<Include> = Vec::new();
     let mut categories: Vec<String> = Vec::new();
     for layer in chain {
         for def in catalog.read_layer(layer)? {
@@ -2398,7 +2762,15 @@ fn aggregation_for(
                 continue;
             }
             for inc in def.includes {
-                if !includes.contains(&inc) {
+                // Dedup must be binding-aware: two table-includes of the same
+                // member id with DIFFERENT bindings are two distinct expansions
+                // (e.g. the same `service-control` bound to two different units),
+                // not a duplicate. Collapsing them by id alone would silently drop
+                // one expansion. An exact (id + bindings) repeat is a true dup.
+                if !includes
+                    .iter()
+                    .any(|e| e.id == inc.id && e.bindings == inc.bindings)
+                {
                     includes.push(inc);
                 }
             }
@@ -2533,10 +2905,25 @@ fn resolve_inner(
         category_members.push((cat.clone(), members));
     }
 
-    // Explicit includes first, then category-materialized members. Dedup so a
-    // member named both explicitly and via a category is expanded once.
+    // Split explicit includes into *bare* (no bindings — flattened into the
+    // bundle's own primitives, exactly as before) and *bound* (a parameter
+    // binding — resolved but carried un-substituted for the two-stage
+    // expansion in `resolve_with_params`). A bare include and a
+    // category-materialized member are both plain ids.
+    let mut bare_members: Vec<String> = Vec::new();
+    let mut bound_includes: Vec<Include> = Vec::new();
+    for inc in &includes {
+        if inc.is_bound() {
+            bound_includes.push(inc.clone());
+        } else if !bare_members.contains(&inc.id) {
+            bare_members.push(inc.id.clone());
+        }
+    }
+
+    // Explicit bare includes first, then category-materialized members. Dedup so
+    // a member named both explicitly and via a category is expanded once.
     let mut members: Vec<String> = Vec::new();
-    for m in includes.iter().chain(materialized.iter()) {
+    for m in bare_members.iter().chain(materialized.iter()) {
         if !members.contains(m) {
             members.push(m.clone());
         }
@@ -2554,6 +2941,22 @@ fn resolve_inner(
     for member in &members {
         let (resolved, member_warnings) = resolve_inner(member, os, catalog, ctx, path)?;
         warnings.extend(member_warnings);
+
+        // A bare include of a permission that itself param-maps (its resolution
+        // carries un-substituted bound members) must fail closed, exactly as the
+        // bound-include path does below. Flattening only this permission's own
+        // primitives would silently drop the included bundle's bound members —
+        // under-granting without a word. Nested/transitive param-mapping is out
+        // of scope for v1, so reject it here too rather than carrying a parametrized
+        // bundle's bindings through a bare include. The author's fix is to bind the
+        // included bundle's members directly. (Leaves like service-control /
+        // service-observe have no bound members and pass through unaffected.)
+        if !resolved.bound_members.is_empty() {
+            return Err(CatalogError::NestedParamMapping {
+                bundle: id.to_owned(),
+                member: member.clone(),
+            });
+        }
 
         match resolved.risk {
             Some(r) => {
@@ -2613,6 +3016,94 @@ fn resolve_inner(
         }
     }
 
+    // Table-form includes split into two classes by whether ANY binding value
+    // references a bundle `{param}`:
+    //
+    // * **Purely literal** (`{ id = "service-control", units = "nginx" }`): every
+    //   binding value is a concrete string, so the member can be rendered NOW with
+    //   no role input. It is expanded eagerly here and its primitives flattened
+    //   into the bundle, exactly like a bare include — so plain `resolve()` (no
+    //   params) returns the concrete grants. This is what the curated per-app
+    //   packages use, and is the path catalog-wide consumers (coverage /
+    //   reverse-lookup, which call `resolve()` without params) depend on.
+    // * **References a bundle `{param}`** (`{ id = "service-control", units =
+    //   "{app}" }`, e.g. app-scope): the value cannot be rendered until the role
+    //   supplies the parameter, so it is carried DEFERRED in `bound_members` and
+    //   expanded by `resolve_with_params`. `resolve()` without that param legitimately
+    //   cannot render it.
+    //
+    // Either way the member's risk folds into the bundle risk now: a member never
+    // lowers the aggregate's honest risk just because its expansion is deferred.
+    let mut bound_members: Vec<BoundMember> = Vec::new();
+    for inc in bound_includes {
+        let (resolved, member_warnings) = resolve_inner(&inc.id, os, catalog, ctx, path)?;
+        warnings.extend(member_warnings);
+
+        // Nested param-mapping is out of scope for v1: a member that is itself a
+        // parametrized bundle (it carries its own bound members) would require
+        // transitive, per-level binding scopes the engine does not model. Reject it
+        // for BOTH classes — a literal-bound include of a param-mapping bundle is as
+        // unsupported as a deferred one — rather than silently dropping its bindings.
+        if !resolved.bound_members.is_empty() {
+            return Err(CatalogError::NestedParamMapping {
+                bundle: id.to_owned(),
+                member: inc.id.clone(),
+            });
+        }
+
+        match resolved.risk {
+            Some(r) => {
+                max_known_risk = Some(match max_known_risk {
+                    Some(acc) => acc.max(r),
+                    None => r,
+                });
+            }
+            None => any_member_unknown = true,
+        }
+
+        // A binding value referencing a bundle param keeps the include deferred;
+        // a binding set that is entirely concrete is rendered now.
+        let references_bundle_param = inc
+            .bindings
+            .values()
+            .any(|template| has_placeholder(template));
+
+        if references_bundle_param {
+            bound_members.push(BoundMember {
+                include: inc,
+                member: resolved,
+            });
+        } else {
+            // Eager expansion: render the literal bindings and flatten the member's
+            // primitives into the bundle. A purely-literal binding consumes NO
+            // bundle parameter, so guard 1 (bundle-constraint on the binding INPUT)
+            // has nothing to check — `expand_bound_member` is called with empty
+            // bundle params/constraints. Guard 2 (the member's OWN constraint + the
+            // static sudo/path gates on each rendered value) still runs inside
+            // `expand_bound_member`. Provenance (`via` member id + `binding`
+            // `param=value`) is stamped identically to the deferred path.
+            let bound = BoundMember {
+                include: inc,
+                member: resolved,
+            };
+            let empty_params: std::collections::BTreeMap<String, ParamValue> =
+                std::collections::BTreeMap::new();
+            let empty_constraints: std::collections::BTreeMap<String, ParamConstraint> =
+                std::collections::BTreeMap::new();
+            let mut ignored_used: Vec<String> = Vec::new();
+            let (mut g, mut s, mut f) = expand_bound_member(
+                id,
+                &bound,
+                &empty_params,
+                &empty_constraints,
+                &mut ignored_used,
+            )?;
+            union_member_primitives(&mut groups, std::mem::take(&mut g), &bound.include.id);
+            union_member_primitives(&mut sudo, std::mem::take(&mut s), &bound.include.id);
+            union_member_file_grants(&mut file_grants, std::mem::take(&mut f), &bound.include.id);
+        }
+    }
+
     path.pop();
 
     // Fold "unknown" conservatively to the highest risk. So the computed
@@ -2658,6 +3149,7 @@ fn resolve_inner(
             category_members,
             resolved_catalog_version: ctx.catalog_version.clone(),
             params,
+            bound_members,
         },
         warnings,
     ))
@@ -2857,12 +3349,25 @@ pub fn resolve_with_params(
     // Track which params actually fill a placeholder so unused ones can warn.
     let mut used_params: Vec<String> = Vec::new();
 
+    // Bound members (parametrized includes) are carried un-substituted; pull them
+    // out so the bundle's own primitives substitute against the bundle's own
+    // params first, then each bound member expands through its bindings below.
+    let bound_members = std::mem::take(&mut resolved.bound_members);
+
     // The per-parameter constraints in effect for this resolved permission (see
     // `ResolvedPermission::params`). Each substituted value is checked against
     // its name's constraint inside `render_template`, BEFORE the static
     // sudo/path gates below. Taken out so the field can be borrowed while the
     // primitive vectors are moved through the substitution helpers.
     let constraints = std::mem::take(&mut resolved.params);
+
+    // One-list invariant across the WHOLE bundle expansion (not just per template
+    // string). The bundle's own/bare-member templates fan a list bundle param
+    // inside `render_template`; a binding fan-out fans a (possibly different) list
+    // bundle param at the include layer. No single render sees both, so a
+    // top-level check here rejects two independent list dimensions before either
+    // path silently produces an unintended cartesian.
+    enforce_single_expansion_list(&resolved, &bound_members, params)?;
 
     resolved.groups = substitute_primitives(
         &resolved.id,
@@ -2887,6 +3392,35 @@ pub fn resolve_with_params(
         &constraints,
         &mut used_params,
     )?;
+
+    // Expand each bound member: render its bindings with the bundle's params
+    // (guard 1), then substitute the member against ITS OWN constraints (guard 2).
+    // The two scopes stay distinct — `constraints` is the bundle's, the member's
+    // own `[params.*]` ride on `bound.member.params` — so neither guard is
+    // skipped or conflated.
+    for bound in bound_members {
+        let (mut g, mut s, mut f) =
+            expand_bound_member(&resolved.id, &bound, params, &constraints, &mut used_params)?;
+        // Merge the member's expanded primitives into the bundle exactly as the
+        // bare-member union does: dedup groups/sudo by (value, runas), union file
+        // grants by path.
+        union_member_primitives(
+            &mut resolved.groups,
+            std::mem::take(&mut g),
+            &bound.include.id,
+        );
+        union_member_primitives(
+            &mut resolved.sudo,
+            std::mem::take(&mut s),
+            &bound.include.id,
+        );
+        union_member_file_grants(
+            &mut resolved.file_grants,
+            std::mem::take(&mut f),
+            &bound.include.id,
+        );
+    }
+
     resolved.params = constraints;
 
     for key in params.keys() {
@@ -2899,6 +3433,297 @@ pub fn resolve_with_params(
     }
 
     Ok((resolved, warnings))
+}
+
+/// Reject a bundle expansion that would fan out over more than one list
+/// dimension (the one-list invariant, applied across the whole expansion).
+///
+/// `render_template` already rejects two list parameters inside a single template
+/// string, but a parametrized bundle fans on two separate layers: the bundle's
+/// own/bare-member templates, and each bound member's binding templates. A list
+/// bundle parameter used in either layer is one fan-out dimension; two distinct
+/// list dimensions across the whole expansion would silently multiply root
+/// grants. This collects every list-valued bundle parameter actually consumed —
+/// by the bundle's own substituted templates and by every binding — and refuses
+/// once a second distinct one appears.
+fn enforce_single_expansion_list(
+    resolved: &ResolvedPermission,
+    bound_members: &[BoundMember],
+    params: &std::collections::BTreeMap<String, ParamValue>,
+) -> Result<(), CatalogError> {
+    // Only a parametrized bundle (one with bound members) needs this cross-layer
+    // check: it is the sole construct that fans out on two independent layers.
+    // Without bound members, a single template's two-list case is already the
+    // authoritative `render_template` `MultipleListParams` path, and reproducing
+    // it here would only change that error's variant. Leave it untouched.
+    if bound_members.is_empty() {
+        return Ok(());
+    }
+
+    // A bundle parameter is a list dimension iff the role supplied it as an array.
+    let is_list = |name: &str| matches!(params.get(name), Some(ParamValue::Array(_)));
+
+    let mut seen: Option<String> = None;
+    let mut check = |name: &str| -> Result<(), CatalogError> {
+        if !is_list(name) {
+            return Ok(());
+        }
+        match &seen {
+            Some(first) if first == name => Ok(()),
+            Some(first) => Err(CatalogError::MultipleExpansionLists {
+                bundle: resolved.id.clone(),
+                first: first.clone(),
+                second: name.to_owned(),
+            }),
+            None => {
+                seen = Some(name.to_owned());
+                Ok(())
+            }
+        }
+    };
+
+    // The bundle's own + bare-member templates (already merged into the flat
+    // vectors) reference bundle params directly.
+    for prim in resolved.groups.iter().chain(resolved.sudo.iter()) {
+        for name in extract_placeholders(&prim.value) {
+            check(name)?;
+        }
+    }
+    for grant in &resolved.file_grants {
+        for name in extract_placeholders(&grant.path) {
+            check(name)?;
+        }
+    }
+    // Each binding template references bundle params; a binding consuming two
+    // distinct list bundle params (`"{apps}-{envs}"`) trips the same check.
+    for bound in bound_members {
+        for template in bound.include.bindings.values() {
+            for name in extract_placeholders(template) {
+                check(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The expanded primitives a bound member contributes: groups, sudo, file grants.
+type ExpandedMember = (
+    Vec<SourcedPrimitive>,
+    Vec<SourcedPrimitive>,
+    Vec<ResolvedFileGrant>,
+);
+
+/// One fan-out instance of a bound member's bindings: the member's concrete
+/// parameter map plus a `param=value` provenance summary for audit.
+type RenderedBinding = (std::collections::BTreeMap<String, ParamValue>, String);
+
+/// Expand one bound member into its `(groups, sudo, file_grants)`.
+///
+/// Two stages, two guards:
+///
+/// 1. **Guard 1 (bundle side).** Each binding value is a template over the
+///    bundle's parameters. Render it with `bundle_params`, and for every bundle
+///    parameter the template consumes explicitly check the bundle constraint
+///    (`bundle_constraints`) and [`param_value_defect`]. This is NOT free: a
+///    bundle parameter that appears only inside a binding would otherwise reach
+///    this render unchecked (the bundle's own templates never mention it), so the
+///    check is wired here rather than relying on the bundle's own substitution.
+/// 2. **Guard 2 (member side).** The rendered binding values become the member's
+///    concrete parameters, and the member's primitives are substituted against
+///    the member's OWN constraints (`bound.member.params`) and static gates.
+///
+/// A bundle *list* parameter threaded through a binding fans the whole member out
+/// per element; the one-list invariant across the expansion is enforced upstream
+/// by [`enforce_single_expansion_list`].
+fn expand_bound_member(
+    bundle: &str,
+    bound: &BoundMember,
+    bundle_params: &std::collections::BTreeMap<String, ParamValue>,
+    bundle_constraints: &std::collections::BTreeMap<String, ParamConstraint>,
+    used_params: &mut Vec<String>,
+) -> Result<ExpandedMember, CatalogError> {
+    let member_id = &bound.include.id;
+
+    // Completeness: every binding key must be a member parameter, and every
+    // member placeholder must be bound. The member's parameter surface is its own
+    // `[params.*]` (one entry per placeholder, guaranteed by the member's own
+    // parse-time validation). A role can reach member parameters ONLY through
+    // bindings, so an unbound member placeholder could never be filled.
+    for binding_key in bound.include.bindings.keys() {
+        if !bound.member.params.contains_key(binding_key) {
+            return Err(CatalogError::OrphanIncludeBinding {
+                bundle: bundle.to_owned(),
+                member: member_id.clone(),
+                param: binding_key.clone(),
+            });
+        }
+    }
+    for member_param in bound.member.params.keys() {
+        if !bound.include.bindings.contains_key(member_param) {
+            return Err(CatalogError::UnboundMemberParam {
+                bundle: bundle.to_owned(),
+                member: member_id.clone(),
+                param: member_param.clone(),
+            });
+        }
+    }
+
+    // Render the bindings into the member's concrete parameters. A scalar bundle
+    // param yields one member-param map; a single list bundle param fans the
+    // member out into one map per element (the one-list invariant guarantees at
+    // most one list dimension across the whole expansion). Each rendered map also
+    // carries a human-readable `param=value` summary for provenance.
+    let fanned = render_bindings(
+        bundle,
+        member_id,
+        &bound.include.bindings,
+        bundle_params,
+        bundle_constraints,
+        used_params,
+    )?;
+
+    let mut out_groups: Vec<SourcedPrimitive> = Vec::new();
+    let mut out_sudo: Vec<SourcedPrimitive> = Vec::new();
+    let mut out_files: Vec<ResolvedFileGrant> = Vec::new();
+
+    for (member_params, provenance) in fanned {
+        // Guard 2: substitute the member's own primitives against the member's
+        // own constraints and static gates. A bound value that satisfies the
+        // bundle constraint but violates the member's (or fails the member's
+        // path/sudo gate) fails closed here.
+        let mut member_used: Vec<String> = Vec::new();
+        let mut g = substitute_primitives(
+            member_id,
+            bound.member.groups.clone(),
+            &member_params,
+            &bound.member.params,
+            &mut member_used,
+            false,
+        )?;
+        let mut s = substitute_primitives(
+            member_id,
+            bound.member.sudo.clone(),
+            &member_params,
+            &bound.member.params,
+            &mut member_used,
+            true,
+        )?;
+        let mut f = substitute_file_grants(
+            member_id,
+            bound.member.file_grants.clone(),
+            &member_params,
+            &bound.member.params,
+            &mut member_used,
+        )?;
+
+        // Stamp the binding provenance onto each expanded primitive so audit can
+        // show `via <member> (param=value)`. Provenance only — never a drift key.
+        for p in g.iter_mut().chain(s.iter_mut()) {
+            p.binding = Some(provenance.clone());
+        }
+        for grant in &mut f {
+            for src in &mut grant.sources {
+                src.binding = Some(provenance.clone());
+            }
+        }
+
+        out_groups.append(&mut g);
+        out_sudo.append(&mut s);
+        out_files.append(&mut f);
+    }
+
+    Ok((out_groups, out_sudo, out_files))
+}
+
+/// Render a member's bindings into one or more concrete member-parameter maps.
+///
+/// Each binding value is a template over the *bundle's* parameters. Scalars
+/// produce a single map; one list bundle parameter (threaded through any binding)
+/// fans into one map per element. Returns each map paired with a `param=value`
+/// provenance summary.
+///
+/// Guard 1 lives here: for every bundle parameter a binding consumes, the value
+/// is explicitly checked against the bundle constraint and [`param_value_defect`]
+/// before it is spliced — so a bundle parameter used only in a binding is still
+/// constrained, not silently trusted.
+fn render_bindings(
+    bundle: &str,
+    member: &str,
+    bindings: &std::collections::BTreeMap<String, String>,
+    bundle_params: &std::collections::BTreeMap<String, ParamValue>,
+    bundle_constraints: &std::collections::BTreeMap<String, ParamConstraint>,
+    used_params: &mut Vec<String>,
+) -> Result<Vec<RenderedBinding>, CatalogError> {
+    // Discover the single list bundle parameter (if any) any binding consumes, and
+    // its elements. Scalars are resolved once; the list, if present, drives the
+    // fan-out. `render_template` is reused so guard 1 (constraint + value gate)
+    // runs identically to the bundle's own templates — including on a parameter no
+    // bundle-own template ever mentions.
+    //
+    // Determine the fan-out width: 1 for an all-scalar binding set, or the list
+    // length. The list parameter is identified by scanning binding placeholders.
+    let mut list_len: Option<usize> = None;
+    let mut list_name: Option<String> = None;
+    for template in bindings.values() {
+        for name in extract_placeholders(template) {
+            if let Some(ParamValue::Array(items)) = bundle_params.get(name) {
+                // A second distinct list parameter is rejected upstream by
+                // `enforce_single_expansion_list`; here we just record the one.
+                list_len = Some(items.len());
+                list_name = Some(name.to_owned());
+            }
+        }
+    }
+
+    let width = list_len.unwrap_or(1);
+    let mut out = Vec::with_capacity(width);
+
+    for index in 0..width {
+        let mut member_params: std::collections::BTreeMap<String, ParamValue> =
+            std::collections::BTreeMap::new();
+        // For the fan-out element, present the list parameter as a single scalar
+        // so each binding renders to exactly one string for this element.
+        let mut element_params = bundle_params.clone();
+        if let Some(name) = &list_name {
+            if let Some(ParamValue::Array(items)) = bundle_params.get(name) {
+                // `index` is in `0..items.len()` (width is the list length), so
+                // the element is always present; `get` keeps the access panic-free.
+                if let Some(element) = items.get(index) {
+                    element_params.insert(name.clone(), element.clone());
+                }
+            }
+        }
+
+        let mut summary_parts: Vec<String> = Vec::new();
+        for (member_param, template) in bindings {
+            // Guard 1: render the binding with the bundle's params, checking each
+            // consumed bundle param against the bundle constraint + value gate.
+            // A binding-only bundle param is therefore constrained right here.
+            let rendered = render_template(
+                bundle,
+                template,
+                &element_params,
+                bundle_constraints,
+                used_params,
+            )?;
+            // With the list flattened to a scalar above, each binding renders to
+            // exactly one string.
+            let [value] = rendered.as_slice() else {
+                // A binding template that still expands to multiple values would
+                // mean a second list dimension slipped past the upstream guard.
+                return Err(CatalogError::MultipleExpansionLists {
+                    bundle: bundle.to_owned(),
+                    first: list_name.as_deref().unwrap_or_default().to_owned(),
+                    second: format!("binding {member}.{member_param}"),
+                });
+            };
+            summary_parts.push(format!("{member_param}={value}"));
+            member_params.insert(member_param.clone(), ParamValue::String(value.clone()));
+        }
+        out.push((member_params, summary_parts.join(", ")));
+    }
+
+    Ok(out)
 }
 
 /// Apply parameter substitution to one primitive list (groups or sudo).
@@ -2940,6 +3765,10 @@ fn substitute_primitives(
                 // templated sudo command keeps the run-as account of the
                 // permission that declared it (`runas` is not itself templated).
                 runas: prim.runas.clone(),
+                // Preserve any binding provenance attached upstream (a bound
+                // member's primitive carries `param=value`); a non-bound
+                // primitive keeps `None`.
+                binding: prim.binding.clone(),
             });
         }
     }
@@ -3103,11 +3932,13 @@ fn render_template(
                 // Validate every element and collect them; reject a second list.
                 let mut elems: Vec<String> = Vec::new();
                 for item in items {
-                    let s = scalar_param_string(item).ok_or(CatalogError::InvalidParamValue {
-                        permission: permission.to_owned(),
-                        param: name.clone(),
-                        value: format!("{item:?}"),
-                        reason: "list element is not a scalar value",
+                    let s = scalar_param_string(item).ok_or_else(|| {
+                        CatalogError::InvalidParamValue {
+                            permission: permission.to_owned(),
+                            param: name.clone(),
+                            value: format!("{item:?}"),
+                            reason: "list element is not a scalar value",
+                        }
                     })?;
                     if let Some(reason) = param_value_defect(&s) {
                         return Err(CatalogError::InvalidParamValue {
@@ -3132,12 +3963,13 @@ fn render_template(
                 list_param = Some((name.clone(), elems));
             }
             other => {
-                let s = scalar_param_string(other).ok_or(CatalogError::InvalidParamValue {
-                    permission: permission.to_owned(),
-                    param: name.clone(),
-                    value: format!("{other:?}"),
-                    reason: "parameter value is not a scalar (string/int/float/bool)",
-                })?;
+                let s =
+                    scalar_param_string(other).ok_or_else(|| CatalogError::InvalidParamValue {
+                        permission: permission.to_owned(),
+                        param: name.clone(),
+                        value: format!("{other:?}"),
+                        reason: "parameter value is not a scalar (string/int/float/bool)",
+                    })?;
                 if let Some(reason) = param_value_defect(&s) {
                     return Err(CatalogError::InvalidParamValue {
                         permission: permission.to_owned(),
@@ -3254,7 +4086,13 @@ include_categories = ["network"]
 "#,
         )
         .unwrap();
-        assert_eq!(def.includes, vec!["network-diag", "network-admin"]);
+        assert_eq!(
+            def.includes,
+            vec![
+                Include::bare("network-diag"),
+                Include::bare("network-admin")
+            ]
+        );
         assert_eq!(def.include_categories, vec!["network"]);
     }
 
@@ -3656,7 +4494,7 @@ include_categories = ["network"]
                 PermissionDef {
                     // The bundle carries its own primitive too.
                     sudo: ListOverride::Replace(vec!["/usr/bin/tcpdump".to_owned()]),
-                    includes: vec!["network-diag".to_owned(), "network-admin".to_owned()],
+                    includes: vec!["network-diag".into(), "network-admin".into()],
                     ..def("network-config")
                 },
             );
@@ -3719,7 +4557,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["svc-token".to_owned(), "svc-enum".to_owned()],
+                    includes: vec!["svc-token".into(), "svc-enum".into()],
                     ..def("svc-bundle")
                 },
             );
@@ -3764,7 +4602,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["svc-a".to_owned(), "svc-b".to_owned()],
+                    includes: vec!["svc-a".into(), "svc-b".into()],
                     ..def("svc-bundle")
                 },
             );
@@ -3810,7 +4648,7 @@ include_categories = ["network"]
                     // The bundle's own command, under the bundle's own run-spec.
                     sudo: ListOverride::Replace(vec!["/usr/bin/own-tool".to_owned()]),
                     runas: Some("ops".to_owned()),
-                    includes: vec!["db-tool".to_owned()],
+                    includes: vec!["db-tool".into()],
                     ..def("toolbox")
                 },
             );
@@ -3864,7 +4702,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["a".to_owned(), "b".to_owned()],
+                    includes: vec!["a".into(), "b".into()],
                     ..def("bundle")
                 },
             );
@@ -3888,7 +4726,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["leaf".to_owned()],
+                    includes: vec!["leaf".into()],
                     sudo: ListOverride::Replace(vec!["/usr/bin/mid-cmd".to_owned()]),
                     ..def("mid")
                 },
@@ -3896,7 +4734,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["mid".to_owned()],
+                    includes: vec!["mid".into()],
                     ..def("outer")
                 },
             );
@@ -3916,14 +4754,14 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["b".to_owned()],
+                    includes: vec!["b".into()],
                     ..def("a")
                 },
             )
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["a".to_owned()],
+                    includes: vec!["a".into()],
                     ..def("b")
                 },
             );
@@ -3952,7 +4790,7 @@ include_categories = ["network"]
             let id = format!("p{i}");
             let def = if i + 1 < len {
                 PermissionDef {
-                    includes: vec![format!("p{}", i + 1)],
+                    includes: vec![format!("p{}", i + 1).into()],
                     ..def(&id)
                 }
             } else {
@@ -3988,7 +4826,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["leaf".to_owned()],
+                    includes: vec!["leaf".into()],
                     ..def("bundle")
                 },
             );
@@ -4111,7 +4949,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["low".to_owned(), "high".to_owned()],
+                    includes: vec!["low".into(), "high".into()],
                     ..def("bundle")
                 },
             );
@@ -4135,7 +4973,7 @@ include_categories = ["network"]
                 PermissionDef {
                     // Bundle under-states the member's escalation risk.
                     risk: Some(Risk::Contained),
-                    includes: vec!["high".to_owned()],
+                    includes: vec!["high".into()],
                     ..def("bundle")
                 },
             );
@@ -4166,7 +5004,7 @@ include_categories = ["network"]
                 "linux",
                 PermissionDef {
                     risk: Some(Risk::EscalationCapable),
-                    includes: vec!["high".to_owned()],
+                    includes: vec!["high".into()],
                     ..def("bundle")
                 },
             );
@@ -4187,7 +5025,7 @@ include_categories = ["network"]
                 "linux",
                 PermissionDef {
                     risk: Some(Risk::EscalationCapable),
-                    includes: vec!["low".to_owned()],
+                    includes: vec!["low".into()],
                     ..def("bundle")
                 },
             );
@@ -4213,7 +5051,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["undeclared".to_owned(), "high".to_owned()],
+                    includes: vec!["undeclared".into(), "high".into()],
                     ..def("bundle")
                 },
             );
@@ -4229,7 +5067,7 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["m1".to_owned(), "m2".to_owned()],
+                    includes: vec!["m1".into(), "m2".into()],
                     ..def("bundle")
                 },
             );
@@ -4248,7 +5086,7 @@ include_categories = ["network"]
             "linux",
             PermissionDef {
                 risk: Some(Risk::Contained),
-                includes: vec!["undeclared".to_owned()],
+                includes: vec!["undeclared".into()],
                 ..def("bundle")
             },
         );
@@ -5558,7 +6396,7 @@ access = ["append"]
             .with(
                 "linux",
                 PermissionDef {
-                    includes: vec!["svc-implicit".to_owned(), "svc-explicit".to_owned()],
+                    includes: vec!["svc-implicit".into(), "svc-explicit".into()],
                     ..def("svc-bundle")
                 },
             );
@@ -6279,5 +7117,771 @@ deny_glob = false
             "id = \"svc\"\nsudo = [\"/x {u}\"]\n[params.u]\nkind = \"token\"\nbogus = 1\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn segment_constraint_parses_from_toml() {
+        // The `[params.<name>]` surface accepts `kind = "segment"` with an
+        // optional `max_len`, and a bare segment (no max_len) deserializes to the
+        // defaulted-None form.
+        let def: PermissionDef = toml::from_str(
+            r#"
+id = "app-config"
+[[file]]
+path = "/etc/{app}"
+access = "rw"
+recursive = true
+[params.app]
+kind = "segment"
+max_len = 64
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            def.params.get("app"),
+            Some(ParamConstraint::Segment { max_len: Some(64) })
+        ));
+
+        let def_bare: PermissionDef =
+            toml::from_str("id = \"a\"\nsudo = [\"/x {s}\"]\n[params.s]\nkind = \"segment\"\n")
+                .unwrap();
+        assert!(matches!(
+            def_bare.params.get("s"),
+            Some(ParamConstraint::Segment { max_len: None })
+        ));
+
+        // A non-integer max_len is rejected by deserialization.
+        assert!(toml::from_str::<PermissionDef>(
+            "id = \"a\"\nsudo = [\"/x {s}\"]\n[params.s]\nkind = \"segment\"\nmax_len = \"big\"\n"
+        )
+        .is_err());
+
+        // An unknown key inside a segment constraint is rejected
+        // (deny_unknown_fields, like every other kind).
+        assert!(toml::from_str::<PermissionDef>(
+            "id = \"a\"\nsudo = [\"/x {s}\"]\n[params.s]\nkind = \"segment\"\nbogus = 1\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn segment_value_defect_accepts_and_rejects() {
+        // A segment value is a single safe path component that doubles as a plain
+        // name: ASCII alphanumerics plus `.`, `_`, `-` only.
+        let c = ParamConstraint::Segment { max_len: None };
+        // Accepted: capitalised app name, hyphen+digit, dotted, underscored.
+        for ok in ["Supervisor", "app-1", "foo.bar", "a_b", "x"] {
+            assert!(
+                c.value_defect(ok).is_none(),
+                "expected {ok:?} to pass the segment charset"
+            );
+        }
+        // Rejected: a path separator turns one segment into two (or a traversal),
+        // and the `.`/`..` components and the empty value must never reach a path.
+        for (bad, frag) in [
+            ("foo/bar", "charset"),
+            ("../x", "charset"),
+            ("a\\b", "charset"),
+            ("a:b", "charset"),
+            ("a@b", "charset"),
+            ("..", "`.` or `..`"),
+            (".", "`.` or `..`"),
+            ("", "empty"),
+        ] {
+            assert!(
+                c.value_defect(bad).is_some_and(|r| r.contains(frag)),
+                "expected {bad:?} to be rejected mentioning {frag:?}"
+            );
+        }
+        // A control character is outside the charset.
+        assert!(c.value_defect("a\u{7}b").is_some());
+
+        // The length bound is enforced.
+        let c4 = ParamConstraint::Segment { max_len: Some(4) };
+        assert!(c4.value_defect("abcd").is_none());
+        assert!(c4
+            .value_defect("abcde")
+            .is_some_and(|r| r.contains("max_len")));
+    }
+
+    #[test]
+    fn segment_constraint_resolves_into_path_and_token() {
+        // One segment value safely fills both a path component and a sudo token.
+        let mut p = std::collections::BTreeMap::new();
+        p.insert("app".to_owned(), ParamConstraint::Segment { max_len: None });
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/bin/systemctl restart {app}".to_owned()]),
+                params: p,
+                ..file_def("app-scope", vec![grant("/etc/{app}", Access::RW, true)])
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let ok = params(vec![("app", toml::Value::String("Supervisor".to_owned()))]);
+        let (r, _) = resolve_with_params("app-scope", &ok, &os, &cat, &ctx()).unwrap();
+        assert_eq!(r.file_grants[0].path, "/etc/Supervisor");
+        assert_eq!(r.sudo[0].value, "/usr/bin/systemctl restart Supervisor");
+
+        // A traversal value is refused at the segment gate, before any path gate.
+        let bad = params(vec![("app", toml::Value::String("../etc".to_owned()))]);
+        assert!(matches!(
+            resolve_with_params("app-scope", &bad, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::ParamConstraintViolation { ref param, .. } if param == "app"
+        ));
+    }
+
+    // --- Feature A: parametrized includes (param-mapping) ---------------------
+
+    /// A single-entry `params` map carrying a `segment`-kind constraint with no
+    /// length cap — the safe app-name kind for the param-mapping tests.
+    fn segment_param(name: &str) -> std::collections::BTreeMap<String, ParamConstraint> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(name.to_owned(), ParamConstraint::Segment { max_len: None });
+        m
+    }
+
+    /// A table-form include binding one member parameter to a template.
+    fn bound_inc(id: &str, member_param: &str, template: &str) -> Include {
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert(member_param.to_owned(), template.to_owned());
+        Include {
+            id: id.to_owned(),
+            bindings,
+        }
+    }
+
+    /// Build the canonical `app-scope` bundle catalog: `service-control` (binds
+    /// member `units` ← `{app}`) and `app-config-edit` (binds member `path` ←
+    /// `/etc/{app}`), under a bundle `segment` param `app`/`apps`.
+    fn app_scope_catalog() -> FakeCatalog {
+        FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec![
+                        "/usr/bin/systemctl restart {units}".to_owned()
+                    ]),
+                    params: token_param("units"),
+                    ..def("service-control")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    params: {
+                        let mut m = std::collections::BTreeMap::new();
+                        m.insert(
+                            "path".to_owned(),
+                            ParamConstraint::Path {
+                                allow_prefix: vec!["/etc/".to_owned()],
+                                deny_glob: Some(true),
+                                max_len: None,
+                            },
+                        );
+                        m
+                    },
+                    ..file_def("app-config-edit", vec![grant("{path}", Access::RW, false)])
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    includes: vec![
+                        bound_inc("service-control", "units", "{app}"),
+                        bound_inc("app-config-edit", "path", "/etc/{app}"),
+                    ],
+                    params: segment_param("app"),
+                    ..def("app-scope")
+                },
+            )
+    }
+
+    #[test]
+    fn param_mapping_threads_one_value_into_unit_and_path() {
+        // Lead test (guard 2 / H2): one `app` value resolves to a unit-restart sudo
+        // command and an /etc/<app> file grant — the path binding reaches the
+        // member path gate and passes (the `/` in `/etc/{app}` is NOT banned).
+        let cat = app_scope_catalog();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("app", toml::Value::String("Supervisor".to_owned()))]);
+        let (r, _) = resolve_with_params("app-scope", &p, &os, &cat, &ctx()).unwrap();
+
+        assert_eq!(
+            values(&r.sudo),
+            vec!["/usr/bin/systemctl restart Supervisor"]
+        );
+        assert_eq!(r.file_grants.len(), 1);
+        assert_eq!(r.file_grants[0].path, "/etc/Supervisor");
+
+        // Provenance: each bound primitive records the member (`via`) and the
+        // binding (`param=value`).
+        let unit = &r.sudo[0];
+        assert_eq!(unit.via.as_deref(), Some("service-control"));
+        assert_eq!(unit.binding.as_deref(), Some("units=Supervisor"));
+        let grant_src = &r.file_grants[0].sources[0];
+        assert_eq!(grant_src.via.as_deref(), Some("app-config-edit"));
+        assert_eq!(grant_src.binding.as_deref(), Some("path=/etc/Supervisor"));
+    }
+
+    #[test]
+    fn param_mapping_traversal_fails_closed_on_both_guards() {
+        // Guard 2 (path): `app="../x"` passes guard 1 only if `segment` allowed it
+        // — it does not (`/` and `..`). Even bypassing that, `/etc/../x` would be
+        // refused by the member path gate. Either way: fail closed.
+        let cat = app_scope_catalog();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("app", toml::Value::String("../x".to_owned()))]);
+        assert!(matches!(
+            resolve_with_params("app-scope", &p, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::ParamConstraintViolation { ref param, .. } if param == "app"
+        ));
+    }
+
+    #[test]
+    fn param_mapping_member_constraint_rejects_independently_of_guard_1() {
+        // Guard 2 in isolation: a bound value that PASSES the bundle constraint
+        // (guard 1) but is rejected by the MEMBER's own constraint. Every other
+        // rejection test trips guard 1 or a parse gate first; this one pins the
+        // member-side guard alone, so it cannot silently regress.
+        //
+        // `app="etc"` is a perfectly valid `segment` — guard 1 accepts it. The
+        // binding `/x/{app}` renders the member value `/x/etc`, which the member's
+        // own `[params.path]` (allow_prefix=["/etc/"]) rejects: `/x/etc` is not
+        // under `/etc/`. The error must therefore originate at the MEMBER scope.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    params: {
+                        let mut m = std::collections::BTreeMap::new();
+                        m.insert(
+                            "path".to_owned(),
+                            ParamConstraint::Path {
+                                allow_prefix: vec!["/etc/".to_owned()],
+                                deny_glob: Some(true),
+                                max_len: None,
+                            },
+                        );
+                        m
+                    },
+                    ..file_def("config-edit", vec![grant("{path}", Access::RW, false)])
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // Bundle param `app` is a segment; the binding prefixes a path
+                    // the member constraint will NOT admit. Guard 1 sees only the
+                    // segment value (`etc`), which it accepts.
+                    includes: vec![bound_inc("config-edit", "path", "/x/{app}")],
+                    params: segment_param("app"),
+                    ..def("bad-prefix")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        // `etc` passes the bundle segment gate (alnum-only, no `/`/`..`).
+        assert!(ParamConstraint::Segment { max_len: None }
+            .value_defect("etc")
+            .is_none());
+
+        let p = params(vec![("app", toml::Value::String("etc".to_owned()))]);
+        let err = resolve_with_params("bad-prefix", &p, &os, &cat, &ctx()).unwrap_err();
+        // The rejection names the MEMBER permission and its `path` parameter, and
+        // carries the MEMBER-scope rendered value (`/x/etc`) — proving it came from
+        // `expand_bound_member` → `substitute_file_grants` (guard 2), not from the
+        // bundle-scope guard 1 (which would name `bad-prefix`/`app`/`etc`).
+        assert!(
+            matches!(
+                &err,
+                CatalogError::ParamConstraintViolation { id, param, value, .. }
+                    if id == "config-edit" && param == "path" && value == "/x/etc"
+            ),
+            "expected a member-scope path-constraint violation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn param_mapping_binding_only_param_is_constraint_checked() {
+        // Lead test (guard 1 / C1): a bundle param used ONLY inside a binding (the
+        // bundle has no own template mentioning it) is still constraint-checked.
+        // A bad value fails closed — it does NOT slip through as `UnusedParam`.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec![
+                        "/usr/bin/systemctl restart {units}".to_owned()
+                    ]),
+                    params: token_param("units"),
+                    ..def("service-control")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // The bundle carries NO own template; `app` appears only in the
+                    // binding expression.
+                    includes: vec![bound_inc("service-control", "units", "{app}")],
+                    params: segment_param("app"),
+                    ..def("app-svc")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+
+        // A clean value resolves and is marked used (no UnusedParam warning).
+        let ok = params(vec![("app", toml::Value::String("Supervisor".to_owned()))]);
+        let (r, warnings) = resolve_with_params("app-svc", &ok, &os, &cat, &ctx()).unwrap();
+        assert_eq!(
+            values(&r.sudo),
+            vec!["/usr/bin/systemctl restart Supervisor"]
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, Warning::UnusedParam { param, .. } if param == "app")),
+            "a binding-consumed param must not warn as unused"
+        );
+
+        // A value the BUNDLE segment constraint rejects fails closed at guard 1 —
+        // proving the binding-only param is checked, not silently trusted.
+        let bad = params(vec![("app", toml::Value::String("a/b".to_owned()))]);
+        assert!(matches!(
+            resolve_with_params("app-svc", &bad, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::ParamConstraintViolation { ref param, .. } if param == "app"
+        ));
+    }
+
+    #[test]
+    fn param_mapping_list_fans_out_per_app() {
+        // A bundle LIST param (`apps`) fans the WHOLE bundle per element.
+        let cat = app_scope_catalog();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("app", arr(&["Supervisor", "gateway"]))]);
+        let (r, _) = resolve_with_params("app-scope", &p, &os, &cat, &ctx()).unwrap();
+
+        let mut sudo = values(&r.sudo);
+        sudo.sort();
+        assert_eq!(
+            sudo,
+            vec![
+                "/usr/bin/systemctl restart Supervisor",
+                "/usr/bin/systemctl restart gateway",
+            ]
+        );
+        let mut paths: Vec<&str> = r.file_grants.iter().map(|g| g.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/etc/Supervisor", "/etc/gateway"]);
+    }
+
+    #[test]
+    fn param_mapping_two_list_bundle_params_in_binding_rejected() {
+        // H1: a binding expression referencing two list bundle params is a second
+        // list dimension — rejected, not silently a cartesian.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/bin/x {units}".to_owned()]),
+                    params: token_param("units"),
+                    ..def("svc")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    includes: vec![bound_inc("svc", "units", "{apps}-{envs}")],
+                    params: {
+                        let mut m = segment_param("apps");
+                        m.insert(
+                            "envs".to_owned(),
+                            ParamConstraint::Segment { max_len: None },
+                        );
+                        m
+                    },
+                    ..def("two-list")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("apps", arr(&["a", "b"])), ("envs", arr(&["x", "y"]))]);
+        assert!(matches!(
+            resolve_with_params("two-list", &p, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::MultipleExpansionLists { ref bundle, .. } if bundle == "two-list"
+        ));
+    }
+
+    #[test]
+    fn param_mapping_bundle_list_times_member_list_rejected() {
+        // H1: a bundle list param fanned into a member AND a second list bundle
+        // param consumed by the bundle's own template = two dimensions → reject.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/bin/x {units}".to_owned()]),
+                    params: token_param("units"),
+                    ..def("svc")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // Bundle's own template fans on `tools`; the binding fans on
+                    // `apps`. Two distinct list dimensions across the expansion.
+                    sudo: ListOverride::Replace(vec!["/usr/bin/own {tools}".to_owned()]),
+                    includes: vec![bound_inc("svc", "units", "{apps}")],
+                    params: {
+                        let mut m = segment_param("apps");
+                        m.insert("tools".to_owned(), ParamConstraint::Token { max_len: None });
+                        m
+                    },
+                    ..def("cross")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![
+            ("apps", arr(&["a", "b"])),
+            ("tools", arr(&["t1", "t2"])),
+        ]);
+        assert!(matches!(
+            resolve_with_params("cross", &p, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::MultipleExpansionLists { ref bundle, .. } if bundle == "cross"
+        ));
+    }
+
+    #[test]
+    fn param_mapping_unbound_member_param_rejected() {
+        // M2: a member placeholder no binding fills → UnboundMemberParam.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/bin/x {units}".to_owned()]),
+                    params: token_param("units"),
+                    ..def("svc")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // No binding for `units`.
+                    includes: vec![Include::bare("svc")],
+                    ..def("nobind")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        // A bare include of a parametrized member is the unbound case: the member's
+        // `{units}` is never supplied (member params are internal). But a bare
+        // include flattens the member, so its placeholder surfaces at the bundle
+        // and needs a bundle param — which the bundle does not declare. The
+        // expansion has no bound members, so this is the existing flatten path:
+        // it fails on the missing param / unconstrained placeholder, fail-closed.
+        // (The dedicated UnboundMemberParam path covers the *bound* include shape
+        // below.)
+        let p = params(vec![]);
+        assert!(resolve_with_params("nobind", &p, &os, &cat, &ctx()).is_err());
+    }
+
+    #[test]
+    fn param_mapping_unbound_member_param_in_bound_include_rejected() {
+        // M2: a member with TWO placeholders, only one bound → UnboundMemberParam
+        // for the unbound one.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/bin/x {a} {b}".to_owned()]),
+                    params: {
+                        let mut m = token_param("a");
+                        m.insert("b".to_owned(), ParamConstraint::Token { max_len: None });
+                        m
+                    },
+                    ..def("two-param")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // Binds `a` but not `b`.
+                    includes: vec![bound_inc("two-param", "a", "{app}")],
+                    params: segment_param("app"),
+                    ..def("partial")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("app", toml::Value::String("X".to_owned()))]);
+        assert!(matches!(
+            resolve_with_params("partial", &p, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::UnboundMemberParam { ref member, ref param, .. }
+                if member == "two-param" && param == "b"
+        ));
+    }
+
+    #[test]
+    fn param_mapping_orphan_binding_rejected() {
+        // M2: a binding naming a member param the member does not have.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/bin/x {units}".to_owned()]),
+                    params: token_param("units"),
+                    ..def("svc")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // `nope` is not a parameter of `svc`.
+                    includes: vec![bound_inc("svc", "nope", "{app}")],
+                    params: segment_param("app"),
+                    ..def("orphan")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("app", toml::Value::String("X".to_owned()))]);
+        assert!(matches!(
+            resolve_with_params("orphan", &p, &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::OrphanIncludeBinding { ref member, ref param, .. }
+                if member == "svc" && param == "nope"
+        ));
+    }
+
+    #[test]
+    fn param_mapping_unknown_bundle_param_rejected_at_parse() {
+        // M2: a binding template referencing a bundle param that does not exist is
+        // a read-boundary error (PermissionDef::validate).
+        let def = PermissionDef {
+            includes: vec![bound_inc("svc", "units", "{xyz}")],
+            params: segment_param("app"),
+            ..def("bad-bundle")
+        };
+        assert!(matches!(
+            def.validate().unwrap_err(),
+            CatalogError::UnknownBundleParam { ref bundle, ref param, .. }
+                if bundle == "bad-bundle" && param == "xyz"
+        ));
+    }
+
+    #[test]
+    fn param_mapping_nested_bundle_rejected() {
+        // M3: a bound member that is ITSELF a parametrized bundle → NestedParamMapping.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/bin/x {units}".to_owned()]),
+                    params: token_param("units"),
+                    ..def("leaf-svc")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // `inner` is itself a parametrized bundle (it carries a binding).
+                    includes: vec![bound_inc("leaf-svc", "units", "{app}")],
+                    params: segment_param("app"),
+                    ..def("inner")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // `outer` binds `inner`, which is parametrized → reject.
+                    includes: vec![bound_inc("inner", "app", "{x}")],
+                    params: segment_param("x"),
+                    ..def("outer")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        assert!(matches!(
+            resolve("outer", &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::NestedParamMapping { ref bundle, ref member, .. }
+                if bundle == "outer" && member == "inner"
+        ));
+    }
+
+    #[test]
+    fn bare_include_of_parametrized_bundle_rejected() {
+        // M3, bare-include arm: a BARE (string) include of a permission that is
+        // itself a parametrized bundle (its resolution carries bound members) must
+        // fail closed with NestedParamMapping, exactly as the bound-include arm
+        // does — otherwise the outer bundle would flatten only the inner's own
+        // primitives and silently drop the inner's bound members (under-grant).
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec!["/usr/bin/x {units}".to_owned()]),
+                    params: token_param("units"),
+                    ..def("leaf-svc")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // `inner` param-maps: it binds the leaf to a unit name.
+                    includes: vec![bound_inc("leaf-svc", "units", "{app}")],
+                    params: segment_param("app"),
+                    ..def("inner")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // `outer` BARE-includes `inner` (a string, no binding). `inner`
+                    // is parametrized, so the bare include is rejected too.
+                    includes: vec!["inner".into()],
+                    ..def("outer")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        assert!(matches!(
+            resolve("outer", &os, &cat, &ctx()).unwrap_err(),
+            CatalogError::NestedParamMapping { ref bundle, ref member, .. }
+                if bundle == "outer" && member == "inner"
+        ));
+    }
+
+    #[test]
+    fn bare_include_of_plain_bundle_still_resolves() {
+        // The guard must NOT over-reach: a bare include of a NON-parametrized
+        // bundle (no bound members — only static primitives and/or bare members)
+        // still flattens normally. Only an inner bundle that param-maps is blocked.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    // A plain leaf: a static sudo command, no params, no bindings.
+                    sudo: ListOverride::Replace(vec!["/usr/bin/plain".to_owned()]),
+                    ..def("plain-leaf")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // `inner` is an unparametrized bundle: it bare-includes the leaf
+                    // and adds a static command of its own. No bound members.
+                    sudo: ListOverride::Replace(vec!["/usr/bin/inner".to_owned()]),
+                    includes: vec!["plain-leaf".into()],
+                    ..def("inner-plain")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // `outer` bare-includes the plain inner bundle — must resolve.
+                    includes: vec!["inner-plain".into()],
+                    ..def("outer-plain")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let (resolved, _warnings) =
+            resolve("outer-plain", &os, &cat, &ctx()).expect("plain bare include resolves");
+        let sudo: Vec<&str> = resolved.sudo.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            sudo.contains(&"/usr/bin/plain") && sudo.contains(&"/usr/bin/inner"),
+            "both the leaf and inner static commands must flatten through the bare \
+             includes; got {sudo:?}"
+        );
+    }
+
+    #[test]
+    fn param_mapping_dedup_is_binding_aware() {
+        // M4: two table-includes of the same member id with DIFFERENT bindings must
+        // NOT collapse — they are distinct expansions.
+        let cat = FakeCatalog::new()
+            .with(
+                "linux",
+                PermissionDef {
+                    sudo: ListOverride::Replace(vec![
+                        "/usr/bin/systemctl restart {units}".to_owned()
+                    ]),
+                    params: token_param("units"),
+                    ..def("service-control")
+                },
+            )
+            .with(
+                "linux",
+                PermissionDef {
+                    // Same member, two different bindings.
+                    includes: vec![
+                        bound_inc("service-control", "units", "{a}"),
+                        bound_inc("service-control", "units", "{b}"),
+                    ],
+                    params: {
+                        let mut m = segment_param("a");
+                        m.insert("b".to_owned(), ParamConstraint::Segment { max_len: None });
+                        m
+                    },
+                    ..def("multi")
+                },
+            );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![
+            ("a", toml::Value::String("Supervisor".to_owned())),
+            ("b", toml::Value::String("gateway".to_owned())),
+        ]);
+        let (r, _) = resolve_with_params("multi", &p, &os, &cat, &ctx()).unwrap();
+        let mut sudo = values(&r.sudo);
+        sudo.sort();
+        assert_eq!(
+            sudo,
+            vec![
+                "/usr/bin/systemctl restart Supervisor",
+                "/usr/bin/systemctl restart gateway",
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_string_includes_still_parse() {
+        // Back-compat: the bare-string `includes` form deserializes to an Include
+        // with no bindings, alongside a table form on the same list.
+        let def: PermissionDef = toml::from_str(
+            r#"
+id = "mixed"
+includes = [
+  "service-observe",
+  { id = "service-control", units = "{app}" },
+]
+[params.app]
+kind = "segment"
+"#,
+        )
+        .unwrap();
+        assert_eq!(def.includes.len(), 2);
+        assert_eq!(def.includes[0], Include::bare("service-observe"));
+        assert_eq!(def.includes[1].id, "service-control");
+        assert_eq!(
+            def.includes[1].bindings.get("units").map(String::as_str),
+            Some("{app}")
+        );
+
+        // An include table missing `id` is rejected.
+        assert!(toml::from_str::<PermissionDef>(
+            "id = \"x\"\nincludes = [ { units = \"{app}\" } ]\n[params.app]\nkind = \"segment\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn param_mapping_provenance_excluded_from_drift_keys() {
+        // M1: the binding provenance must not perturb the materialized primitive.
+        // The sudo command value and the file grant (path, access, recursive) — the
+        // drift keys — are exactly what a non-mapped grant would produce; only the
+        // `binding`/`via` provenance differs, and those are never compared.
+        let cat = app_scope_catalog();
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        let p = params(vec![("app", toml::Value::String("Supervisor".to_owned()))]);
+        let (r, _) = resolve_with_params("app-scope", &p, &os, &cat, &ctx()).unwrap();
+
+        // The drift-relevant fields are the plain rendered primitive — provenance
+        // lives only on `via`/`binding`, which the plan/apply key never reads.
+        assert_eq!(r.sudo[0].value, "/usr/bin/systemctl restart Supervisor");
+        assert_eq!(r.sudo[0].runas, None);
+        assert_eq!(r.file_grants[0].path, "/etc/Supervisor");
+        assert_eq!(r.file_grants[0].access, Access::RW);
+        assert!(!r.file_grants[0].recursive);
     }
 }

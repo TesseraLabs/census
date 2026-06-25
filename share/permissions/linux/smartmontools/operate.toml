@@ -1,0 +1,26 @@
+id       = "smartmontools.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for smartmontools: read-only observe (service-observe
+# on the `smartd` unit) plus service-control on the same unit and READ-ONLY
+# access to the config file. Lifecycle + read only — NO rw config, so this stays
+# contained. The config is a single file /etc/smartd.conf (NOT a directory), so
+# it is off the /etc/{app} convention and the grant is inline; recursive=false
+# because it is one file.
+#
+# Write access to /etc/smartd.conf is escalation-capable, not contained, and so
+# lives in smartmontools.admin: smartd runs as root and the `-M exec <script>`
+# directive runs an arbitrary script as root on SMART events, so rw on this file
+# is a root code-exec path.
+#
+# Values verified against smartmontools on Debian 12 (unit smartd, config
+# /etc/smartd.conf). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "smartd" },
+    { id = "service-control", units = "smartd" },
+]
+
+[[file]]
+path   = "/etc/smartd.conf"
+access = "ro"

@@ -331,6 +331,7 @@ fn sourced(value: &str, layer: &str, via: Option<&str>) -> SourcedPrimitive {
         layer: layer.to_owned(),
         via: via.map(str::to_owned),
         runas: None,
+        binding: None,
     }
 }
 
@@ -341,6 +342,7 @@ fn sourced_runas(value: &str, layer: &str, runas: &str) -> SourcedPrimitive {
         layer: layer.to_owned(),
         via: None,
         runas: Some(runas.to_owned()),
+        binding: None,
     }
 }
 
@@ -363,6 +365,7 @@ fn compiled_perm(
             category_members: Vec::new(),
             resolved_catalog_version: None,
             params: std::collections::BTreeMap::new(),
+            bound_members: Vec::new(),
         },
     }
 }
@@ -395,6 +398,7 @@ fn compiled_perm_with_file(
                 sources: vec![crate::catalog::SourcedFileGrant {
                     layer: "linux".to_owned(),
                     via: via.map(str::to_owned),
+                    binding: None,
                 }],
             }],
             limits: None,
@@ -402,6 +406,7 @@ fn compiled_perm_with_file(
             category_members: Vec::new(),
             resolved_catalog_version: None,
             params: std::collections::BTreeMap::new(),
+            bound_members: Vec::new(),
         },
     }
 }

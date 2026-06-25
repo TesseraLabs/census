@@ -1,0 +1,34 @@
+id       = "postgresql.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for PostgreSQL: read-only observe (service-observe on
+# the `postgresql` wrapper unit) plus service-control on the same unit and
+# READ-ONLY config + logs (inline, recursive). Lifecycle + read only — NO rw
+# config — so this stays contained.
+#
+# rw on /etc/postgresql is escalation-capable and lives in postgresql.admin: even
+# though the daemon runs as the non-root `postgres` user, the config tree is the
+# data-root control surface (pg_hba.conf trust auth, shared_preload_libraries
+# code load), so rw on it is escalation, not a contained operate.
+#
+# Config/logs are INLINE rather than the app-config/app-logs components: the
+# Debian config tree is versioned (/etc/postgresql/<ver>/<cluster>/...), off the
+# flat /etc/{app} convention.
+#
+# Values verified against postgresql on Debian 12 (wrapper unit postgresql,
+# config /etc/postgresql, logs /var/log/postgresql). Per-OS unit/path deltas land
+# in linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "postgresql" },
+    { id = "service-control", units = "postgresql" },
+]
+
+[[file]]
+path      = "/etc/postgresql"
+access    = "ro"
+recursive = true
+
+[[file]]
+path      = "/var/log/postgresql"
+access    = "ro"
+recursive = true

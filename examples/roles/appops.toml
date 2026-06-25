@@ -1,0 +1,12 @@
+role    = "appops"
+version = 1
+os      = "linux"
+name    = "Application operator"
+level   = 4
+
+[payload]
+# One app name drives a per-app access set via param-mapping: app-scope binds the
+# existing service-control permission on {app} and carries its own contained file
+# grants on /etc/{app} (rw) and /var/log/{app} (ro). A list of app names fans the
+# whole set out per application.
+permissions = [ { id = "app-scope", app = ["Supervisor", "gateway"] } ]

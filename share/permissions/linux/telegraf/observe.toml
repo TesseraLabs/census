@@ -1,0 +1,20 @@
+id       = "telegraf.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for Telegraf (the metrics-collection agent). Pins
+# service-observe to the unit `telegraf` and binds the ro config-tree convention
+# component (config tree /etc/telegraf holds telegraf.conf and the telegraf.d
+# drop-in dir — it follows the /etc/{app} convention).
+#
+# Contained: read-only status + ro ACL on the config tree, no mutation, no root
+# path. No log grant: Telegraf logs to journald by default (there is no
+# /var/log/telegraf on the baseline), so observe deliberately omits app-logs-ro —
+# journald reads belong to a journald/log-read grant, not this package.
+#
+# Values verified against telegraf on Debian 12 (unit telegraf with
+# User=telegraf, config /etc/telegraf, logs to journald). Per-OS unit/path deltas
+# land in linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "telegraf" },
+    { id = "app-config-ro", app = "telegraf" },
+]

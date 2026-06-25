@@ -1,0 +1,20 @@
+role    = "edgeops"
+version = 1
+os      = "linux"
+name    = "Edge operator"
+level   = 4
+
+[payload]
+# An edge-node operator mix that stays fully contained. mosquitto.operate carries
+# rw config but is contained because the broker drops to the non-root mosquitto
+# user (exec-as-app-user, the redis precedent). docker.observe is status + ro
+# daemon config only — deliberately NO socket/group, because the socket is
+# root-equivalent (its escalation tiers are docker.operate/admin). salt-minion is
+# observe-only (ro), since rw on /etc/salt repoints the root minion at an
+# attacker-controlled master and lives in salt-minion.admin. No escalation
+# permission here, so this role is a safe demo.
+permissions = [
+    "mosquitto.operate",
+    "docker.observe",
+    "salt-minion.observe",
+]

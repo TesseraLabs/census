@@ -1,0 +1,24 @@
+id       = "docker.operate"
+risk     = "escalation-capable"
+category = "container"
+# Curated operate package for the Docker engine: read-only observe plus
+# service-control on the `docker` unit, membership of the `docker` group, and the
+# docker-compose CLI plugin.
+#
+# This is escalation-capable, NOT a contained operate, and there is NO contained
+# operate tier for docker: the docker group grants access to the daemon socket,
+# and the socket is root-equivalent — it can bind-mount the host root filesystem
+# into a container, run --privileged, and thereby execute code as root on the
+# host. docker-compose drives that same socket. The docker daemon runs as root, so
+# everything it does on your behalf runs as root.
+#
+# Values verified against docker on Debian 12 (unit docker, group docker,
+# compose plugin at the listed paths, daemon runs as root). Per-OS unit/path
+# deltas land in linux-<distro> layers once verified — unverified values are not
+# shipped.
+includes = [
+    { id = "service-observe", units = "docker" },
+    { id = "service-control", units = "docker" },
+]
+groups = ["docker"]
+sudo   = ["/usr/bin/docker-compose", "/usr/libexec/docker/cli-plugins/docker-compose"]

@@ -1,5 +1,0 @@
-id       = "docker.compose"
-risk     = "escalation-capable"
-category = "container"
-groups   = ["docker"]
-sudo     = ["/usr/bin/docker-compose", "/usr/libexec/docker/cli-plugins/docker-compose"]

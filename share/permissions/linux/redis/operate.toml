@@ -1,0 +1,22 @@
+id       = "redis.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for Redis: read-only observe (service-observe on the
+# `redis-server` unit — the Debian unit name, NOT `redis`) plus service-control
+# on the same unit and the rw config convention component (config tree /etc/redis
+# follows /etc/{app}).
+#
+# rw config is in operate (and there is deliberately NO redis.admin tier) because
+# the Redis daemon runs as the unprivileged `redis` user, not root. rw on
+# /etc/redis and runtime MODULE LOAD execute code as the redis user, not root —
+# so this is contained (exec-as-app-user), not escalation. Contained: scoped
+# service control + ACL file access, no root path.
+#
+# Values verified against redis on Debian 12 (unit redis-server, config
+# /etc/redis, runs as user redis). Per-OS unit/path deltas land in linux-<distro>
+# layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "redis-server" },
+    { id = "service-control", units = "redis-server" },
+    { id = "app-config-rw", app = "redis" },
+]

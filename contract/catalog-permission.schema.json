@@ -36,11 +36,10 @@
       }
     },
     "includes": {
-      "description": "Explicit ids this permission aggregates. Inert in slice 1.",
+      "description": "Explicit members this permission aggregates. Each entry is either a bare\nid string or a table binding the member's parameters to templates over\nthis bundle's own parameters (see [`Include`]). Inert in slice 1.",
       "type": "array",
-      "default": [],
       "items": {
-        "type": "string"
+        "$ref": "#/$defs/Include"
       }
     },
     "limits": {
@@ -178,6 +177,27 @@
         "access"
       ]
     },
+    "Include": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": {
+            "type": "string"
+          },
+          "required": [
+            "id"
+          ]
+        }
+      ]
+    },
     "ListOverride": {
       "oneOf": [
         {
@@ -290,6 +310,30 @@
           "required": [
             "kind",
             "values"
+          ]
+        },
+        {
+          "description": "A single safe path segment that doubles as a plain name. The substituted\nvalue must be non-empty, within the length bound, and drawn from a\ndeliberately narrow charset — ASCII alphanumerics plus `.`, `_`, `-`\nonly — with the bare `.` and `..` components rejected outright. Because it\ncannot contain `/`, `\\`, `:`, `@`, or any control character, one value is\nsafe to drop into both a single path component (`/etc/{seg}`) and a token\nposition (a unit name, a login), without risking traversal, an absolute\npath, or a sudoers/shell metacharacter.\n\nThis is strictly narrower than [`ParamConstraint::Token`]: `token` admits\n`/`, `\\`, `:`, and `@` (needed for path-like and instance/slice unit\nnames) and so is *not* safe as a path segment. The exclusion of `@` and\n`:` here is the known limitation — `segment` cannot express a systemd\ninstance or slice unit name (`wg-quick@wg0`, `system.slice`); those still\nrequire `token`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "segment"
+            },
+            "max_len": {
+              "description": "Maximum accepted length; defaults to [`PARAM_DEFAULT_MAX_LEN`].",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "default": null,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
           ]
         }
       ]

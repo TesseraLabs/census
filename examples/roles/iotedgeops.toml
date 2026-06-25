@@ -1,0 +1,19 @@
+role    = "iotedgeops"
+version = 1
+os      = "linux"
+name    = "IoT edge operator"
+level   = 4
+
+[payload]
+# A fully contained IoT-edge operator mix. edgex.operate (snap deployment) is
+# lifecycle + READ-ONLY config plus Modbus RTU serial access — contained because
+# the EdgeX snap services run as root, so rw config is escalation (edgex.admin) and
+# operate keeps config ro (the rsyslog/salt-minion root-daemon shape). greengrass.
+# observe is status + ro logs only; its config (and the device private key it holds)
+# and the sudo-ALL root install path stay in greengrass.admin (escalation),
+# deliberately out of this role. No escalation permission here, so this role is a
+# safe demo of the edge-runtime packages.
+permissions = [
+    "edgex.operate",
+    "greengrass.observe",
+]

@@ -1,0 +1,25 @@
+id       = "pcscd.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for the PC/SC smartcard resource manager (pcscd):
+# read-only observe plus service-control on BOTH the daemon unit `pcscd` and its
+# activating socket unit `pcscd.socket` (socket-activated), and the contained
+# USB-reader device leaf `device-usb`.
+#
+# device-usb is the right contained leaf for CCID/USB smartcard readers: it grants
+# the `plugdev` and `scanner` groups (raw access to the USB reader device node)
+# plus udisksctl, without touching /etc/reader.conf.d. That keeps operate
+# contained — no rw on the driver config tree, so no path to a root .so load (that
+# is pcscd.admin).
+#
+# Values verified against pcscd on Debian 12 (units pcscd + pcscd.socket, USB CCID
+# readers via the device-usb leaf's plugdev/scanner groups). Per-OS unit/path
+# deltas land in linux-<distro> layers once verified — unverified values are not
+# shipped.
+includes = [
+    { id = "service-observe", units = "pcscd" },
+    { id = "service-observe", units = "pcscd.socket" },
+    { id = "service-control", units = "pcscd" },
+    { id = "service-control", units = "pcscd.socket" },
+    "device-usb",
+]

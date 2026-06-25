@@ -1380,7 +1380,7 @@ uid = 9010
                     // Bundle's own command under its own run-spec, plus the member.
                     sudo: ListOverride::Replace(vec!["/usr/bin/own-tool".to_owned()]),
                     runas: Some("ops".to_owned()),
-                    includes: vec!["db-tool".to_owned()],
+                    includes: vec![crate::catalog::Include::bare("db-tool")],
                     ..def("toolbox")
                 },
             );

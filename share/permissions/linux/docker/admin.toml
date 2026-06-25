@@ -1,5 +1,17 @@
 id       = "docker.admin"
 risk     = "escalation-capable"
 category = "container"
-includes = ["docker.ps", "docker.compose"]
+# Curated admin package for the Docker engine: everything in docker.operate
+# (docker group + socket access + compose) plus an explicit sudo to restart the
+# daemon itself.
+#
+# Escalation-capable, like docker.operate: the docker group / daemon socket is
+# root-equivalent (bind-mount host root, --privileged), and the daemon runs as
+# root. Restarting it via systemctl is additional root-level daemon management on
+# top of the already root-equivalent socket access.
+#
+# Values verified against docker on Debian 12 (unit docker, daemon runs as root).
+# Per-OS unit/path deltas land in linux-<distro> layers once verified — unverified
+# values are not shipped.
+includes = ["docker.operate"]
 sudo     = ["/usr/bin/systemctl restart docker"]

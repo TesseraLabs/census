@@ -1,0 +1,20 @@
+id       = "chrony.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for chrony: read-only observe (service-observe on the
+# `chrony` unit) plus service-control on the same unit and the rw config
+# convention component (config tree /etc/chrony follows /etc/{app}).
+#
+# Contained: changing time synchronization can shift the system clock, which
+# affects certificate validity windows (a not-yet-valid / expired cert turns on
+# the clock) — security-relevant, but not a root path. Scoped service control +
+# ACL file access, no root path.
+#
+# Values verified against chrony on Debian 12 (unit chrony, config /etc/chrony).
+# Some distros name the unit `chronyd` — that delta lands in a linux-<distro>
+# layer once verified. Unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "chrony" },
+    { id = "service-control", units = "chrony" },
+    { id = "app-config-rw", app = "chrony" },
+]

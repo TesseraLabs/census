@@ -1,14 +1,24 @@
-["docker.ps"]
-title     = "Docker 查看"
-summary   = "通过 docker 组列出并查看容器。"
-risk_note = "docker 组等同 root：守护进程套接字可挂载主机并运行特权容器。"
+["docker.observe"]
+title     = "Docker 引擎——观察"
+summary   = "对 Docker 引擎的只读访问：查询 docker 服务状态，读取 /etc/docker（daemon.json）。"
+risk_note = "受限（contained）：仅状态加只读守护进程配置。刻意不含套接字、不含 docker 组——没有受限方式列出容器（docker ps 需要等同 root 的守护进程套接字），因此观察止于状态加只读配置。任何需要套接字的操作都属于提权，归入 docker.operate。"
 
-["docker.compose"]
-title     = "Docker Compose"
-summary   = "通过 docker 组运行 docker-compose 栈。"
-risk_note = "docker 组等同 root：compose 可绑定挂载主机路径并取得完全控制。"
+["docker.operate"]
+title     = "Docker 引擎——运维"
+summary   = "运维 Docker 引擎：start/stop/restart docker 服务，运行 docker-compose，并通过 docker 组使用守护进程。"
+risk_note = "具备提权能力：docker 组授予对守护进程套接字的访问，而该套接字等同 root——它可将主机根文件系统绑定挂载进容器并运行 --privileged，从而在主机上以 root 执行代码。docker 守护进程本身以 root 运行。docker 没有受限的 operate；套接字就是核心，而套接字即 root。"
 
 ["docker.admin"]
-title     = "Docker 管理（捆绑）"
-summary   = "查看与 Compose，并重启 Docker 守护进程。"
-risk_note = "docker 组等同 root：管理守护进程即完全控制主机。"
+title     = "Docker 引擎——管理"
+summary   = "管理 Docker 引擎：operate 的全部内容（docker 组、套接字、compose）加上重启 docker 守护进程。"
+risk_note = "与 docker.operate 一样具备提权能力：docker 组／守护进程套接字等同 root（绑定挂载主机根、--privileged），且守护进程以 root 运行。重启在已等同 root 的套接字访问之上再增加 root 级别的守护进程管理。"
+
+["portainer-edge.observe"]
+title     = "Portainer Edge Agent——观察"
+summary   = "对 Portainer Edge Agent 的只读访问：查询 PortainerEdgeAgent 服务状态。"
+risk_note = "受限（contained）：仅只读单元状态。不授予日志文件（代理写入容器运行时/日志，无稳定的主机侧路径）。单元名 PortainerEdgeAgent 是社区 systemd 包装约定，取决于部署（角色覆盖）；代理通常是无主机单元的裸容器，此时本包不适用。"
+
+["portainer-edge.admin"]
+title     = "Portainer Edge Agent——管理"
+summary   = "管理 Portainer Edge Agent：start/stop/restart PortainerEdgeAgent 服务，外加 docker.operate（代理所驱动的主机 docker 套接字）。"
+risk_note = "具备提权能力，且没有受限的 operate 层：Edge 代理通过主机 docker 套接字管理边缘节点上的容器栈，而该套接字等同 root（绑定挂载主机根、--privileged）。portainer-edge.admin 按设计就是 docker 套接字访问——它组合了 docker.operate，因而与 docker.admin 重叠；相较 docker.operate，它唯一额外提供的是对代理单元自身的生命周期控制。"

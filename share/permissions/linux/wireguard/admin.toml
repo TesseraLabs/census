@@ -1,0 +1,30 @@
+id       = "wireguard.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for WireGuard: service-control on the instance unit
+# wg-quick@wg0 plus READ-WRITE config (the rw /etc/wireguard convention component).
+#
+# This is escalation-capable, NOT a contained operate: wg-quick runs the config's
+# PostUp/PostDown/PreUp/PreDown lines as ROOT when bringing the interface up or
+# down. So rw on /etc/wireguard points wg-quick at attacker-supplied commands that
+# run as root — a direct root command-exec path. The file access is contained ACL,
+# but the content it grants write to is a root command-exec surface.
+#
+# DEPLOYMENT-SPECIFIC unit: wg-quick@wg0 is the default interface; a role overrides
+# `units` to its actual interface(s).
+#
+# This admin tier deliberately does NOT reuse the generic `vpn-admin` leaf. While
+# vpn-admin does grant sudo for wg/wg-quick, it ALSO grants the nm-openvpn group
+# and resolvectl (a broader NetworkManager bundle) and gives NO scoped systemd
+# lifecycle and NO ACL on /etc/wireguard. Composing the convention components
+# (service-control + app-config-rw on app="wireguard") models the actual WireGuard
+# admin surface precisely — scoped to the wg-quick instance unit and the
+# /etc/wireguard config tree — so this package does NOT include vpn-admin.
+#
+# Values verified against wireguard-tools on Debian 12 (template unit wg-quick@,
+# config /etc/wireguard). Per-OS unit/path deltas land in linux-<distro> layers
+# once verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "wg-quick@wg0" },
+    { id = "app-config-rw", app = "wireguard" },
+]

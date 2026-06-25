@@ -1,0 +1,40 @@
+id       = "node-red.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for Node-RED (the industrial/edge flow runtime). Pins
+# service-observe to the unit `nodered` (the official install ships
+# nodered.service) and grants an inline ro [[file]] on the userDir.
+#
+# DEPLOYMENT-SPECIFIC path: Node-RED's config is NOT under /etc — it lives in a
+# userDir holding settings.js + flows.json + flows_cred.json. The UPSTREAM
+# installer pins User=<invoking-user> with WorkingDirectory=$HOME, so its userDir
+# is /home/<user>/.node-red. That path cannot be expressed as a literal inline
+# [[file]], so this package defaults to /var/lib/node-red — a hardened/systemd-
+# system deployment convention (a dedicated service user with a /var/lib state
+# dir), which is a defensible package default but is NOT the upstream installer's
+# path. The path is deployment-specific: a per-OS layer / role overrides it (to
+# /home/<user>/.node-red for an upstream install, or another state dir). Because it
+# is off the flat /etc/{app} convention, it is an inline literal-path [[file]]
+# (postgresql/rsyslog precedent), not the app-config-ro component.
+#
+# Contained: read-only status + ro ACL on the userDir, no mutation, no root path.
+# NOTE: flows_cred.json in the userDir holds encrypted node credentials — ro access
+# exposes that file (credential material), so ro here is still sensitive.
+#
+# Risk label verified against the way Node-RED is run: the upstream systemd install
+# pins it non-root (User=<invoking-user>), which is what keeps the operate tier
+# contained. Per-OS unit/path deltas — including the upstream /home/<user>/.node-red
+# userDir — land in linux-<distro> layers once verified; unverified values are not
+# shipped.
+includes = [
+    { id = "service-observe", units = "nodered" },
+]
+
+# Inline literal-path grant on the userDir — Node-RED's config is a home-dir tree,
+# not /etc/{app}, so it cannot use the app-config-ro convention component. A
+# catalog package may carry a literal-path inline [[file]] (unlike a role payload,
+# which forbids literal file grants); the bound value is a curation/review concern.
+[[file]]
+path      = "/var/lib/node-red"
+access    = "ro"
+recursive = true

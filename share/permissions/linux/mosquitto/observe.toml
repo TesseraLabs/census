@@ -1,0 +1,18 @@
+id       = "mosquitto.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for the Mosquitto MQTT broker. Pins service-observe to
+# the unit `mosquitto` and binds the ro config + ro logs convention components
+# (config tree /etc/mosquitto and logs /var/log/mosquitto both follow the
+# convention). Contained: read-only status + ro ACL on config and logs, no root
+# path.
+#
+# Values verified against mosquitto on Debian 12 (unit mosquitto, config
+# /etc/mosquitto, logs /var/log/mosquitto, daemon drops to the mosquitto user).
+# Per-OS unit/path deltas land in linux-<distro> layers once verified — unverified
+# values are not shipped.
+includes = [
+    { id = "service-observe", units = "mosquitto" },
+    { id = "app-config-ro", app = "mosquitto" },
+    { id = "app-logs-ro", app = "mosquitto" },
+]

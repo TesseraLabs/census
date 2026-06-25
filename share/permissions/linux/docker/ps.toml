@@ -1,4 +1,0 @@
-id       = "docker.ps"
-risk     = "escalation-capable"
-category = "container"
-groups   = ["docker"]

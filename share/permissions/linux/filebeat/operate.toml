@@ -1,0 +1,16 @@
+id       = "filebeat.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for Filebeat: read-only observe (service-observe on the
+# `filebeat` unit) plus the mutating half — service-control on the same unit and
+# the rw config convention component (config tree /etc/filebeat follows
+# /etc/{app}). Contained: scoped service control + ACL file access, no root path.
+#
+# Values verified against filebeat on Debian 12 (unit filebeat, config
+# /etc/filebeat). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "filebeat" },
+    { id = "service-control", units = "filebeat" },
+    { id = "app-config-rw", app = "filebeat" },
+]

@@ -1,0 +1,32 @@
+id       = "rsyslog.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for rsyslog: read-only observe (service-observe on the
+# `rsyslog` unit) PLUS service-control on the same unit, plus READ-ONLY config on
+# the drop-in tree /etc/rsyslog.d (via the convention component). Lifecycle +
+# read only — NO rw config — so this stays contained.
+#
+# Managed surface is the drop-in tree /etc/rsyslog.d — the modern,
+# rewrite-proof-grantable surface (rsyslog's default `$IncludeConfig
+# /etc/rsyslog.d/*.conf` on Debian/Astra pulls every drop-in in). The main
+# /etc/rsyslog.conf is deliberately OUT OF SCOPE: it is a single system-global
+# file, and census enforces rewrite-proof config access through DIRECTORY-level
+# ACLs (a per-file ACL is defeated by atomic-replace). A single file in /etc
+# cannot be granted rewrite-proof without granting all of /etc, and a single-file
+# grant is rejected at apply by any target without a per-file ACL backend (stock
+# Astra/Debian). Admins who must edit the main conf do so out-of-band.
+#
+# rw on the rsyslog config is escalation-capable and lives in rsyslog.admin:
+# rsyslogd runs as ROOT, and a drop-in can both load a .so into the root daemon
+# (`module(load="im...")` / legacy `$ModLoad`) and run an external program as root
+# (the `omprog` output module). So unlike a non-root daemon (redis/telegraf),
+# rsyslog's rw config is NOT a contained operate — keep rw out of operate.
+#
+# Values verified against rsyslog on Debian 12 (unit rsyslog, drop-in tree
+# /etc/rsyslog.d, daemon runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "rsyslog" },
+    { id = "service-control", units = "rsyslog" },
+    { id = "app-config-ro", app = "rsyslog.d" },
+]

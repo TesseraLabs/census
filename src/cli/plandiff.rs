@@ -432,6 +432,7 @@ mod tests {
             sources: vec![SourcedFileGrant {
                 layer: "linux".to_owned(),
                 via: None,
+                binding: None,
             }],
         }
     }

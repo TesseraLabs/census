@@ -1,0 +1,27 @@
+id       = "wireguard.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for WireGuard. Pins service-observe to the instance
+# unit `wg-quick@wg0` (template unit wg-quick@.service, default interface wg0) and
+# binds the ro config convention component (config tree /etc/wireguard follows
+# /etc/{app}).
+#
+# DEPLOYMENT-SPECIFIC unit: WireGuard has NO long-lived daemon — the kernel module
+# does the work and `wg-quick@<iface>` is a oneshot that brings the interface up at
+# boot and tears it down on stop. The instance name is the interface name and is
+# deployment-specific; `wg0` is only a sensible default. A role overrides `units`
+# to match its actual interface(s). The `@`-form is a valid service-observe
+# `{units}` token (the token kind admits `@`).
+#
+# Contained: read-only status + ro ACL on /etc/wireguard, no mutation, no root
+# path. NOTE: /etc/wireguard/<iface>.conf CONTAINS THE INTERFACE PRIVATE KEY — even
+# read-only access therefore exposes the VPN private key. This is credential
+# exposure, not privilege escalation, but it is why ro here is still sensitive.
+#
+# Values verified against wireguard-tools on Debian 12 (template unit wg-quick@,
+# config /etc/wireguard). Per-OS unit/path deltas land in linux-<distro> layers
+# once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "wg-quick@wg0" },
+    { id = "app-config-ro", app = "wireguard" },
+]
