@@ -158,6 +158,16 @@
             "$ref": "#/$defs/PermissionRef"
           }
         },
+        "sudo": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
         "sudo_role": {
           "type": [
             "string",

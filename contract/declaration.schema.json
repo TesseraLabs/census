@@ -33,6 +33,12 @@
       "description": "Path to the role-store directory (source of role composition).",
       "type": "string"
     },
+    "schema": {
+      "description": "Format version of the declaration parser, distinct from `version`. It\npins which on-disk shape the document was written for, so a too-new\ndocument fails with a clear message instead of a confusing field error.\nChecked before any other validation against [`SUPPORTED_SCHEMA`]: a value\nabove it is rejected, a value below it is reserved for a future\nformat-migration branch. Required — a missing `schema` is a parse error.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
     "signature": {
       "description": "Detached Ed25519 signature over the declaration bytes minus this line\n(hex of 64 bytes). Present in managed mode; absent under `--trust-fs`.\nThe field exists so the strict (`deny_unknown_fields`) parser accepts a\n`signature = \"...\"` line — verification operates on RAW bytes via\n`trust::signed_payload`, not on this parsed value.",
       "type": [
@@ -42,7 +48,7 @@
       "default": null
     },
     "version": {
-      "description": "Monotonic version; anti-rollback uses it (verification is a later slice).",
+      "description": "Monotonic anti-rollback counter over the declaration *content* (not the\nformat). It is the replay guard for the signature: each newly signed\ndeclaration that supersedes a prior one must carry a strictly higher\n`version`, so a captured older-but-validly-signed declaration cannot be\nreplayed. Enforced only in managed/signed mode (see `trust.rs`); under\n`--trust-fs` it is not checked. Bump it on every new signed declaration\nthat replaces the previous one. Contrast with `schema`, which versions\nthe parser format, not the content.",
       "type": "integer",
       "format": "uint32",
       "minimum": 0
@@ -50,6 +56,7 @@
   },
   "additionalProperties": false,
   "required": [
+    "schema",
     "version",
     "role_store",
     "defaults"

@@ -325,11 +325,16 @@ pub fn lint_role(
     // Resolve-class warnings → lint warnings (never errors).
     for w in warnings {
         let (code, message): (&'static str, String) = match w {
-            model::ResolveWarning::RawPrimitiveAlongsidePermissions { .. } => {
-                ("raw-primitive", w.to_string())
-            }
+            // Inline payload.sudo shares the raw-primitive marker with the other
+            // escape-hatch primitives: it is an uncurated escalation-capable
+            // primitive a reviewer must see flagged the same way.
+            model::ResolveWarning::RawPrimitiveAlongsidePermissions { .. }
+            | model::ResolveWarning::InlineSudoUnlabeled { .. } => ("raw-primitive", w.to_string()),
             model::ResolveWarning::GroupsPrimitiveOnGroupTarget { .. } => {
                 ("groups-on-group-target", w.to_string())
+            }
+            model::ResolveWarning::InlineSudoDroppedOnGroupTarget { .. } => {
+                ("inline-sudo-on-group-target", w.to_string())
             }
             model::ResolveWarning::Catalog(catalog::Warning::UnknownOsVersion { .. }) => {
                 ("unknown-os-version", w.to_string())

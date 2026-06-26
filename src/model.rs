@@ -458,12 +458,34 @@ pub enum ResolveWarning {
         /// Which raw primitive (`groups`/`sudo_role`/`limits`/`files`).
         primitive: &'static str,
     },
+    /// A role carries an inline `payload.sudo` command — a raw escape-hatch that
+    /// grants sudo directly, bypassing the catalog risk-label. Unlike the tame
+    /// legacy primitives (`groups`/`sudo_role`/`limits`), inline sudo is
+    /// escalation-capable and uncurated, so it is surfaced unconditionally (even
+    /// on a role that declares no permissions) — a reviewer must see it as raw /
+    /// unlabeled escalation-capable.
+    InlineSudoUnlabeled {
+        /// Role carrying the inline sudo escape hatch.
+        role: String,
+    },
     /// A bound role expanded an in-group-membership sub-primitive (`groups`)
     /// onto a group target. There is no local group nesting to apply it to, so
     /// it is dropped. (LDAP-side nesting still works transparently through the
     /// group itself; this only concerns the local `usermod -aG` semantics.)
     GroupsPrimitiveOnGroupTarget {
         /// The bound role whose permission carried the `groups` primitive.
+        role: String,
+        /// The group target the binding pointed at.
+        group: String,
+    },
+    /// A role bound to a group carried an inline `payload.sudo` escape hatch.
+    /// Inline sudo is an account-level raw primitive — it is materialized onto the
+    /// account the role projects to, not onto a `%group` fragment — so on a
+    /// group-target binding it is ignored. Surfaced so the author sees the
+    /// primitive did not apply rather than silently losing it (the binding's sudo
+    /// comes from the role's curated permissions instead).
+    InlineSudoDroppedOnGroupTarget {
+        /// The bound role carrying the ignored inline sudo escape hatch.
         role: String,
         /// The group target the binding pointed at.
         group: String,
@@ -481,10 +503,20 @@ impl std::fmt::Display for ResolveWarning {
                 f,
                 "role {role}: raw {primitive} used alongside permissions; prefer permissions"
             ),
+            ResolveWarning::InlineSudoUnlabeled { role } => write!(
+                f,
+                "role {role}: inline payload.sudo is a raw / unlabeled escalation-capable \
+                 primitive (bypasses the catalog risk-label); review as uncurated"
+            ),
             ResolveWarning::GroupsPrimitiveOnGroupTarget { role, group } => write!(
                 f,
                 "role {role}: permission `groups` (вступление в группу) не применимо к group-цели \
                  {group}; пропущено (локальной вложенности групп нет)"
+            ),
+            ResolveWarning::InlineSudoDroppedOnGroupTarget { role, group } => write!(
+                f,
+                "role {role}: inline payload.sudo is an account-level primitive and does not apply \
+                 to group target {group}; ignored (the binding's sudo comes from permissions)"
             ),
             ResolveWarning::Catalog(catalog::Warning::UnknownOsVersion {
                 missing_layer,
@@ -540,6 +572,21 @@ pub enum ResolveError {
         role: String,
         /// The rejected file path.
         path: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+    /// A raw `[payload].sudo` command was not a fit literal absolute-path Cmnd
+    /// (relative, empty, `..` component, control char, a shell/sudoers
+    /// metacharacter, an argument list, or a `{param}` placeholder). Fail-closed
+    /// before apply — an inline sudo command is emitted into a NOPASSWD sudoers
+    /// rule as root, so anything but a bare literal absolute path must never reach
+    /// that rule.
+    #[error("role {role}: invalid inline sudo command {command:?}: {reason}")]
+    InvalidInlineSudo {
+        /// The role carrying the bad inline sudo command.
+        role: String,
+        /// The rejected command value.
+        command: String,
         /// Why it was rejected.
         reason: &'static str,
     },
@@ -611,6 +658,35 @@ pub fn resolve(
             }
         }
         let mut sudo_commands: Vec<SudoCommand> = Vec::new();
+        // Seed sudo commands from the role's raw `[payload].sudo` escape hatch,
+        // alongside the permission expansion below. Each value must be a LITERAL
+        // absolute-path Cmnd, validated before it can reach a NOPASSWD sudoers rule
+        // as root — an invalid value fails resolution closed. Inline sudo is granted
+        // as root (`runas: None`, the default `(ALL)` run-spec): the escape hatch
+        // carries no run-as, and confined parametrization is the catalog's job.
+        // Dedup at the seed (by the `(command, runas)` pair) so a slice repeating a
+        // command does not produce a managed record that diffs forever, and the
+        // permission union below skips any command already seeded here. Surfaced
+        // unconditionally as raw / unlabeled escalation-capable: unlike the tame
+        // legacy primitives, inline sudo bypasses the catalog risk-label.
+        if !comp.sudo.is_empty() {
+            warnings.push(ResolveWarning::InlineSudoUnlabeled {
+                role: acct.role.clone(),
+            });
+        }
+        for cmd in &comp.sudo {
+            if let Some(reason) = inline_sudo_command_defect(cmd) {
+                return Err(ResolveError::InvalidInlineSudo {
+                    role: acct.role.clone(),
+                    command: cmd.clone(),
+                    reason,
+                });
+            }
+            let seeded = SudoCommand::root(cmd.clone());
+            if !sudo_commands.contains(&seeded) {
+                sudo_commands.push(seeded);
+            }
+        }
         // Seed file grants from the role's raw `[payload].files` escape hatch, then
         // union the permission-derived grants on top (by path) below: a raw grant
         // and a permission grant on the same path widen/merge exactly like two
@@ -764,6 +840,93 @@ pub fn resolve(
     Ok((out, warnings))
 }
 
+/// Shell/sudoers metacharacters forbidden in an inline `payload.sudo` command.
+///
+/// Inline sudo is a LITERAL-only escape hatch — a bare absolute command path with
+/// no arguments and no `{param}` placeholders. Any of these characters would
+/// either smuggle a second token past the gate (`;` `|` `&` `<` `>` `(` `)` and
+/// the backtick), trigger a shell expansion (`$` `*` `?` `[` `]` `!`), start a
+/// sudoers comment that silently truncates the rest of the rule line (`#`), or
+/// reintroduce the `{...}` parametrization that only a curated catalog id may
+/// carry. The printable-ASCII gate already rejects whitespace, control, and
+/// non-ASCII characters; this list narrows the remaining printable set.
+const INLINE_SUDO_FORBIDDEN: &[char] = &[
+    ';', '|', '&', '$', '<', '>', '(', ')', '`', '{', '}', '*', '?', '[', ']', '!', '#',
+];
+
+/// The inclusive printable-ASCII byte range an inline sudo command must stay
+/// within: `0x21..=0x7e` — every graphic ASCII character, excluding the space
+/// (`0x20`), all control bytes (`0x00..=0x1f`, `0x7f`), and every non-ASCII byte
+/// (`>= 0x80`). Inline sudo is a low-trust authoring surface whose entire purpose
+/// is a visible audit in `show`/`lint`, so a value is confined to characters that
+/// render unambiguously: this rejects an argument list (the space), a control
+/// character that would split the sudoers rule, and any non-ASCII / bidi /
+/// zero-width / homoglyph character that would mask the command from a reviewer.
+const INLINE_SUDO_PRINTABLE_ASCII: std::ops::RangeInclusive<u8> = 0x21..=0x7e;
+
+/// Validate one raw inline `payload.sudo` command. Returns the rejection reason,
+/// or `None` if the value is a fit literal absolute-path Cmnd.
+///
+/// Census emits each inline sudo command into a NOPASSWD `/etc/sudoers.d/census-*`
+/// rule as root, and the value bypasses the catalog's curated risk-label, so it
+/// is held to a deliberately tight, literal-only shape: a non-empty printable-ASCII
+/// absolute path (see [`INLINE_SUDO_PRINTABLE_ASCII`] — no whitespace, control, or
+/// non-ASCII characters), with no `..` component (sudo normalizes it to a broader
+/// Cmnd than the literal prefix suggests) and none of the shell/sudoers
+/// metacharacters in [`INLINE_SUDO_FORBIDDEN`]. The forbidden set includes `{`/`}`:
+/// parametrization with confinement is the prerogative of a catalog id and its
+/// `[params.X]` constraints, never an inline literal, so a `{placeholder}` here is
+/// rejected rather than silently emitted verbatim.
+fn inline_sudo_command_defect(value: &str) -> Option<&'static str> {
+    if value.is_empty() {
+        // Checked first: an empty string vacuously satisfies the byte-range check
+        // below, so it must be rejected explicitly here.
+        Some("is empty")
+    } else if !value
+        .bytes()
+        .all(|b| INLINE_SUDO_PRINTABLE_ASCII.contains(&b))
+    {
+        Some("must be printable ASCII only (no whitespace, control, or non-ASCII characters)")
+    } else if !value.starts_with('/') {
+        Some("must be an absolute path (start with '/')")
+    } else if value.chars().any(|c| INLINE_SUDO_FORBIDDEN.contains(&c)) {
+        Some("contains a shell/sudoers metacharacter or a {param} placeholder (literals only)")
+    } else if catalog::has_dotdot_component(value) {
+        Some("must not contain a `..` path component")
+    } else {
+        None
+    }
+}
+
+/// Emit the per-binding raw-primitive lints for one group binding.
+///
+/// A raw `files` escape hatch used alongside permissions mirrors the account-side
+/// raw-primitive lint. An inline `payload.sudo` is an account-level primitive with
+/// no `%group` projection, so on a group-target binding it does not materialize;
+/// it is surfaced (rather than dropped silently) so the author sees the primitive
+/// did not apply here. No fail-closed validation is needed on this path — nothing
+/// reaches a sudoers rule from it, so an invalid value can do no harm; it is gated
+/// on the account path if the same role also projects to an account.
+fn push_group_binding_lints(
+    warnings: &mut Vec<ResolveWarning>,
+    role: &str,
+    group: &str,
+    comp: &rolestore::RoleComposition,
+) {
+    if !comp.permissions.is_empty() && !comp.files.is_empty() {
+        warnings.push(ResolveWarning::RawPrimitiveAlongsidePermissions {
+            role: role.to_owned(),
+            primitive: "files",
+        });
+    }
+    if !comp.sudo.is_empty() {
+        warnings.push(ResolveWarning::InlineSudoDroppedOnGroupTarget {
+            role: role.to_owned(),
+            group: group.to_owned(),
+        });
+    }
+}
+
 /// Merge one permission's resolved limits into an accumulator, first-wins per
 /// field: a field already set is left untouched, an unset field takes the
 /// expansion's value. Shared by account and group resolution so both sequence
@@ -868,14 +1031,9 @@ pub fn resolve_groups(
             catalog::union_file_grants(raw_binding_grants, None);
         let mut emitted_groups_warning = false;
 
-        // Lint: a raw `files` escape hatch used alongside permissions on the bound
-        // role, mirroring the account-side lint.
-        if !comp.permissions.is_empty() && !comp.files.is_empty() {
-            warnings.push(ResolveWarning::RawPrimitiveAlongsidePermissions {
-                role: rg.role.clone(),
-                primitive: "files",
-            });
-        }
+        // Per-binding raw-primitive lints (raw `files` alongside permissions; an
+        // inline `payload.sudo` that has no group projection).
+        push_group_binding_lints(&mut warnings, &rg.role, &rg.group, &comp);
 
         for perm in &comp.permissions {
             let (resolved, catalog_warnings) = catalog::resolve_with_params(
@@ -1008,6 +1166,7 @@ mod tests {
         let store = tmp.path().display().to_string();
         let decl_text = format!(
             r#"
+schema = 1
 version = 4
 role_store = "{store}"
 [defaults]
@@ -1286,6 +1445,171 @@ uid = 9010
                 ResolveWarning::Catalog(catalog::Warning::UnusedParam { .. })
             )),
             "bare ref on plain record must not warn about params: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn inline_sudo_unions_with_catalog_sudo() {
+        // A role carrying both a catalog permission (granting /usr/sbin/ip) and an
+        // inline payload.sudo (/usr/sbin/myapp-reload) resolves to the union of
+        // both sudo commands; the inline command is granted as root.
+        let (_tmp, decl) = fixture(
+            "[payload]\npermissions = [\"net-admin\"]\nsudo = [\"/usr/sbin/myapp-reload\"]\n",
+        );
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                sudo: ListOverride::Replace(vec!["/usr/sbin/ip".to_owned()]),
+                ..def("net-admin")
+            },
+        );
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (resolved, warnings) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(
+            resolved[0].sudo_commands,
+            vec![
+                SudoCommand::root("/usr/sbin/myapp-reload"),
+                SudoCommand::root("/usr/sbin/ip"),
+            ],
+            "inline sudo seeds first, catalog sudo unions on top"
+        );
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ResolveWarning::InlineSudoUnlabeled { role } if role == "oper"
+            )),
+            "inline sudo must be flagged raw / unlabeled: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn inline_sudo_only_role_materializes_and_warns() {
+        // No permissions: the inline command still materializes (as root) and is
+        // surfaced as raw / unlabeled escalation-capable.
+        let (_tmp, decl) = fixture("[payload]\nsudo = [\"/usr/sbin/myapp-reload\"]\n");
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (resolved, warnings) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(
+            resolved[0].sudo_commands,
+            vec![SudoCommand::root("/usr/sbin/myapp-reload")]
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| matches!(w, ResolveWarning::InlineSudoUnlabeled { .. })));
+    }
+
+    #[test]
+    fn inline_sudo_dedups_repeated_command() {
+        // A slice repeating the same inline command must not produce a duplicate
+        // grant (it would diff forever against the deduped managed record).
+        let (_tmp, decl) =
+            fixture("[payload]\nsudo = [\"/usr/sbin/myapp-reload\", \"/usr/sbin/myapp-reload\"]\n");
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (resolved, _) = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        assert_eq!(
+            resolved[0].sudo_commands,
+            vec![SudoCommand::root("/usr/sbin/myapp-reload")]
+        );
+    }
+
+    #[test]
+    fn inline_sudo_invalid_values_fail_closed() {
+        // Each rejected shape must fail resolution closed before any
+        // materialization — an inline command reaches a NOPASSWD sudoers rule as
+        // root, so a non-literal value must never get there. These cases are also a
+        // regression lock on the injection vectors: a future loosening of the gate
+        // (e.g. dropping the printable-ASCII rule) must re-break one of them.
+        //
+        // Cases whose on-disk TOML literal equals the parsed value (so the rejected
+        // `command` round-trips): relative, empty, whitespace, each metacharacter
+        // class, the placeholder, `..`, and a bidi-override char (parses through a
+        // TOML basic string unchanged, masking the command in `show`/`lint`).
+        let direct = [
+            "etc/passwd",            // relative path
+            "",                      // empty
+            "/usr/bin/foo bar",      // argument list (whitespace, also non-printable-range)
+            "/usr/bin/foo|bar",      // shell/sudoers metacharacter
+            "/usr/bin/foo#bar",      // sudoers comment (truncates the rest of the rule)
+            "/usr/bin/foo*",         // glob metacharacter
+            "/usr/bin/foo`bar",      // command-substitution backtick
+            "/usr/bin/{cmd}",        // {param} placeholder (parametrization forbidden)
+            "/usr/bin/../../bin/sh", // `..` traversal
+            "/usr/bin/\u{202e}foo",  // right-to-left override (bidi masking, non-ASCII)
+        ];
+        for bad in direct {
+            let (_tmp, decl) = fixture(&format!("[payload]\nsudo = [\"{bad}\"]\n"));
+            let cat = FakeCatalog::new();
+            let ctx = ResolveCtx::default();
+            let os = os();
+            let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+            assert!(
+                matches!(err, ResolveError::InvalidInlineSudo { ref command, .. } if command == bad),
+                "value {bad:?} must fail closed: {err:?}"
+            );
+        }
+
+        // Control characters embedded as TOML escape sequences (`\n`, `\r`,
+        // ` `): the TOML parser decodes the escape, so the parsed command
+        // carries the real control byte — exactly the newline-splits-the-rule and
+        // NUL vectors `is_control` once covered. The parsed value no longer equals
+        // the source literal, so only the variant is asserted.
+        for esc in ["\\n", "\\r", "\\u0000"] {
+            let (_tmp, decl) = fixture(&format!("[payload]\nsudo = [\"/usr/bin/foo{esc}bar\"]\n"));
+            let cat = FakeCatalog::new();
+            let ctx = ResolveCtx::default();
+            let os = os();
+            let err = resolve(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap_err();
+            assert!(
+                matches!(err, ResolveError::InvalidInlineSudo { .. }),
+                "control escape {esc:?} must fail closed: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_sudo_on_group_target_warns_and_is_not_materialized() {
+        // A role bound to a group via [[role_group]] carries inline payload.sudo.
+        // Inline sudo is account-level (no %group projection), so it must NOT land
+        // on the group's sudo_commands, and the author must be warned it was
+        // ignored rather than silently losing the primitive.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut f = std::fs::File::create(tmp.path().join("oper.toml")).unwrap();
+        f.write_all(
+            b"role = \"oper\"\nversion = 1\nos = \"linux\"\nname = \"Operator\"\nlevel = 5\n\
+              [payload]\nsudo = [\"/usr/sbin/myapp-reload\"]\n",
+        )
+        .unwrap();
+        let store = tmp.path().display().to_string();
+        let decl_text = format!(
+            "schema = 1\nversion = 4\nrole_store = \"{store}\"\n\
+             [defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\n\
+             home_base = \"/var/lib/census/home\"\n\
+             [[group]]\nname = \"opsgrp\"\ngid = 8030\n\
+             [[role_group]]\nrole = \"oper\"\ngroup = \"opsgrp\"\n"
+        );
+        let decl = Declaration::parse(&decl_text).unwrap();
+        let cat = FakeCatalog::new();
+        let ctx = ResolveCtx::default();
+        let os = os();
+        let (groups, warnings) = resolve_groups(&decl, &empty_inputs(&cat, &os, &ctx)).unwrap();
+        let grp = groups.iter().find(|g| g.name == "opsgrp").unwrap();
+        assert!(
+            grp.sudo_commands.is_empty(),
+            "inline sudo must not project onto the group: {:?}",
+            grp.sudo_commands
+        );
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ResolveWarning::InlineSudoDroppedOnGroupTarget { role, group }
+                    if role == "oper" && group == "opsgrp"
+            )),
+            "expected inline-sudo-dropped-on-group-target warning: {warnings:?}"
         );
     }
 
@@ -1923,6 +2247,7 @@ uid = 9010
         let store = tmp.path().display().to_string();
         let decl_text = format!(
             r#"
+schema = 1
 version = 4
 role_store = "{store}"
 [defaults]

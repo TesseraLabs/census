@@ -166,9 +166,9 @@ l10n, не трогая security-определения.
 ## 8. CLI автора
 
 ```bash
-census compile <role> --catalog-dir D --os-target T --lint   # раскрыть разрешения → примитивы + provenance
+census compile <role> --additional-catalog-dir D --os-target T --lint   # раскрыть разрешения → примитивы + provenance
 census show    <role> --lang ru --os-target T                # дерево разрешение→примитив, локализовано
-census framework lint     --catalog-dir D                    # валидация маппингов на каталог
+census framework lint     --additional-catalog-dir D                    # валидация маппингов на каталог
 census framework coverage <fw>                               # какие контроли ещё не покрыты
 census framework risk     <fw>                               # какие контроли маппинг подрывает
 ```

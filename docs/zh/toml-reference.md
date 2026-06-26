@@ -32,13 +32,33 @@ Census 读取以下几类文件：
 
 | 键 | 类型 | 必填 | 含义 |
 |---|---|---|---|
-| `version` | 整数 | 是 | 声明 schema 版本。当前为 `1`。 |
+| `schema` | 整数 | 是 | 声明的**解析器格式版本**。当前为 `1`。Census **最先**检查它，先于任何其他校验，并拒绝其 `schema` 超出本构建所支持范围的声明（fail-closed，不做任何变更）——见 §1.1.1。 |
+| `version` | 整数 | 是 | 声明内容的**单调 anti-rollback 计数器**（保护签名不被 replay）——*不是*格式版本。仅在 managed/signed 模式下强制；在 `--trust-fs` 下**不检查**。每次新签名的声明都应递增它。见 §1.1.1。 |
 | `role_store` | 路径 | 是 | role-store 目录路径，**相对于 Census 运行的工作目录**解析（或绝对路径）。 |
 | `[defaults]` | 表 | 是 | 账户默认属性（§1.2）。 |
 | `[[role_account]]` | 表数组 | 否 | 要配置的角色账户（§1.3）。 |
 | `[[group]]` | 表数组 | 否 | 独立的组（§1.4）。 |
 | `[[role_group]]` | 表数组 | 否 | 将某角色的授权绑定到已声明的组（§1.5）。 |
 | `signature` | 字符串（hex） | 仅 managed | 对声明字节的分离式 Ed25519 签名。当声明被集中签名时存在；在 `--trust-fs`（standalone）下**不存在**。不由手工编写——由控制平面添加。 |
+
+#### 1.1.1 `schema` vs `version` —— 两个不同的数字
+
+这两个整数字段看起来相像、容易混淆，但它们回答的是不同的问题：
+
+| 字段 | 回答 | 强制 |
+|---|---|---|
+| `schema` | *「这是哪种 TOML 格式？」*——解析器格式版本。 | 始终。**最先**检查，先于任何其他字段；`schema` 比本构建所支持的更新 → 拒绝、fail-closed、不做变更。 |
+| `version` | *「这份内容有多新？」*——保护签名不被 replay 的单调 anti-rollback 计数器。 | 仅在 managed（签名）模式下；在 `--trust-fs` 下**不**检查。 |
+
+- **`schema`** 关乎文件的*形态*。仅当格式本身发生不兼容变更时才递增它；不理解更新
+  `schema` 的构建会干净地停下并给出清晰提示，而非在深处遇到未知键才失败。
+- **`version`** 关乎*内容*。**每次新签名的声明**都应递增它，使攻击者无法重放
+  （replay）较旧的已签名副本、把设备回退到陈旧的访问。在 standalone（`--trust-fs`）模式
+  下没有签名可重放，因此 `version` 被记录但不强制。
+
+二者独立变动：重新签发设备的访问会递增 `version` 而 `schema` 不变；迁移文件格式会递增
+`schema` 而 `version` 不受影响。把它们合并成一个字段，要么会在格式升级时造成误判式的
+rollback 拒绝，要么会在 schema 重构时留下 replay 防护的漏洞。
 
 ### 1.2 `[defaults]`
 
@@ -154,14 +174,15 @@ Tessera 共同拥有，它添加 Census 不需要的适配字段）。Census 作
 
 ### 2.2 `[payload]`
 
-所有字段可选；宽松（未知键被忽略）。原始原语（`groups`、`sudo_role`、`limits`、
-`files`）是一个**逃生舱（escape hatch）**，它与 `permissions` 的展开**取并集**——可用
-其一，或两者皆用。
+所有字段可选；宽松（未知键被忽略）。原始原语（`groups`、`sudo`、`sudo_role`、
+`limits`、`files`）是一个**逃生舱（escape hatch）**，它与 `permissions` 的展开
+**取并集**——可用其一，或两者皆用。
 
 | 键 | 类型 | 含义 |
 |---|---|---|
 | `permissions` | 数组 | 针对目录展开的权限引用（§2.3）。授予访问的常规方式。 |
 | `groups` | 字符串数组 | 直接添加的原始附加组（逃生舱——绕过目录）。 |
+| `sudo` | 字符串数组 | 直接携带的原始内联 `sudo` 命令规则（逃生舱——绕过目录）。仅限字面量绝对命令路径；见 §2.7。 |
 | `sudo_role` | 字符串 | 直接携带的原始 sudo 角色名（逃生舱）。 |
 | `[payload.limits]` | 表 | 资源限制（§2.4）。 |
 | `[[payload.files]]` | 表数组 | 原始的内联文件访问授权（§2.5）。 |
@@ -176,6 +197,7 @@ level   = 3
 [payload]
 permissions = ["service-restart", "log-read", { id = "service-control", units = "nginx" }, "nginx.operate"]
 groups      = ["video"]                 # 逃生舱，取并集
+sudo        = ["/usr/sbin/reboot"]      # 逃生舱，原始 sudo 命令（§2.7）
 sudo_role   = "operations"              # 逃生舱
 
 [payload.limits]
@@ -245,6 +267,30 @@ recursive = true
 
 多数授权需要的正是 `"ro"` 与 `"rw"`。
 
+### 2.7 `payload.sudo` —— 原始 sudo 命令（逃生舱）
+
+`[payload]` 下的 `sudo` 是 `[[payload.files]]` 的命令级孪生：一份**直接**携带进角色的
+原始 `sudo` 命令规则列表，与角色 `permissions` 的展开**取并集**——与目录权限的 `sudo`
+字段同途。用于尚无对应目录权限的命令。
+
+```toml
+[payload]
+sudo = ["/usr/sbin/reboot", "/usr/bin/systemctl"]
+```
+
+约束——在向 `sudoers` 写入任何内容**之前**校验，违反则 fail-closed：
+
+- **仅限字面量绝对命令路径**——每个元素必须以 `/` 开头。
+- **不得有参数、不得有 `{placeholder}` 模板。** 带 confinement 的参数化（由 `[params]`
+  约束护住的 `{unit}`）仍是 catalog-id 的专属——内联参数无从约束，故被拒绝。
+- **可打印 ASCII，不得有 shell 元字符**（`; | & $ < >` 等）——一律拒绝，以免某个值把第二
+  条命令夹带进 sudoers 行。
+
+每个元素以 **root** 物化进 `sudoers.d/census-<role>`，因此是一次真正的提权授予。由于它绕过
+精选目录，它**不带风险标签**——因此 `census show` 与 `census compile --lint` 会把内联
+`payload.sudo`（如同 `[[payload.files]]`）标记为 **raw / unlabeled escalation-capable**，
+使审阅者总能看到它。有对应目录权限时优先使用之；仅在有意使用逃生舱时才动用 `payload.sudo`。
+
 ---
 
 ## 3. 目录权限文件（概要）
@@ -305,7 +351,7 @@ recursive = true
 的**具体产物**，以统一 diff 呈现——当前受管状态对已解析目标：
 
 ```sh
-census plan --declaration declaration.toml --catalog-dir /opt/census/share/permissions --diff
+census plan --declaration declaration.toml --additional-catalog-dir /opt/census/share/permissions --diff
 ```
 
 `plan --diff` 按每个变更的账户显示：

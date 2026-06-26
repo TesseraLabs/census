@@ -36,8 +36,13 @@ pub enum Command {
         managed: std::path::PathBuf,
         /// Extra catalog root for permission expansion (repeatable; appended to
         /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
+        #[arg(long = "additional-catalog-dir")]
+        additional_catalog_dir: Vec<std::path::PathBuf>,
+        /// Drop the built-in default catalog roots, resolving only against the
+        /// `--additional-catalog-dir` roots. With no additional root this leaves
+        /// zero roots and the command fails closed.
+        #[arg(long)]
+        no_default_catalog_dirs: bool,
         /// Override the OS target as `family-distro-version` (e.g.
         /// `linux-debian-12`); autodetected from /etc/os-release if absent.
         #[arg(long)]
@@ -69,8 +74,13 @@ pub enum Command {
         sessions_file: std::path::PathBuf,
         /// Extra catalog root for permission expansion (repeatable; appended to
         /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
+        #[arg(long = "additional-catalog-dir")]
+        additional_catalog_dir: Vec<std::path::PathBuf>,
+        /// Drop the built-in default catalog roots, resolving only against the
+        /// `--additional-catalog-dir` roots. With no additional root this leaves
+        /// zero roots and the command fails closed.
+        #[arg(long)]
+        no_default_catalog_dirs: bool,
         /// Override the OS target as `family-distro-version` (e.g.
         /// `linux-debian-12`); autodetected from /etc/os-release if absent.
         #[arg(long)]
@@ -106,8 +116,13 @@ pub enum Command {
         declaration: std::path::PathBuf,
         /// Extra catalog root for permission expansion (repeatable; appended to
         /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
+        #[arg(long = "additional-catalog-dir")]
+        additional_catalog_dir: Vec<std::path::PathBuf>,
+        /// Drop the built-in default catalog roots, resolving only against the
+        /// `--additional-catalog-dir` roots. With no additional root this leaves
+        /// zero roots and the command fails closed.
+        #[arg(long)]
+        no_default_catalog_dirs: bool,
         /// Override the OS target as `family-distro-version` (e.g.
         /// `linux-debian-12`); autodetected from /etc/os-release if absent.
         #[arg(long)]
@@ -129,8 +144,13 @@ pub enum Command {
         declaration: std::path::PathBuf,
         /// Extra catalog root for permission expansion (repeatable; appended to
         /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
+        #[arg(long = "additional-catalog-dir")]
+        additional_catalog_dir: Vec<std::path::PathBuf>,
+        /// Drop the built-in default catalog roots, resolving only against the
+        /// `--additional-catalog-dir` roots. With no additional root this leaves
+        /// zero roots and the command fails closed.
+        #[arg(long)]
+        no_default_catalog_dirs: bool,
         /// Override the OS target as `family-distro-version` (e.g.
         /// `linux-debian-12`); autodetected from /etc/os-release if absent.
         #[arg(long)]
@@ -240,8 +260,13 @@ pub enum FrameworkSub {
         framework_dir: Vec<std::path::PathBuf>,
         /// Extra catalog root (repeatable; appended to the defaults) — used to
         /// detect orphaned mappings (permission-id absent from the catalog).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
+        #[arg(long = "additional-catalog-dir")]
+        additional_catalog_dir: Vec<std::path::PathBuf>,
+        /// Drop the built-in default catalog roots, resolving only against the
+        /// `--additional-catalog-dir` roots. With no additional root this leaves
+        /// zero roots and orphan detection fails closed.
+        #[arg(long)]
+        no_default_catalog_dirs: bool,
         /// Override the OS target as `family-distro-version`; autodetected if absent.
         #[arg(long)]
         os_target: Option<String>,
@@ -266,8 +291,13 @@ pub enum CatalogSub {
         os_target: Option<String>,
         /// Extra catalog root for permission expansion (repeatable; appended to
         /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
+        #[arg(long = "additional-catalog-dir")]
+        additional_catalog_dir: Vec<std::path::PathBuf>,
+        /// Drop the built-in default catalog roots, resolving only against the
+        /// `--additional-catalog-dir` roots. With no additional root this leaves
+        /// zero roots and the command fails closed.
+        #[arg(long)]
+        no_default_catalog_dirs: bool,
         /// Role-store dir whose roles are resolved into concrete instances so
         /// parametrized permissions contribute named units/paths/groups.
         #[arg(long)]
@@ -308,8 +338,13 @@ pub enum CatalogSub {
         os_target: Option<String>,
         /// Extra catalog root for permission expansion (repeatable; appended to
         /// the defaults in precedence order — later wins).
-        #[arg(long = "catalog-dir")]
-        catalog_dir: Vec<std::path::PathBuf>,
+        #[arg(long = "additional-catalog-dir")]
+        additional_catalog_dir: Vec<std::path::PathBuf>,
+        /// Drop the built-in default catalog roots, resolving only against the
+        /// `--additional-catalog-dir` roots. With no additional root this leaves
+        /// zero roots and the command fails closed.
+        #[arg(long)]
+        no_default_catalog_dirs: bool,
         /// Declaration whose `[[role_group]]` bindings are resolved so group
         /// grants (`via %group sudoers` / `via g:group ACL`) appear in the
         /// lookup. Optional; without it only account grants are reported.

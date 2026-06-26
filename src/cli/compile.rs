@@ -45,6 +45,11 @@ pub struct CompiledRole {
     pub raw_groups: Vec<String>,
     /// Raw `payload.sudo_role`, if any (escape hatch).
     pub raw_sudo_role: Option<String>,
+    /// Raw `payload.sudo` literal commands (escape hatch), the sudo parallel to a
+    /// raw file grant. These bypass the catalog risk-label, so the flat sudo view
+    /// seeds them tagged `[raw]` and lint flags them as unlabeled
+    /// escalation-capable.
+    pub raw_sudo: Vec<String>,
     /// Raw `payload.limits` (escape hatch); default when unset.
     pub raw_limits: Limits,
 }
@@ -73,13 +78,21 @@ impl CompiledRole {
         out
     }
 
-    /// The flat union of every sudo command across all permissions, deduped by
-    /// value, each tagged with provenance.
+    /// The flat union of the raw `payload.sudo` escape-hatch commands plus every
+    /// sudo command across all permissions, deduped by value, each tagged with
+    /// provenance. Raw inline commands come first (they seed the role) tagged
+    /// `[raw]`, mirroring [`Self::flat_groups`] — so a reviewer sees an uncurated
+    /// escalation-capable command next to its `[raw]` marker.
     fn flat_sudo(&self) -> Vec<FlatPrimitive> {
         let mut out: Vec<FlatPrimitive> = Vec::new();
         // Borrowed seen-set: O(1) membership, first-seen output order, no clones
         // for the dedup itself (only deduped values are cloned into `out`).
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for cmd in &self.raw_sudo {
+            if seen.insert(cmd.as_str()) {
+                out.push(FlatPrimitive::raw(cmd.clone()));
+            }
+        }
         for perm in &self.permissions {
             for p in &perm.resolved.sudo {
                 if seen.insert(p.value.as_str()) {
@@ -264,6 +277,16 @@ pub fn compile_role(
         }
     }
 
+    // Inline sudo is surfaced unconditionally (even on a permission-free role):
+    // unlike the tame legacy primitives above, it is escalation-capable and
+    // bypasses the catalog risk-label, so a reviewer must always see it flagged as
+    // raw / unlabeled. Mirrors the model layer's resolve warning.
+    if !comp.sudo.is_empty() {
+        warnings.push(model::ResolveWarning::InlineSudoUnlabeled {
+            role: role.to_owned(),
+        });
+    }
+
     let mut permissions = Vec::with_capacity(comp.permissions.len());
     for perm in &comp.permissions {
         let (resolved, catalog_warnings) = catalog::resolve_with_params(
@@ -289,6 +312,7 @@ pub fn compile_role(
             permissions,
             raw_groups: comp.groups,
             raw_sudo_role: comp.sudo_role,
+            raw_sudo: comp.sudo,
             raw_limits: comp.limits,
         },
         warnings,

@@ -1,7 +1,7 @@
 //! Reads the Linux *composition* subset of a Tessera role-store slice.
 //!
 //! Census needs only `payload.groups`, `payload.sudo_role`, `payload.limits`,
-//! `payload.permissions`, and `payload.files`.
+//! `payload.permissions`, `payload.files`, and `payload.sudo`.
 //! Parsing is TOLERANT (no `deny_unknown_fields`): full role-schema validation
 //! is Tessera's responsibility (spec §17). Census ignores fields it does not
 //! consume (`mac_mask`, `selinux`, `session`, `name`, `level`, ...). The one
@@ -149,6 +149,16 @@ pub struct RoleComposition {
     /// setfacl, so an unknown key must fail closed. Like the other raw primitives,
     /// these are unioned with the permission expansion by the resolver.
     pub files: Vec<FileGrant>,
+    /// Inline sudo commands (raw escape-hatch primitive), the sudo parallel to
+    /// `files`: a list of literal absolute command paths granted directly on the
+    /// role, bypassing the catalog risk-label. Values are LITERAL-only — no
+    /// `{placeholder}` and no argument list — because parametrization with
+    /// confinement is the prerogative of a catalog id and its `[params.X]`
+    /// constraints. Each value is validated and unioned into the account's
+    /// sudo commands by the resolver alongside the permission expansion; an
+    /// invalid value fails resolution closed (it would otherwise reach a NOPASSWD
+    /// sudoers rule emitted as root).
+    pub sudo: Vec<String>,
     /// Permission references to expand against the catalog. Each is a bare id or
     /// a `{id, ...params}` table. The raw `groups`/`sudo_role`/`limits`/`files`
     /// above are unioned with the expansion of these (spec: escape hatch coexists
@@ -186,6 +196,8 @@ pub struct SlicePayload {
     limits: Option<Limits>,
     #[serde(default)]
     files: Option<Vec<FileGrant>>,
+    #[serde(default)]
+    sudo: Option<Vec<String>>,
     #[serde(default)]
     permissions: Option<Vec<PermissionRef>>,
 }
@@ -248,6 +260,7 @@ pub fn read_composition(role_store: &Path, role: &str) -> Result<RoleComposition
         sudo_role: None,
         limits: None,
         files: None,
+        sudo: None,
         permissions: None,
     });
     Ok(RoleComposition {
@@ -255,6 +268,7 @@ pub fn read_composition(role_store: &Path, role: &str) -> Result<RoleComposition
         sudo_role: payload.sudo_role,
         limits: payload.limits.unwrap_or_default(),
         files: payload.files.unwrap_or_default(),
+        sudo: payload.sudo.unwrap_or_default(),
         permissions: payload.permissions.unwrap_or_default(),
     })
 }
@@ -570,6 +584,64 @@ recursiv = true
         );
         let err = read_composition(tmp.path(), "typo").unwrap_err();
         assert!(matches!(err, RoleStoreError::TomlParse { .. }));
+    }
+
+    #[test]
+    fn reads_inline_sudo_commands() {
+        // payload.sudo is parsed as a raw list of literal command paths; the
+        // reader does not validate them (that is the resolver's fail-closed job).
+        let tmp = tempfile::tempdir().unwrap();
+        write_slice(
+            tmp.path(),
+            "reload",
+            r#"
+role = "reload"
+version = 1
+os = "linux"
+name = "Reload"
+level = 2
+[payload]
+sudo = ["/usr/sbin/myapp-reload", "/usr/bin/systemctl"]
+"#,
+        );
+        let c = read_composition(tmp.path(), "reload").unwrap();
+        assert_eq!(c.sudo, vec!["/usr/sbin/myapp-reload", "/usr/bin/systemctl"]);
+    }
+
+    #[test]
+    fn inline_sudo_coexists_with_permissions_and_raw_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_slice(
+            tmp.path(),
+            "sudomix",
+            r#"
+role = "sudomix"
+version = 1
+os = "linux"
+name = "Sudo Mix"
+level = 3
+[payload]
+groups = ["wheel"]
+permissions = ["log-read"]
+sudo = ["/usr/sbin/myapp-reload"]
+"#,
+        );
+        let c = read_composition(tmp.path(), "sudomix").unwrap();
+        assert_eq!(c.groups, vec!["wheel"]);
+        assert_eq!(c.permissions.len(), 1);
+        assert_eq!(c.sudo, vec!["/usr/sbin/myapp-reload"]);
+    }
+
+    #[test]
+    fn absent_inline_sudo_yields_empty_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_slice(
+            tmp.path(),
+            "nosudo",
+            "role = \"nosudo\"\nversion = 1\nos = \"linux\"\nname = \"n\"\nlevel = 0\n[payload]\ngroups = [\"wheel\"]\n",
+        );
+        let c = read_composition(tmp.path(), "nosudo").unwrap();
+        assert!(c.sudo.is_empty());
     }
 
     #[test]

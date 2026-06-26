@@ -769,7 +769,8 @@ mod tests {
     fn signed_decl(sk: &SigningKey, version: u32) -> (String, Declaration) {
         // The exact bytes that will appear on disk, signature line included.
         // We sign `signed_payload(full)` so canonicalization is exercised end-to-end.
-        let head = format!("version = {version}\nrole_store = \"/var/lib/tessera/roles\"\n");
+        let head =
+            format!("version = {version}\nschema = 1\nrole_store = \"/var/lib/tessera/roles\"\n");
         let tail = "[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n";
         // First splice in a placeholder to get the canonical payload (= head+tail).
         let payload = format!("{head}{tail}");
@@ -793,7 +794,7 @@ mod tests {
     #[test]
     fn verify_trust_standalone_grants_without_signature() {
         let decl = Declaration::parse(
-            "version = 7\nrole_store = \"/x\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
+            "version = 7\nschema = 1\nrole_store = \"/x\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
         )
         .unwrap();
         let o = TrustOptions {
@@ -828,7 +829,7 @@ mod tests {
         let sk = keypair();
         let anchor = anchor_file(tmp.path(), &sk);
         let decl = Declaration::parse(
-            "version = 5\nrole_store = \"/x\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
+            "version = 5\nschema = 1\nrole_store = \"/x\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
         )
         .unwrap();
         let err = verify_trust(

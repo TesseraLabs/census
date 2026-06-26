@@ -440,15 +440,16 @@ fn render_runspec(commands: &[crate::model::SudoCommand]) -> String {
 /// second physical sudoers directive line) are rejected upstream at catalog
 /// parse, so a value reaching here is already a single-line absolute path. This
 /// escaper is the second layer: it neutralises the sudoers metacharacters
-/// `, : = \ ( ) !` by backslash-escaping each, so every entry renders as exactly
+/// `, : = \ ( ) ! #` by backslash-escaping each, so every entry renders as exactly
 /// one literal Cmnd. `,` is the Cmnd-list separator; `( )` open a per-command
-/// runas override; `!` is the negation operator; `: =` are rule punctuation.
-/// Without escaping, any of these in a command string could broaden the rule or
-/// alter its meaning rather than name a command.
+/// runas override; `!` is the negation operator; `: =` are rule punctuation; `#`
+/// starts a comment that would silently truncate the rest of the line. Without
+/// escaping, any of these in a command string could broaden the rule, comment out
+/// part of it, or alter its meaning rather than name a command.
 fn escape_sudoers_command(cmd: &str) -> String {
     let mut out = String::with_capacity(cmd.len());
     for ch in cmd.chars() {
-        if matches!(ch, ',' | ':' | '=' | '\\' | '(' | ')' | '!') {
+        if matches!(ch, ',' | ':' | '=' | '\\' | '(' | ')' | '!' | '#') {
             out.push('\\');
         }
         out.push(ch);

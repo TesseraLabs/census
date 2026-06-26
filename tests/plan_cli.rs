@@ -33,7 +33,7 @@ fn plan_reports_create_for_new_role() {
     write(
         &decl,
         &format!(
-            "version = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
+            "version = 1\nschema = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
             store.display()
         ),
     );
@@ -83,7 +83,7 @@ fn plan_diff_shows_runas_fragment_and_target_path_for_create() {
     write(
         &decl,
         &format!(
-            "version = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"svc\"\nuid = 9100\n",
+            "version = 1\nschema = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"svc\"\nuid = 9100\n",
             store.display()
         ),
     );
@@ -94,7 +94,7 @@ fn plan_diff_shows_runas_fragment_and_target_path_for_create() {
         .arg(&decl)
         .arg("--managed")
         .arg(&managed)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -131,7 +131,7 @@ fn plan_without_diff_keeps_terse_output() {
     write(
         &decl,
         &format!(
-            "version = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
+            "version = 1\nschema = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
             store.display()
         ),
     );
@@ -164,7 +164,7 @@ fn plan_fails_on_missing_role_slice() {
     write(
         &decl,
         &format!(
-            "version = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"ghost\"\nuid = 9010\n",
+            "version = 1\nschema = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"ghost\"\nuid = 9010\n",
             store.display()
         ),
     );
