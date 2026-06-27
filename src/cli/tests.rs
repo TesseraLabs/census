@@ -1390,6 +1390,7 @@ fn sample_report() -> CoverageReport {
         catalog_version: Some("2026.06".to_owned()),
         os_target: "linux-debian-12".to_owned(),
         catalog_warnings: vec![],
+        scan_warnings: vec![],
     }
 }
 
@@ -1443,24 +1444,47 @@ fn resolve_roles_honours_additional_catalog_dir_override() {
 
 #[test]
 fn coverage_exit_code_gates_on_min_coverage() {
-    // No threshold → always success even at 0%.
+    // No threshold → always success even at 0%, and even if the scan degraded
+    // (without a gate the audit is read-only).
     assert_eq!(
-        format!("{:?}", coverage_exit_code(0.0, None)),
+        format!("{:?}", coverage_exit_code(0.0, None, false)),
+        format!("{:?}", ExitCode::SUCCESS)
+    );
+    assert_eq!(
+        format!("{:?}", coverage_exit_code(0.0, None, true)),
         format!("{:?}", ExitCode::SUCCESS)
     );
     // Below threshold → exit 4 (CI-gate, distinct from FAILURE==1).
     assert_eq!(
-        format!("{:?}", coverage_exit_code(81.0, Some(85.0))),
+        format!("{:?}", coverage_exit_code(81.0, Some(85.0), false)),
         format!("{:?}", ExitCode::from(4))
     );
     // At or above threshold → success.
     assert_eq!(
-        format!("{:?}", coverage_exit_code(85.0, Some(85.0))),
+        format!("{:?}", coverage_exit_code(85.0, Some(85.0), false)),
         format!("{:?}", ExitCode::SUCCESS)
     );
     assert_eq!(
-        format!("{:?}", coverage_exit_code(90.0, Some(85.0))),
+        format!("{:?}", coverage_exit_code(90.0, Some(85.0), false)),
         format!("{:?}", ExitCode::SUCCESS)
+    );
+}
+
+#[test]
+fn coverage_exit_code_fails_closed_on_scan_degradation() {
+    // Fail-closed guard: a degraded grant class means the surface was not fully
+    // enumerated, so `overall_pct` is computed over a shrunken denominator and may
+    // read above the threshold while half the surface was never seen. With a
+    // threshold, a degraded scan trips the gate (exit 4) REGARDLESS of how high the
+    // percentage looks — even at a perfect 100.0 against a 0.0 threshold.
+    assert_eq!(
+        format!("{:?}", coverage_exit_code(100.0, Some(90.0), true)),
+        format!("{:?}", ExitCode::from(4)),
+        "an inflated percentage over a degraded scan must not pass the gate"
+    );
+    assert_eq!(
+        format!("{:?}", coverage_exit_code(100.0, Some(0.0), true)),
+        format!("{:?}", ExitCode::from(4))
     );
 }
 

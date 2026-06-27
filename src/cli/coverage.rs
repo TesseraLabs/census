@@ -172,14 +172,25 @@ pub(crate) fn resolve_roles(
     out
 }
 
-/// Map overall coverage and an optional `--min-coverage` threshold to an exit
-/// code. Without a threshold the audit is read-only and always succeeds (0). With
-/// a threshold, coverage below it exits 4 (a distinct CI-gate failure, separate
-/// from a scan/catalog error which exits `FAILURE`==1). Pure so the policy is
+/// Map overall coverage, an optional `--min-coverage` threshold, and whether the
+/// scan degraded to an exit code. Without a threshold the audit is read-only and
+/// always succeeds (0). With a threshold, exit 4 (a distinct CI-gate failure,
+/// separate from a scan/catalog error which exits `FAILURE`==1) when EITHER the
+/// coverage is below the threshold OR a requested grant class degraded.
+///
+/// The `scan_degraded` arm is the fail-closed guard: a degraded grant class was
+/// not fully enumerated, so its objects are missing from the denominator and
+/// `overall_pct` reads higher than the truth — it could clear the threshold while
+/// half the surface was never seen. Tripping the gate regardless makes a degraded
+/// audit impossible to mistake for a complete, passing one. Pure so the policy is
 /// unit-testable.
-pub(crate) fn coverage_exit_code(overall_pct: f64, min: Option<f64>) -> ExitCode {
+pub(crate) fn coverage_exit_code(
+    overall_pct: f64,
+    min: Option<f64>,
+    scan_degraded: bool,
+) -> ExitCode {
     match min {
-        Some(threshold) if overall_pct < threshold => ExitCode::from(4),
+        Some(threshold) if scan_degraded || overall_pct < threshold => ExitCode::from(4),
         _ => ExitCode::SUCCESS,
     }
 }
@@ -218,6 +229,17 @@ pub fn render_coverage_human(report: &CoverageReport, include_low_priority: bool
         ));
     }
     out.push_str(&format!("overall: {:.1}%\n", report.overall_pct));
+
+    // Scan degradations: a grant-class scan tool was present but failed, so that
+    // class was NOT fully enumerated and the metric above is computed over a
+    // shrunken denominator. Surface it prominently so a high percentage cannot be
+    // misread as a complete audit; the `--min-coverage` gate fails closed on these.
+    if !report.scan_warnings.is_empty() {
+        out.push_str("scan degraded (coverage INCOMPLETE; gate fails closed):\n");
+        for w in &report.scan_warnings {
+            out.push_str(&format!("  [{}] {}\n", w.class.as_str(), w.reason));
+        }
+    }
 
     // Covered objects that carry a HOW note (config via file grants): surface the
     // backend/guarantee so the operator can see which grant enforces each config.
@@ -395,12 +417,26 @@ pub fn render_coverage_json(report: &CoverageReport) -> String {
         .iter()
         .map(|w| json_str(w))
         .collect();
+    // Per-class scan degradations as `{class, reason}` objects, so a machine
+    // consumer (CI) can see exactly which classes were not fully enumerated.
+    let scan_warnings: Vec<String> = report
+        .scan_warnings
+        .iter()
+        .map(|w| {
+            format!(
+                "{{\"class\":{},\"reason\":{}}}",
+                json_str(w.class.as_str()),
+                json_str(&w.reason),
+            )
+        })
+        .collect();
     out.push_str(&format!(
-        "],\"overall_pct\":{:.1},\"catalog_version\":{},\"os_target\":{},\"catalog_warnings\":[{}]}}",
+        "],\"overall_pct\":{:.1},\"catalog_version\":{},\"os_target\":{},\"catalog_warnings\":[{}],\"scan_warnings\":[{}]}}",
         report.overall_pct,
         report.catalog_version.as_deref().map(json_str).unwrap_or_else(|| "null".to_owned()),
         json_str(&report.os_target),
         warnings.join(","),
+        scan_warnings.join(","),
     ));
 
     out.push('}');
@@ -473,8 +509,8 @@ pub fn run_coverage(opts: CoverageOpts) -> ExitCode {
         opts.classes.clone()
     };
 
-    let surface = match LiveSurface::system().scan(&classes) {
-        Ok(s) => s,
+    let outcome = match LiveSurface::system().scan(&classes) {
+        Ok(o) => o,
         Err(e) => {
             eprintln!("census: {e}");
             return ExitCode::FAILURE;
@@ -486,8 +522,8 @@ pub fn run_coverage(opts: CoverageOpts) -> ExitCode {
         catalog_version: ctx.catalog_version.clone(),
         bound_grant_groups,
     };
-    let report = match coverage::coverage_scoped(
-        &surface,
+    let mut report = match coverage::coverage_scoped(
+        &outcome.objects,
         &catalog,
         &os,
         &roles,
@@ -500,6 +536,21 @@ pub fn run_coverage(opts: CoverageOpts) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Carry the per-class scan degradations (a scan tool present but failed) into
+    // the report so they ride out in stderr, the human view, and `--json`, and so
+    // the gate can fail closed on them. The pure core left this empty.
+    report.scan_warnings = outcome.degraded;
+
+    // A degraded grant class means its surface was NOT fully enumerated, so the
+    // metric is computed over a shrunken denominator. Surface each prominently on
+    // stderr — distinct wording from the catalog-resolve warnings below.
+    for w in &report.scan_warnings {
+        eprintln!(
+            "census: warning: scan degraded for class {} (coverage incomplete): {}",
+            w.class.as_str(),
+            w.reason
+        );
+    }
 
     // A catalog id that failed to resolve was skipped rather than aborting the
     // audit; surface each as a stderr warning so the gap is visible while the
@@ -517,7 +568,13 @@ pub fn run_coverage(opts: CoverageOpts) -> ExitCode {
         );
     }
 
-    coverage_exit_code(report.overall_pct, opts.min_coverage)
+    // Fail the gate closed when any grant class degraded: an inflated `overall_pct`
+    // over a shrunken denominator must not read as a passing audit.
+    coverage_exit_code(
+        report.overall_pct,
+        opts.min_coverage,
+        !report.scan_warnings.is_empty(),
+    )
 }
 
 // ============================================================================
