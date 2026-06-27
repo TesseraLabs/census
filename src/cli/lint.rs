@@ -11,6 +11,12 @@
 //! `SECRET_PATH_PREFIXES`, `path_is_secret`, `path_boundary_overlaps`) is shared
 //! between the account-side file-grant lint and the group-grant lint so the rule
 //! cannot drift between the two.
+//!
+//! A separate classifier (`ESCALATION_CAPABLE_SUDO_BASENAMES`,
+//! `sudo_escalation_risk_findings`) catches the curated-package doctrine's
+//! canonical mislabel: a permission labelled `contained` that grants `sudo` on a
+//! known root-shell-spawning binary (a GTFOBins-class basename), where the
+//! declared risk label understates the real escalation surface.
 
 use crate::catalog::OsTarget;
 use crate::cli::compile::CompiledRole;
@@ -229,6 +235,183 @@ fn sudo_command_edits_root_equivalent(command: &str) -> bool {
         })
 }
 
+/// Sudo command basenames that can spawn a root shell (or otherwise execute
+/// arbitrary code) the moment a member is allowed to run them under `sudo` —
+/// the GTFOBins "sudo → shell" class plus the curated-package service binaries
+/// the risk doctrine repeatedly catches mislabelled (the cups/nut/smartmontools/
+/// edgex "non-root-but-actually-root" family). A permission that hands one of
+/// these out under `sudo` is escalation-capable in fact, whatever its declared
+/// label says.
+///
+/// This list is CURATED and deliberately NON-EXHAUSTIVE: it is not a complete
+/// GTFOBins mirror and is not meant to be one. Its only job is to surface a
+/// LIKELY mislabel for a human reviewer — a false negative here costs nothing
+/// (the lint never gates), and keeping the set small and reviewable matters more
+/// than chasing every binary that can be coerced into code execution. Matching is
+/// by command BASENAME (the last `/`-component of the sudo command's binary), so
+/// `/usr/bin/vim`, `/bin/vim`, and a bare `vim` all hit the same entry.
+///
+/// Kept sorted by category for review; membership is tested by linear scan over a
+/// handful of entries, not by ordering, so the grouping is purely for humans.
+const ESCALATION_CAPABLE_SUDO_BASENAMES: &[&str] = &[
+    // Shells and su — a direct root shell.
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "ksh",
+    "csh",
+    "tcsh",
+    "fish",
+    "busybox",
+    "su",
+    // Editors / pagers / viewers that can shell out (`:!sh`, `!command`, `v`).
+    "vi",
+    "vim",
+    "view",
+    "nano",
+    "less",
+    "more",
+    "man",
+    "pager",
+    "ed",
+    // Interpreters and text tools that run arbitrary code or commands.
+    "perl",
+    "python",
+    "python3",
+    "ruby",
+    "lua",
+    "node",
+    "awk",
+    "gawk",
+    "sed",
+    "env",
+    // Find/exec and archivers with a command-execution or checkpoint hook.
+    "find",
+    "tar",
+    "zip",
+    "cpio",
+    "rsync",
+    // Process / debug / network tools that can exec or drop a shell.
+    "gdb",
+    "strace",
+    "ltrace",
+    "nmap",
+    "socat",
+    // Generic command runners / wrappers: each runs an arbitrary child command.
+    "xargs",
+    "nice",
+    "ionice",
+    "taskset",
+    "flock",
+    "timeout",
+    "watch",
+    "nohup",
+    "stdbuf",
+    "setarch",
+    "chroot",
+    "unshare",
+    // Service / admin binaries from the curated-package risk doctrine. Each is an
+    // EXECUTABLE basename (not a package name) escalation-capable in a documented
+    // way: a pager spill (`systemctl`, `journalctl`), a package hook
+    // (`apt`/`apt-get`/`dpkg`), a config/pager escape (`git -c`/pager), a
+    // container runtime that mounts the host (`docker`/`ctr`/`runc`), an arbitrary
+    // command target (`make`, `vagrant`), a mount/exec primitive (`mount`,
+    // `unshare` above), an SSH ProxyCommand, or the print/UPS/SMART daemons and
+    // control tools the cups/nut/smartmontools doctrine packages ship
+    // (`cupsd`/`lpadmin`, `upsd`/`upsmon`/`upsdrvctl`, `smartd`/`smartctl`) — the
+    // package NAMES themselves are never a sudo command basename and so are not
+    // listed.
+    "systemctl",
+    "journalctl",
+    "cupsd",
+    "cupsctl",
+    "lpadmin",
+    "upsd",
+    "upsmon",
+    "upsdrvctl",
+    "smartd",
+    "smartctl",
+    "apt",
+    "apt-get",
+    "dpkg",
+    "git",
+    "docker",
+    "ctr",
+    "runc",
+    "mount",
+    "make",
+    "vagrant",
+    "ssh",
+];
+
+/// The basename of a sudo command: the last `/`-component of its leading binary
+/// token. `None` when the command is empty. Pure string analysis — no path
+/// resolution, no shell, no execution: `/usr/bin/vim arg` → `vim`, `vim` → `vim`,
+/// `/bin/find` → `find`. Mirrors how [`sudo_command_edits_root_equivalent`]
+/// treats the first whitespace token as the binary.
+fn sudo_command_basename(command: &str) -> Option<&str> {
+    let binary = command.split_whitespace().next()?;
+    // `rsplit('/').next()` always yields at least the whole token (no `/`), so the
+    // `Option` is `Some` whenever there is a binary token at all.
+    binary.rsplit('/').next()
+}
+
+/// Risk-lint each permission for a sudo grant whose declared risk label
+/// UNDERSTATES it: the permission claims `contained` (an explicit
+/// non-escalation label) yet grants `sudo` on a binary whose basename is a known
+/// escalation-capable shell-spawner ([`ESCALATION_CAPABLE_SUDO_BASENAMES`]). This
+/// is the curated-package doctrine's canonical failure — a "non-root-but-actually-
+/// root" grant labelled low-risk — that the file-grant lints do not cover.
+///
+/// The gate is an EXPLICIT `contained` label, not merely "not escalation-capable":
+///
+/// - `Some(Contained)` → flagged. The author actively claimed the grant is
+///   contained while handing out a root-shell primitive; that is the mislabel.
+/// - `Some(EscalationCapable)` → silent. The label is honest, so there is nothing
+///   to surface (per the lint's contract).
+/// - `None` → silent. The absence of a label is no CLAIM to understate; flagging
+///   it would be a different rule (unlabelled-but-dangerous) and would add noise
+///   to the targeted mislabel signal this lint exists for.
+///
+/// The command's run-as account is deliberately ignored (same reasoning as the
+/// sibling [`group_grant_risk_findings`]): a root-shell binary narrowed to a
+/// service account is still worth surfacing — that account may itself be
+/// privileged — and ignoring `runas` only ever over-warns (the safe direction),
+/// never under-warns.
+///
+/// Findings are advisory WARNINGs (like every other risk lint): they inform a
+/// reviewer but never gate `compile --lint` or `apply`.
+pub(crate) fn sudo_escalation_risk_findings(compiled: &CompiledRole) -> Vec<LintFinding> {
+    let mut out: Vec<LintFinding> = Vec::new();
+    for perm in &compiled.permissions {
+        let resolved = &perm.resolved;
+        // Only an explicit `contained` label can understate the risk; an honest
+        // `escalation-capable` label and an absent label are both left alone.
+        if resolved.risk != Some(catalog::Risk::Contained) {
+            continue;
+        }
+        for sudo in &resolved.sudo {
+            let Some(base) = sudo_command_basename(&sudo.value) else {
+                continue;
+            };
+            if ESCALATION_CAPABLE_SUDO_BASENAMES.contains(&base) {
+                out.push(LintFinding {
+                    code: "sudo-risk-understated",
+                    severity: LintSeverity::Warning,
+                    message: format!(
+                        "permission {} is labelled `contained` but grants sudo on `{base}` \
+                         (command `{}`), a known escalation-capable binary (GTFOBins-class \
+                         root-shell spawner); the declared risk label understates it",
+                        resolved.id, sudo.value
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Risk-lint the resolved group bindings for escalation-capable grants that
 /// EVERY group member inherits (including effectively-nested LDAP members). A
 /// group grant widens the blast radius beyond a single account, so the same
@@ -360,6 +543,12 @@ pub fn lint_role(
     // Advisory warnings (like the catalog's own risk labelling), placed after the
     // resolve warnings and before l10n so the output order is stable.
     out.extend(file_grant_risk_findings(compiled));
+
+    // Sudo-vs-risk-label lint: a permission labelled `contained` that grants sudo
+    // on a known escalation-capable binary (the curated-package mislabel). Sibling
+    // of the file-grant lint, kept in the same per-role pass so its advisory
+    // warnings share the stable position before l10n.
+    out.extend(sudo_escalation_risk_findings(compiled));
 
     // l10n completeness over the role's permission ids. Missing translation and
     // orphan translation are warnings (a missing/broken text must never break
