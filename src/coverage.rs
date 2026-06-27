@@ -104,11 +104,45 @@ pub struct SurfaceObject {
     pub detail: String,
 }
 
+/// A surface-scan result: the enumerated objects plus any per-class degradations.
+///
+/// A *degradation* is distinct from an empty class. A class is legitimately empty
+/// when its scan tool is simply absent (a non-systemd host has no units). It is
+/// *degraded* when the tool is present but its run could not be trusted — a spawn
+/// failure, a non-zero exit, non-UTF-8 output, or a wall-clock timeout. A degraded
+/// grant class was NOT fully enumerated, so its objects are missing from the
+/// coverage denominator and the metric for it reads higher than the truth. The
+/// caller surfaces every degradation and fails the `--min-coverage` gate closed on
+/// it, so a half-read scan can never be mistaken for a complete, passing audit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanOutcome {
+    /// Every enumerated surface object across the requested classes.
+    pub objects: Vec<SurfaceObject>,
+    /// Per-class scan degradations (tool present but its output is untrustworthy).
+    /// Empty on a clean scan.
+    pub degraded: Vec<ScanDegraded>,
+}
+
+/// One class's scan degradation: the class whose live enumeration could not be
+/// trusted, and a human reason naming the tool and how it failed. Kept separate
+/// from a legitimately-empty class (tool simply absent) so a passing coverage gate
+/// can never be misread as a complete audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanDegraded {
+    /// The grant class whose live enumeration degraded.
+    pub class: SurfaceClass,
+    /// Why the class could not be trusted (tool + failure mode).
+    pub reason: String,
+}
+
 /// A source of live surface objects, abstracted so the coverage core is pure and
 /// unit tests supply an in-memory surface without touching the filesystem.
 pub trait SurfaceScanner {
     /// Enumerate the privileged surface, restricted to the requested `classes`.
-    fn scan(&self, classes: &[SurfaceClass]) -> Result<Vec<SurfaceObject>, CoverageError>;
+    ///
+    /// Returns the enumerated objects together with any per-class degradations (a
+    /// scan tool that was present but failed); see [`ScanOutcome`].
+    fn scan(&self, classes: &[SurfaceClass]) -> Result<ScanOutcome, CoverageError>;
 }
 
 /// A resolved role instance the coverage core folds in so parametrized
@@ -260,6 +294,14 @@ pub struct CoverageReport {
     /// abort the whole report — so the offending ids are reported here instead
     /// of turning into a hard error. Empty when every id resolved.
     pub catalog_warnings: Vec<String>,
+    /// Per-class scan degradations: grant classes whose live scan tool was present
+    /// but failed (spawn error, non-zero exit, non-UTF-8 output, or timeout), so
+    /// the class was not fully enumerated. Distinct from `catalog_warnings` (a
+    /// catalog-side resolve failure). A non-empty list means the metric is computed
+    /// over a shrunken denominator and may read higher than the truth; the CLI
+    /// fails the `--min-coverage` gate closed whenever any entry is present. Filled
+    /// by the CLI from the [`ScanOutcome`]; the pure core leaves it empty.
+    pub scan_warnings: Vec<ScanDegraded>,
 }
 
 /// Errors computing coverage or enumerating the surface.
@@ -297,13 +339,16 @@ impl FakeSurface {
 }
 
 impl SurfaceScanner for FakeSurface {
-    fn scan(&self, classes: &[SurfaceClass]) -> Result<Vec<SurfaceObject>, CoverageError> {
-        Ok(self
-            .objects
-            .iter()
-            .filter(|o| classes.contains(&o.class))
-            .cloned()
-            .collect())
+    fn scan(&self, classes: &[SurfaceClass]) -> Result<ScanOutcome, CoverageError> {
+        Ok(ScanOutcome {
+            objects: self
+                .objects
+                .iter()
+                .filter(|o| classes.contains(&o.class))
+                .cloned()
+                .collect(),
+            degraded: Vec::new(),
+        })
     }
 }
 
@@ -486,17 +531,6 @@ fn build_covered_set(
     };
 
     let all = catalog.all_definitions(os)?;
-    for (_layer, def) in &all {
-        // Class-wide grants are detected by id presence, matching the spec: the
-        // mere existence of `service-admin`/`capability-admin` in the catalog
-        // means every unit/capfile is covered.
-        if def.id == SERVICE_ADMIN_ID {
-            has_service_admin = true;
-        }
-        if def.id == CAPABILITY_ADMIN_ID {
-            has_capability_admin = true;
-        }
-    }
 
     // Resolve each *distinct* id once (an id may appear on several layers as the
     // override chain; resolve merges them). Dedup ids first so we don't re-resolve.
@@ -508,6 +542,20 @@ fn build_covered_set(
 
         match catalog::resolve(&def.id, os, catalog, &resolve_ctx) {
             Ok((resolved, _warnings)) => {
+                // Class-wide grants flip their flag ONLY on a successful resolve.
+                // The mere presence of `service-admin`/`capability-admin` is not
+                // enough: an id that exists but cannot resolve (cycle, contradiction,
+                // unknown include) is recorded as a warning below and contributes
+                // nothing — flipping the flag on bare presence would mark every
+                // unit/capfile covered off a permission that never actually resolves,
+                // a class-wide false "covered". So the flag rides the Ok arm, next to
+                // the sudo/group/file primitives this same resolve produced.
+                if def.id == SERVICE_ADMIN_ID {
+                    has_service_admin = true;
+                }
+                if def.id == CAPABILITY_ADMIN_ID {
+                    has_capability_admin = true;
+                }
                 for p in &resolved.sudo {
                     // A templated command (e.g. `/usr/bin/systemctl restart
                     // {unit}`) arrives here with the literal `{unit}` intact —
@@ -783,39 +831,71 @@ pub fn coverage_scoped(
 
         // Config coverage is grant-based and yields a backend/guarantee note;
         // every other class is covered by the sudo/group/unit mechanism (no note).
+        // A config object whose strongest covering grant is `File`/`Pattern`-shaped
+        // is *declared but unenforceable* in the open build: the dir-only
+        // `AclBackend` can constrain a directory, not a single file or a glob. Such
+        // a grant must NOT count as covered — that would inflate the numerator off a
+        // guarantee the installed backend cannot make, the mirror image of how an
+        // ungranted bare file in a non-grantable parent is correctly excluded. It is
+        // routed to the backend-limited bucket below (leaving the metric).
+        let mut unenforceable_grant: Option<&ResolvedFileGrant> = None;
         let (is_covered, coverage_note) = if object.class == SurfaceClass::Config {
             match config_grant_cover(&object.key, &covered.file_grants) {
-                Some(note) => (true, Some(note)),
+                Some(grant) if grant_shape_enforceable(grant) => {
+                    (true, Some(grant_coverage_note(grant)))
+                }
+                Some(grant) => {
+                    // Covered only by a File/Pattern grant the open build cannot
+                    // enforce; record it for the backend-limited bucket.
+                    unenforceable_grant = Some(grant);
+                    (false, None)
+                }
                 None => (false, None),
             }
         } else {
             (object_covered(object, &covered), None)
         };
 
-        // Backend-limited reclassification: an UNCOVERED config object that is a
-        // single file directly in a non-grantable parent (e.g. `/etc/login.defs`)
-        // cannot be covered by the dir-only `AclBackend` without granting the whole
-        // parent — an over-grant, not a real gap. Bucket it separately and exclude
-        // it from the metric (denominator), exactly like an intentional exclusion
-        // but with its own distinct reason so the report tells the two apart. Only
-        // config objects can be backend-limited (only file grants are dir-shaped);
-        // a covered object is already enforceable and stays counted as covered.
-        if !is_covered
-            && object.class == SurfaceClass::Config
-            && backend_limited_config(&object.key)
-        {
-            objects.push(ObjectCoverage {
-                object: object.clone(),
-                covered: false,
-                suggested_permission: None,
-                intentional_exclusion: None,
-                backend_limited: Some(
-                    "single file in non-grantable parent; requires per-file-capable backend"
-                        .to_owned(),
-                ),
-                coverage_note: None,
-            });
-            continue;
+        // Backend-limited reclassification (config objects only): either
+        //   (a) a config object covered ONLY by a `File`/`Pattern`-shaped grant the
+        //       installed dir-only backend cannot enforce (declared-but-unenforceable),
+        //       or
+        //   (b) an UNCOVERED single file directly in a non-grantable parent
+        //       (e.g. `/etc/login.defs`) the dir-only `AclBackend` cannot cover
+        //       without granting the whole parent — an over-grant, not a real gap.
+        // Both are bucketed separately and excluded from the metric denominator,
+        // each with its own reason so the report tells them apart. A per-file- or
+        // pattern-capable backend (commercial) would cover case (a) directly.
+        if object.class == SurfaceClass::Config {
+            if let Some(grant) = unenforceable_grant {
+                objects.push(ObjectCoverage {
+                    object: object.clone(),
+                    covered: false,
+                    suggested_permission: None,
+                    intentional_exclusion: None,
+                    backend_limited: Some(format!(
+                        "declared {} grant; requires {}",
+                        shape_word(grant.shape),
+                        grant_backend(grant),
+                    )),
+                    coverage_note: None,
+                });
+                continue;
+            }
+            if !is_covered && backend_limited_config(&object.key) {
+                objects.push(ObjectCoverage {
+                    object: object.clone(),
+                    covered: false,
+                    suggested_permission: None,
+                    intentional_exclusion: None,
+                    backend_limited: Some(
+                        "single file in non-grantable parent; requires per-file-capable backend"
+                            .to_owned(),
+                    ),
+                    coverage_note: None,
+                });
+                continue;
+            }
         }
 
         // Tally toward the metric (covered + honest gaps; the intentional path
@@ -866,6 +946,9 @@ pub fn coverage_scoped(
         catalog_version: ctx.catalog_version.clone(),
         os_target: os.layer_names().last().cloned().unwrap_or_default(),
         catalog_warnings,
+        // The pure core does not run the live scan, so it knows of no scan
+        // degradations; the CLI fills this from the `ScanOutcome` after scanning.
+        scan_warnings: Vec::new(),
     })
 }
 
@@ -936,25 +1019,67 @@ fn is_security_relevant_config(path: &str) -> bool {
         .any(|prefix| catalog::path_at_or_under(prefix, path))
 }
 
-/// Whether a config `path` is covered by a file grant, and if so the verdict's
-/// HOW note (`<ro|rw> via <backend> (<shape>)`). A path is covered when it equals
-/// a grant path, or lies under a `recursive` Dir grant on a component boundary.
-/// Returns the strongest covering grant's note (max access), or `None`.
-fn config_grant_cover(path: &str, grants: &[ResolvedFileGrant]) -> Option<String> {
-    let mut best: Option<&ResolvedFileGrant> = None;
+/// The strongest file grant covering a config `path`, or `None`. A path is covered
+/// when it equals a grant path, or lies under a `recursive` Dir grant on a
+/// component boundary. The caller decides the verdict from the returned grant: a
+/// `Dir`-shaped grant is enforceable by the open `AclBackend` (truly covered),
+/// while a `File`/`Pattern`-shaped grant is declared-but-unenforceable there (see
+/// [`coverage_scoped`]).
+fn config_grant_cover<'a>(
+    path: &str,
+    grants: &'a [ResolvedFileGrant],
+) -> Option<&'a ResolvedFileGrant> {
+    let mut best: Option<&'a ResolvedFileGrant> = None;
     for g in grants {
         if grant_covers_path(g, path).is_some() {
-            // Prefer the most privilege-relevant covering grant for the note: a
-            // write grant outranks a read-only one (a reviewer most needs to see
-            // the strongest access reachable on the path). Among grants of equal
-            // write-ness, keep the first seen for stability.
             best = Some(match best {
-                Some(prev) if prev.access.contains(Access::WRITE) => prev,
-                _ => g,
+                None => g,
+                Some(prev) => choose_stronger_cover(prev, g),
             });
         }
     }
-    best.map(grant_coverage_note)
+    best
+}
+
+/// Pick the stronger of two covering grants for the config verdict.
+///
+/// Enforceability ranks first: a `Dir`-shaped grant (enforceable by the open
+/// `AclBackend`) outranks a `File`/`Pattern`-shaped one, so a path covered by both
+/// an enforceable directory grant and a paper-only file grant is reported as truly
+/// covered, not demoted to backend-limited. Among grants of equal enforceability,
+/// a write grant outranks a read-only one (a reviewer most needs the strongest
+/// access reachable on the path); the first seen wins on a full tie, for stability.
+fn choose_stronger_cover<'a>(
+    prev: &'a ResolvedFileGrant,
+    cand: &'a ResolvedFileGrant,
+) -> &'a ResolvedFileGrant {
+    let prev_enforceable = grant_shape_enforceable(prev);
+    if prev_enforceable != grant_shape_enforceable(cand) {
+        return if prev_enforceable { prev } else { cand };
+    }
+    if prev.access.contains(Access::WRITE) {
+        prev
+    } else {
+        cand
+    }
+}
+
+/// Whether a covering grant's shape can be enforced by the open build's dir-only
+/// `AclBackend`. A `Dir` grant can; `File`/`Pattern` shapes need a per-file- or
+/// pattern-capable (commercial) backend, so in the open build a config object
+/// covered only by such a grant is declared-but-unenforceable, not truly covered.
+fn grant_shape_enforceable(grant: &ResolvedFileGrant) -> bool {
+    matches!(grant.shape, Shape::Dir)
+}
+
+/// The grant shape as a short word for a report reason (`File`, `Pattern`,
+/// `directory`).
+fn shape_word(shape: Shape) -> &'static str {
+    match shape {
+        Shape::Dir => "directory",
+        Shape::File => "File",
+        Shape::Pattern => "Pattern",
+    }
 }
 
 /// Whether one grant covers `path`, returning the matching grant on success.
@@ -1354,29 +1479,56 @@ impl LiveSurface {
 /// skips a directory whose path equals one of these.
 const VIRTUAL_DIRS: &[&str] = &["proc", "sys", "run", "dev"];
 
+/// Standard on-disk binary directories `getcap` is scoped to (instead of `-r /`).
+/// Capability-bearing files realistically live in these trees; scoping `getcap`
+/// here keeps it on the root device and off NFS/FUSE/virtual mounts (`getcap` has
+/// no `-xdev`), so a wedged mount cannot hang the audit. Only the ones that exist
+/// under the scan root are passed (see [`LiveSurface::scan_capfiles`]).
+const CAPFILE_SCAN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/lib",
+    "/usr/libexec",
+];
+
 impl SurfaceScanner for LiveSurface {
-    fn scan(&self, classes: &[SurfaceClass]) -> Result<Vec<SurfaceObject>, CoverageError> {
+    fn scan(&self, classes: &[SurfaceClass]) -> Result<ScanOutcome, CoverageError> {
         // Read-only enumeration of the requested classes. Each class is gathered
         // independently; a class the caller did not request is skipped entirely so
         // an operator can scope an audit (`--class group` must not pay for a `/`
         // walk). Provenance is resolved in one bulk pass at the end so we shell out
         // to `dpkg` once, not per-object.
         let mut objects: Vec<SurfaceObject> = Vec::new();
+        // Per-class scan degradations: a tool that was present but failed (see
+        // `CaptureOutcome::Degraded`). Each propagates into the report so a
+        // half-enumerated class is visible and fails the `--min-coverage` gate
+        // closed instead of silently shrinking the denominator.
+        let mut degraded: Vec<ScanDegraded> = Vec::new();
 
         if classes.contains(&SurfaceClass::SudoBin) {
             objects.extend(self.scan_sudo_bins()?);
         }
         if classes.contains(&SurfaceClass::Config) {
-            objects.extend(self.scan_configs());
+            let (objs, deg) = self.scan_configs();
+            objects.extend(objs);
+            degraded.extend(deg);
         }
         if classes.contains(&SurfaceClass::Unit) {
-            objects.extend(self.scan_units());
+            let (objs, deg) = self.scan_units();
+            objects.extend(objs);
+            degraded.extend(deg);
         }
         if classes.contains(&SurfaceClass::Group) {
             objects.extend(self.scan_groups()?);
         }
         if classes.contains(&SurfaceClass::CapFile) {
-            objects.extend(self.scan_capfiles());
+            let (objs, deg) = self.scan_capfiles();
+            objects.extend(objs);
+            degraded.extend(deg);
         }
         if classes.contains(&SurfaceClass::Setuid) {
             objects.extend(self.scan_setuid()?);
@@ -1387,7 +1539,7 @@ impl SurfaceScanner for LiveSurface {
         // ⇒ everything keeps its default Orphan (no crash) — see resolve_provenance.
         self.resolve_provenance(&mut objects);
 
-        Ok(objects)
+        Ok(ScanOutcome { objects, degraded })
     }
 }
 
@@ -1459,28 +1611,45 @@ impl LiveSurface {
     }
 
     /// Enumerate security-relevant `/etc` configs: package conffiles (via
-    /// `dpkg-query`) plus any well-known drop-in directories that exist. Missing
-    /// `dpkg-query` is non-fatal — we still return the drop-in dirs we can see, so
-    /// config enumeration degrades to "what is on disk" rather than erroring.
-    fn scan_configs(&self) -> Vec<SurfaceObject> {
+    /// `dpkg-query`) plus any well-known drop-in directories that exist.
+    ///
+    /// Returns the objects plus an optional degradation. An ABSENT `dpkg-query` is
+    /// non-fatal and not a degradation — config enumeration legitimately falls back
+    /// to the on-disk drop-in dirs. But a `dpkg-query` that is PRESENT yet fails
+    /// (non-zero exit, timeout, non-UTF-8) would silently drop the conffile half of
+    /// the surface, so it is reported as a `Config` degradation; the drop-in dirs
+    /// are still returned.
+    fn scan_configs(&self) -> (Vec<SurfaceObject>, Option<ScanDegraded>) {
         let mut out: Vec<SurfaceObject> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut degraded: Option<ScanDegraded> = None;
 
         // Package conffiles: `dpkg-query -W -f='${Conffiles}\n'` lists, per package,
         // lines of `"<path> <md5>"`. We keep only paths under `/etc` (the security-
         // relevant surface) and ignore the checksum (we never read content).
         // dpkg-query must succeed cleanly: a truncated conffile listing parsed as
         // complete would under-report the config surface.
-        if let Some(stdout) = run_capture("dpkg-query", &["-W", "-f=${Conffiles}\n"], false) {
-            for path in parse_dpkg_conffiles(&stdout) {
-                if !seen.insert(path.clone()) {
-                    continue;
+        match run_capture("dpkg-query", &["-W", "-f=${Conffiles}\n"], false) {
+            CaptureOutcome::Ok(stdout) => {
+                for path in parse_dpkg_conffiles(&stdout) {
+                    if !seen.insert(path.clone()) {
+                        continue;
+                    }
+                    out.push(SurfaceObject {
+                        class: SurfaceClass::Config,
+                        key: path,
+                        provenance: Provenance::Orphan,
+                        detail: "conffile".to_owned(),
+                    });
                 }
-                out.push(SurfaceObject {
+            }
+            // No dpkg-query: legitimately fall back to the on-disk drop-in dirs.
+            CaptureOutcome::Absent => {}
+            // Present but failed: the conffile surface is incomplete — flag it.
+            CaptureOutcome::Degraded(reason) => {
+                degraded = Some(ScanDegraded {
                     class: SurfaceClass::Config,
-                    key: path,
-                    provenance: Provenance::Orphan,
-                    detail: "conffile".to_owned(),
+                    reason,
                 });
             }
         }
@@ -1504,24 +1673,35 @@ impl LiveSurface {
                 });
             }
         }
-        out
+        (out, degraded)
     }
 
-    /// Enumerate systemd service units via `systemctl list-unit-files`. Missing
-    /// `systemctl` (a non-systemd host, a container without it) ⇒ no units, no
-    /// error: a unit-less host simply has nothing in this class.
-    fn scan_units(&self) -> Vec<SurfaceObject> {
-        // systemctl must succeed cleanly: a partial unit listing parsed as the
-        // whole would under-report the unit surface.
+    /// Enumerate systemd service units via `systemctl list-unit-files`.
+    ///
+    /// Returns the objects plus an optional degradation. An ABSENT `systemctl` (a
+    /// non-systemd host, a container without it) ⇒ no units, no degradation: a
+    /// unit-less host simply has nothing in this class. A PRESENT `systemctl` that
+    /// fails (non-zero exit, timeout, non-UTF-8) would parse a partial listing as
+    /// the whole and under-report the unit surface, so it is flagged degraded.
+    fn scan_units(&self) -> (Vec<SurfaceObject>, Option<ScanDegraded>) {
         let stdout = match run_capture(
             "systemctl",
             &["list-unit-files", "--no-legend", "--type=service"],
             false,
         ) {
-            Some(s) => s,
-            None => return Vec::new(),
+            CaptureOutcome::Ok(s) => s,
+            CaptureOutcome::Absent => return (Vec::new(), None),
+            CaptureOutcome::Degraded(reason) => {
+                return (
+                    Vec::new(),
+                    Some(ScanDegraded {
+                        class: SurfaceClass::Unit,
+                        reason,
+                    }),
+                );
+            }
         };
-        parse_systemctl_units(&stdout)
+        let objs = parse_systemctl_units(&stdout)
             .into_iter()
             .map(|name| SurfaceObject {
                 class: SurfaceClass::Unit,
@@ -1531,7 +1711,8 @@ impl LiveSurface {
                 provenance: Provenance::Orphan,
                 detail: "service".to_owned(),
             })
-            .collect()
+            .collect();
+        (objs, None)
     }
 
     /// Enumerate groups by reading `/etc/group` directly (not `getent`, to avoid a
@@ -1553,17 +1734,51 @@ impl LiveSurface {
             .collect())
     }
 
-    /// Enumerate capability-bearing files via `getcap -r <root>`. Missing `getcap`
-    /// ⇒ no capfiles, no error (the tool is optional on minimal systems).
-    fn scan_capfiles(&self) -> Vec<SurfaceObject> {
-        let root = self.root.to_string_lossy().into_owned();
-        // getcap must succeed cleanly: a partial capfile listing parsed as
-        // complete would under-report capability-bearing binaries.
-        let stdout = match run_capture("getcap", &["-r", &root], false) {
-            Some(s) => s,
-            None => return Vec::new(),
+    /// Enumerate capability-bearing files via `getcap -r` over the standard binary
+    /// directories.
+    ///
+    /// `getcap` is scoped to [`CAPFILE_SCAN_DIRS`] (the on-disk binary trees that
+    /// actually exist under `root`) rather than `getcap -r /`. `getcap` has no
+    /// `-xdev`, so `-r /` would descend NFS/FUSE/virtual mounts and could hang the
+    /// whole audit on a single wedged mount; capability-bearing files live in binary
+    /// dirs, so scoping loses nothing real while staying on the root device. The
+    /// wall-clock timeout in [`run_capture`] bounds it regardless.
+    ///
+    /// Returns the objects plus an optional degradation. An ABSENT `getcap` (the
+    /// tool is optional on minimal systems) ⇒ no capfiles, no degradation. A PRESENT
+    /// `getcap` that fails (non-zero exit, timeout, non-UTF-8) would under-report
+    /// capability-bearing binaries, so it is flagged degraded.
+    fn scan_capfiles(&self) -> (Vec<SurfaceObject>, Option<ScanDegraded>) {
+        // Only the binary dirs that exist under `root` (a minimal system may lack
+        // `/usr/local/sbin`, a fixture root may have just one). Keys are passed argv.
+        let dirs: Vec<String> = CAPFILE_SCAN_DIRS
+            .iter()
+            .map(|d| self.root.join(d.strip_prefix('/').unwrap_or(d)))
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        if dirs.is_empty() {
+            // No standard binary dir present: nothing to scan, not a degradation.
+            return (Vec::new(), None);
+        }
+        let mut args: Vec<&str> = Vec::with_capacity(dirs.len() + 1);
+        args.push("-r");
+        args.extend(dirs.iter().map(String::as_str));
+
+        let stdout = match run_capture("getcap", &args, false) {
+            CaptureOutcome::Ok(s) => s,
+            CaptureOutcome::Absent => return (Vec::new(), None),
+            CaptureOutcome::Degraded(reason) => {
+                return (
+                    Vec::new(),
+                    Some(ScanDegraded {
+                        class: SurfaceClass::CapFile,
+                        reason,
+                    }),
+                );
+            }
         };
-        parse_getcap(&stdout)
+        let objs = parse_getcap(&stdout)
             .into_iter()
             .map(|(path, caps)| SurfaceObject {
                 class: SurfaceClass::CapFile,
@@ -1571,7 +1786,8 @@ impl LiveSurface {
                 provenance: Provenance::Orphan,
                 detail: caps,
             })
-            .collect()
+            .collect();
+        (objs, None)
     }
 
     /// Walk the filesystem from `root` collecting setuid/setgid binaries. Stays on
@@ -1651,10 +1867,13 @@ impl LiveSurface {
             let mut args: Vec<&str> = vec!["-S"];
             args.extend(chunk.iter().map(String::as_str));
             // dpkg -S exits non-zero when SOME paths in the chunk are unowned yet
-            // still prints the owned ones — accept that partial stdout.
+            // still prints the owned ones — accept that partial stdout. Provenance
+            // is not a coverage grant class (a missing owner only leaves an object
+            // `Orphan`, never inflates the metric), so a degraded `dpkg` chunk is
+            // handled the same as an absent tool: its paths simply stay `Orphan`.
             let stdout = match run_capture("dpkg", &args, true) {
-                Some(s) => s,
-                None => continue, // this chunk failed ⇒ its paths stay Orphan
+                CaptureOutcome::Ok(s) => s,
+                CaptureOutcome::Absent | CaptureOutcome::Degraded(_) => continue,
             };
             merge_dpkg_owners(&mut owners, parse_dpkg_search(&stdout));
         }
@@ -1724,47 +1943,167 @@ fn mode_detail(path: &std::path::Path) -> String {
     }
 }
 
-/// Run an external command read-only, capturing stdout as a `String`. Returns
-/// `None` if the binary is absent or its output is not UTF-8 — every caller treats
-/// `None` as graceful degradation, never a panic. ARGV-only: the program and args
-/// are passed directly to `Command`, never via a shell, so no argument can be
-/// interpreted as a shell metacharacter.
+/// Outcome of running an external scan tool. Distinguishes the two cases the old
+/// `Option` conflated, which is what lets the coverage gate fail closed:
+///
+///   * [`CaptureOutcome::Absent`] — the tool is not installed
+///     (`io::ErrorKind::NotFound`). The class it would enumerate is legitimately
+///     empty on this host (a non-systemd box has no units); NOT a degradation.
+///   * [`CaptureOutcome::Degraded`] — the tool is present but its output cannot be
+///     trusted: a spawn error other than NotFound, a non-zero exit, non-UTF-8
+///     output, or a wall-clock timeout. The class was not fully enumerated, so the
+///     caller marks it degraded and the metric/gate fail closed rather than
+///     silently shrinking the denominator.
+///   * [`CaptureOutcome::Ok`] — stdout captured cleanly (or accepted partial; see
+///     `accept_partial`).
+#[derive(Debug)]
+enum CaptureOutcome {
+    /// Captured stdout (clean success, or accepted partial output).
+    Ok(String),
+    /// The tool is not installed; the class is legitimately empty.
+    Absent,
+    /// The tool is present but its run failed; carries a human reason.
+    Degraded(String),
+}
+
+/// Wall-clock budget for a single external scan command. Generous: the scan tools
+/// (`getcap -r`, `systemctl`, `dpkg-query`) finish in well under a second on a
+/// healthy host. The budget exists only to bound a pathological case — chiefly
+/// `getcap` walking onto a wedged NFS/FUSE mount (it has no `-xdev`) — so a single
+/// hung syscall cannot stall the whole read-only audit indefinitely. On expiry the
+/// child is killed and the class is treated as DEGRADED.
+const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the watchdog polls the child for exit while waiting out the timeout.
+/// Small enough to react promptly, large enough not to busy-spin.
+const SCAN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Run an external command read-only with a wall-clock timeout, capturing stdout.
+/// ARGV-only: the program and args go directly to `Command`, never via a shell, so
+/// no argument can be read as a shell metacharacter.
 ///
 /// `accept_partial` controls how a NON-ZERO exit with non-empty stdout is treated:
 ///
 ///   * `true` — accept the partial stdout. ONLY `dpkg -S` needs this: it exits non-zero when SOME
 ///     queried paths are unowned yet still prints the owned ones, and dropping that output would
 ///     flood every path to `Orphan`.
-///   * `false` — require `status.success()`. For `systemctl` / `getcap` / `getfacl` / `dpkg-query`,
-///     a non-zero exit means the listing is incomplete or failed, and parsing truncated output as
-///     if it were complete would under-report the surface. A clean failure (return `None` →
-///     degrade) is safer than a half-read list mistaken for the whole.
-fn run_capture(program: &str, args: &[&str], accept_partial: bool) -> Option<String> {
-    let output = match std::process::Command::new(program).args(args).output() {
-        Ok(o) => o,
+///   * `false` — require `status.success()`. For `systemctl` / `getcap` / `dpkg-query`, a non-zero
+///     exit means the listing is incomplete or failed, and parsing truncated output as if it were
+///     complete would under-report the surface, so it degrades.
+///
+/// See [`run_capture_inner`] for the timeout mechanics; this wrapper fixes the
+/// budget to [`SCAN_TIMEOUT`].
+fn run_capture(program: &str, args: &[&str], accept_partial: bool) -> CaptureOutcome {
+    run_capture_inner(program, args, accept_partial, SCAN_TIMEOUT)
+}
+
+/// [`run_capture`] with an explicit timeout (so the timeout path is unit-testable
+/// without waiting a minute).
+///
+/// stdout is drained on a dedicated thread so a child that fills the pipe buffer
+/// cannot deadlock the watchdog, which polls `try_wait` until the child exits or
+/// `timeout` elapses. On timeout the child is killed and the class is `Degraded`.
+fn run_capture_inner(
+    program: &str,
+    args: &[&str],
+    accept_partial: bool,
+    timeout: std::time::Duration,
+) -> CaptureOutcome {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Tool not installed: a legitimately empty class, not a degradation.
+            tracing::debug!(program, "scan tool absent; class legitimately empty");
+            return CaptureOutcome::Absent;
+        }
         Err(e) => {
-            // A missing/unspawnable tool degrades the scan (the surface it would
-            // have reported is simply absent); log at debug so an incomplete audit
-            // is diagnosable.
             tracing::debug!(program, reason = %e, "scan tool spawn failed; degrading");
-            return None;
+            return CaptureOutcome::Degraded(format!("{program}: spawn failed: {e}"));
         }
     };
-    let stdout = match String::from_utf8(output.stdout) {
+
+    // Drain stdout on a separate thread; without this a child that writes more than
+    // the pipe buffer holds would block on write while we block on wait — a deadlock.
+    let reader = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            out.read_to_end(&mut buf).map(|_| buf)
+        })
+    });
+
+    // Watchdog: poll for exit until the timeout, then kill.
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(reader) = reader {
+                        let _ = reader.join();
+                    }
+                    tracing::debug!(
+                        program,
+                        timeout_s = timeout.as_secs(),
+                        "scan tool timed out; degrading"
+                    );
+                    return CaptureOutcome::Degraded(format!(
+                        "{program}: timed out after {}s",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(SCAN_POLL_INTERVAL);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                if let Some(reader) = reader {
+                    let _ = reader.join();
+                }
+                tracing::debug!(program, reason = %e, "scan tool wait failed; degrading");
+                return CaptureOutcome::Degraded(format!("{program}: wait failed: {e}"));
+            }
+        }
+    };
+
+    let bytes = match reader {
+        Some(handle) => match handle.join() {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => {
+                tracing::debug!(program, reason = %e, "scan tool stdout read failed; degrading");
+                return CaptureOutcome::Degraded(format!("{program}: stdout read failed: {e}"));
+            }
+            Err(_) => {
+                return CaptureOutcome::Degraded(format!("{program}: stdout reader panicked"));
+            }
+        },
+        None => Vec::new(),
+    };
+
+    let stdout = match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(program, reason = %e, "scan tool output not UTF-8; degrading");
-            return None;
+            return CaptureOutcome::Degraded(format!("{program}: output not UTF-8: {e}"));
         }
     };
-    if output.status.success() {
-        return Some(stdout);
+    if status.success() {
+        return CaptureOutcome::Ok(stdout);
     }
     if accept_partial && !stdout.is_empty() {
-        return Some(stdout);
+        return CaptureOutcome::Ok(stdout);
     }
-    tracing::debug!(program, status = ?output.status.code(), "scan tool non-zero exit; degrading");
-    None
+    tracing::debug!(program, status = ?status.code(), "scan tool non-zero exit; degrading");
+    CaptureOutcome::Degraded(format!("{program}: non-zero exit {:?}", status.code()))
 }
 
 /// Classify a `dpkg -S` owner package name into a provenance. A recognizable
@@ -2057,7 +2396,7 @@ mod tests {
                 Provenance::Vendor,
             ))
             .with(obj(SurfaceClass::Group, "netdev", Provenance::Vendor));
-        let only_bins = s.scan(&[SurfaceClass::SudoBin]).unwrap();
+        let only_bins = s.scan(&[SurfaceClass::SudoBin]).unwrap().objects;
         assert_eq!(only_bins.len(), 1);
         assert_eq!(only_bins[0].key, "/usr/sbin/ip");
     }
@@ -2225,6 +2564,56 @@ mod tests {
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         assert!(find(&r, "atm-app.service").covered);
         assert!(find(&r, "sshd.service").covered);
+    }
+
+    #[test]
+    fn unresolvable_service_admin_does_not_flip_unit_class_to_covered() {
+        // `service-admin` exists in the catalog but cannot resolve (it includes an
+        // unknown id). The class-wide "covers every unit" flag must NOT be set off
+        // bare id presence — a permission that never resolves grants nothing. So
+        // every unit stays uncovered and the failure is recorded as a catalog
+        // warning, instead of a class-wide false "covered".
+        let cat =
+            FakeCatalog::new().with("linux", includes_def("service-admin", &["does-not-exist"]));
+        let surface = vec![
+            obj(SurfaceClass::Unit, "atm-app.service", Provenance::Vendor),
+            obj(SurfaceClass::Unit, "sshd.service", Provenance::Vendor),
+        ];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert!(
+            !find(&r, "atm-app.service").covered,
+            "an unresolvable service-admin must not cover units"
+        );
+        assert!(!find(&r, "sshd.service").covered);
+        assert_eq!(class_cov(&r, SurfaceClass::Unit).covered, 0);
+        assert!(
+            r.catalog_warnings
+                .iter()
+                .any(|w| w.contains("service-admin")),
+            "the unresolvable id must be recorded as a warning: {:?}",
+            r.catalog_warnings
+        );
+    }
+
+    #[test]
+    fn unresolvable_capability_admin_does_not_flip_capfile_class_to_covered() {
+        // Same fail-closed rule for the capfile class-wide flag: a present-but-
+        // unresolvable `capability-admin` must not mark every capfile covered.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            includes_def("capability-admin", &["does-not-exist"]),
+        );
+        let surface = vec![obj(
+            SurfaceClass::CapFile,
+            "/usr/bin/ping",
+            Provenance::Vendor,
+        )];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        assert!(!find(&r, "/usr/bin/ping").covered);
+        assert!(r
+            .catalog_warnings
+            .iter()
+            .any(|w| w.contains("capability-admin")));
     }
 
     // --- group / capfile ---------------------------------------------------
@@ -2579,9 +2968,15 @@ mod tests {
     }
 
     #[test]
-    fn covered_single_file_in_non_grantable_parent_is_not_reclassified() {
-        // A bare /etc file that IS granted (e.g. a per-file grant resolved to it)
-        // stays covered — backend-limited only reclassifies UNcovered objects.
+    fn exact_file_shape_grant_on_config_is_not_covered_in_open_build() {
+        // A per-file (`File`-shape, non-recursive) grant resolved exactly onto a
+        // config path does NOT count as covered in the open build: the dir-only
+        // AclBackend cannot enforce a single-file grant, so declaring one must not
+        // flip the object to covered (which would inflate the numerator off a
+        // guarantee the installed backend cannot make). It is routed to the
+        // backend-limited bucket — mirroring the ungranted single-file case — and
+        // excluded from the metric denominator. A per-file-capable (commercial)
+        // backend would cover it; the open build honestly cannot.
         let cat = FakeCatalog::new().with(
             "linux",
             file_def("logindefs", "/etc/login.defs", Access::RW, false),
@@ -2593,9 +2988,44 @@ mod tests {
         )];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         let c = find(&r, "/etc/login.defs");
-        assert!(c.covered);
+        assert!(
+            !c.covered,
+            "an unenforceable File-shape grant must not count as covered"
+        );
+        assert!(
+            c.backend_limited.is_some(),
+            "a declared-but-unenforceable File grant routes to backend-limited"
+        );
+        assert!(c.coverage_note.is_none());
+        // Excluded from the denominator, exactly like the ungranted single-file case.
+        assert_eq!(class_cov(&r, SurfaceClass::Config).total, 0);
+        assert_eq!(class_cov(&r, SurfaceClass::Config).covered, 0);
+    }
+
+    #[test]
+    fn enforceable_dir_grant_outranks_a_paper_file_grant_on_same_path() {
+        // A path covered by BOTH an enforceable recursive Dir grant and a per-file
+        // grant is reported as truly covered (via the Dir grant), not demoted to
+        // backend-limited: enforceability ranks first in the covering-grant choice.
+        let cat = FakeCatalog::new()
+            .with("linux", file_def("ssh-dir", "/etc/ssh", Access::RW, true))
+            .with(
+                "linux",
+                file_def("ssh-file", "/etc/ssh/sshd_config", Access::RW, false),
+            );
+        let surface = vec![obj(
+            SurfaceClass::Config,
+            "/etc/ssh/sshd_config",
+            Provenance::Vendor,
+        )];
+        let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
+        let c = find(&r, "/etc/ssh/sshd_config");
+        assert!(
+            c.covered,
+            "an enforceable Dir grant must win over a paper File grant"
+        );
+        assert_eq!(c.coverage_note.as_deref(), Some("rw via AclBackend (dir)"));
         assert!(c.backend_limited.is_none());
-        assert_eq!(class_cov(&r, SurfaceClass::Config).total, 1);
         assert_eq!(class_cov(&r, SurfaceClass::Config).covered, 1);
     }
 
@@ -2690,8 +3120,12 @@ mod tests {
 
     #[test]
     fn non_recursive_grant_covers_only_exact_path() {
-        // A non-recursive File grant on /etc/sudoers covers that exact path, NOT a
-        // child of /etc/sudoers.d (which it makes no claim on).
+        // A non-recursive File grant on /etc/sudoers MATCHES that exact path, NOT a
+        // child of /etc/sudoers.d (which it makes no claim on). In the open build a
+        // File-shape grant is declared-but-unenforceable (the dir-only AclBackend
+        // can't constrain a single file), so the matched exact path is reported
+        // backend-limited rather than covered — but it remains the only path the
+        // grant matches.
         let cat = FakeCatalog::new().with(
             "linux",
             file_def("sudoers-edit", "/etc/sudoers", Access::RW, false),
@@ -2706,12 +3140,11 @@ mod tests {
         ];
         let r = coverage(&surface, &cat, &debian(), &[], &ctx()).unwrap();
         let exact = find(&r, "/etc/sudoers");
-        assert!(exact.covered);
-        // A File-shape grant is covered but the note says it needs a capable backend.
-        assert_eq!(
-            exact.coverage_note.as_deref(),
-            Some("rw (requires per-file-capable backend)")
-        );
+        // Matched by the grant, but a File-shape grant is unenforceable in the open
+        // build → backend-limited, not covered.
+        assert!(!exact.covered);
+        assert!(exact.backend_limited.is_some());
+        // The child the non-recursive grant makes no claim on is not covered by it.
         assert!(!find(&r, "/etc/sudoers.d/census").covered);
     }
 
@@ -3158,5 +3591,56 @@ dpkg-query: no path found matching pattern /opt/x
         assert!(is_virtual_dir(root, std::path::Path::new("/run")));
         assert!(is_virtual_dir(root, std::path::Path::new("/dev")));
         assert!(!is_virtual_dir(root, std::path::Path::new("/usr")));
+    }
+
+    // --- run_capture: absent vs degraded vs ok, and the timeout watchdog -----
+
+    #[test]
+    fn run_capture_reports_absent_tool_distinct_from_degraded() {
+        // An ABSENT tool (NotFound) is a legitimately-empty class, NOT a
+        // degradation — this is what lets a missing optional tool stay non-fatal
+        // while a present-but-failing one trips the gate.
+        let out = run_capture("census-no-such-scan-tool-xyzzy", &[], false);
+        assert!(
+            matches!(out, CaptureOutcome::Absent),
+            "a missing binary must be Absent, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn run_capture_reports_nonzero_exit_as_degraded() {
+        // A tool that is PRESENT but exits non-zero (without accept_partial) is a
+        // degradation: parsing a failed/partial listing as complete would silently
+        // under-report the surface, so the class must fail closed.
+        let out = run_capture("false", &[], false);
+        assert!(
+            matches!(out, CaptureOutcome::Degraded(_)),
+            "a non-zero exit must degrade, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn run_capture_captures_clean_output() {
+        // A clean exit yields Ok with stdout.
+        let out = run_capture("true", &[], false);
+        assert!(matches!(out, CaptureOutcome::Ok(_)), "got {out:?}");
+    }
+
+    #[test]
+    fn run_capture_times_out_a_wedged_tool() {
+        // A tool that never returns within the budget degrades (not Absent, not
+        // Ok): the watchdog kills it and reports a timeout, so a hung `getcap` on a
+        // wedged mount cannot stall the audit. Uses a short explicit budget so the
+        // test does not wait the production minute.
+        let out = run_capture_inner(
+            "sleep",
+            &["30"],
+            false,
+            std::time::Duration::from_millis(150),
+        );
+        assert!(
+            matches!(out, CaptureOutcome::Degraded(ref r) if r.contains("timed out")),
+            "a wedged tool must degrade with a timeout reason, got {out:?}"
+        );
     }
 }
