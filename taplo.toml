@@ -21,8 +21,11 @@ include = ["examples/roles/*.toml"]
 [rule.schema]
 path = "contract/role-store.schema.json"
 
-# Permission-catalog slices (strict, layered by OS target).
+# Permission-catalog slices (strict, layered by OS target). Excludes the l10n
+# subtree, whose files are human-text (title/summary/risk_note keyed by id), not
+# PermissionDef records — they carry no contract schema (content, not interface).
 [[rule]]
 include = ["share/permissions/**/*.toml"]
+exclude = ["share/permissions/l10n/**/*.toml"]
 [rule.schema]
 path = "contract/catalog-permission.schema.json"

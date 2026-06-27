@@ -29,6 +29,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_PAT }}
         with:
+          # Signatures are stored in the shared TesseraLabs/cla-signatures repo
+          # (alongside tessera), in a census-specific file.
           path-to-signatures: 'signatures/version-1/census-cla.json'
           path-to-document: 'https://github.com/TesseraLabs/census/blob/main/docs/cla/CLA-individual.md'
           branch: 'main'
