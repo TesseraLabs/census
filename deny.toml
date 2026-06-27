@@ -23,10 +23,9 @@ all-features = true
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
-
-[advisories.ignore]
-# No advisories ignored. Add a RUSTSEC id with a justification comment here only
-# after triage; never blanket-ignore.
+# No advisories ignored. Add a RUSTSEC id (with a justification comment) to this
+# array only after triage; never blanket-ignore.
+ignore = []
 
 [licenses]
 # Permissive licenses actually present in the census dependency tree, plus the
@@ -63,7 +62,7 @@ allow = ["AGPL-3.0-only"]
 # requirements (`*`) in a manifest are denied: they pin nothing and are a
 # supply-chain hazard.
 multiple-versions = "warn"
-wildcard = "deny"
+wildcards = "deny"
 # `getrandom` legitimately appears at two majors (0.2 via rand, 0.4 transitively);
 # skip the duplicate-version warning for it specifically rather than globally.
 skip = []
