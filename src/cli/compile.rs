@@ -532,7 +532,7 @@ pub fn run_compile(
     lint: bool,
     json: bool,
 ) -> ExitCode {
-    let text = match std::fs::read_to_string(declaration) {
+    let text = match crate::fsutil::read_capped(declaration, crate::fsutil::MAX_INPUT_FILE_BYTES) {
         Ok(t) => t,
         Err(e) => {
             eprintln!(
@@ -640,7 +640,7 @@ pub fn run_show(opts: ShowOpts<'_>) -> ExitCode {
         format,
     } = opts;
     let json = format == Some("json");
-    let text = match std::fs::read_to_string(declaration) {
+    let text = match crate::fsutil::read_capped(declaration, crate::fsutil::MAX_INPUT_FILE_BYTES) {
         Ok(t) => t,
         Err(e) => {
             eprintln!(

@@ -220,16 +220,17 @@ impl L10nSource for LiveL10n {
             paths.sort();
 
             for path in paths {
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warnings.push(L10nWarning {
-                            path,
-                            reason: e.to_string(),
-                        });
-                        continue;
-                    }
-                };
+                let text =
+                    match crate::fsutil::read_capped(&path, crate::fsutil::MAX_INPUT_FILE_BYTES) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warnings.push(L10nWarning {
+                                path,
+                                reason: e.to_string(),
+                            });
+                            continue;
+                        }
+                    };
                 let map = match Self::parse_file(&text) {
                     Ok(m) => m,
                     Err(e) => {

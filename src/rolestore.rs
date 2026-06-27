@@ -247,10 +247,12 @@ pub fn read_composition(role_store: &Path, role: &str) -> Result<RoleComposition
     if !path.exists() {
         return Err(RoleStoreError::NotFound(path));
     }
-    let text = std::fs::read_to_string(&path).map_err(|source| RoleStoreError::Io {
-        path: path.clone(),
-        source,
-    })?;
+    let text = crate::fsutil::read_capped(&path, crate::fsutil::MAX_INPUT_FILE_BYTES).map_err(
+        |source| RoleStoreError::Io {
+            path: path.clone(),
+            source,
+        },
+    )?;
     let slice: Slice = toml::from_str(&text).map_err(|source| RoleStoreError::TomlParse {
         path: path.clone(),
         source,

@@ -241,10 +241,12 @@ fn is_signature_line(line: &[u8]) -> bool {
 /// Read and parse the pinned trust-anchor: hex of a 32-byte raw Ed25519 public
 /// key. Whitespace (including a trailing newline) is tolerated.
 pub fn read_trust_anchor(path: &Path) -> Result<VerifyingKey, TrustError> {
-    let raw = std::fs::read_to_string(path).map_err(|source| TrustError::AnchorUnreadable {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let raw = crate::fsutil::read_capped(path, crate::fsutil::MAX_INPUT_FILE_BYTES).map_err(
+        |source| TrustError::AnchorUnreadable {
+            path: path.to_path_buf(),
+            source,
+        },
+    )?;
     let hexed = raw.trim();
     let bytes = hex::decode(hexed).map_err(|e| TrustError::BadKey {
         path: path.to_path_buf(),
@@ -291,7 +293,7 @@ pub fn verify_ed25519(
 /// An absent file means "no floor" (`Ok(None)`).
 pub fn last_applied_version(dir: &Path) -> Result<Option<u32>, TrustError> {
     let path = dir.join(VERSION_FILE);
-    match std::fs::read_to_string(&path) {
+    match crate::fsutil::read_capped(&path, crate::fsutil::MAX_INPUT_FILE_BYTES) {
         Ok(s) => {
             let v = s
                 .trim()

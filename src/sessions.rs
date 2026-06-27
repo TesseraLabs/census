@@ -104,7 +104,8 @@ impl SessionSource for LiveSessionSource {
     fn live(&self) -> Result<LiveSessions, SessionError> {
         // Absent file → standalone invariant: no Tessera-managed sessions, so the
         // live set is empty and destructive applies proceed (§12).
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match crate::fsutil::read_capped(&self.path, crate::fsutil::MAX_INPUT_FILE_BYTES)
+        {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(LiveSessions::default());
