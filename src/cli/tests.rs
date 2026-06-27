@@ -561,7 +561,7 @@ fn render_compile_human_shows_runas_on_service_account_command() {
             "svc-tool",
             None,
             vec![],
-            vec![sourced_runas("/opt/QToolplus", "linux", "bfs_solutions")],
+            vec![sourced_runas("/opt/MyApp", "linux", "app_svc")],
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
@@ -570,7 +570,7 @@ fn render_compile_human_shows_runas_on_service_account_command() {
     };
     let text = render_compile_human(&compiled);
     assert!(
-        text.contains("/opt/QToolplus (runas bfs_solutions) [perm svc-tool @ linux]"),
+        text.contains("/opt/MyApp (runas app_svc) [perm svc-tool @ linux]"),
         "{text}"
     );
 }
@@ -613,7 +613,7 @@ fn render_compile_json_emits_runas_field_on_sudo_entries() {
             None,
             vec![sourced("netdev", "linux", None)],
             vec![
-                sourced_runas("/opt/QToolplus", "linux", "bfs_solutions"),
+                sourced_runas("/opt/MyApp", "linux", "app_svc"),
                 sourced("/usr/sbin/ip", "linux", None),
             ],
         )],
@@ -624,7 +624,7 @@ fn render_compile_json_emits_runas_field_on_sudo_entries() {
     };
     let json = render_compile_json(&compiled);
     assert!(
-        json.contains(r#""value":"/opt/QToolplus","permission":"svc-tool","layer":"linux","via":null,"runas":"bfs_solutions""#),
+        json.contains(r#""value":"/opt/MyApp","permission":"svc-tool","layer":"linux","via":null,"runas":"app_svc""#),
         "narrowed command must carry its runas: {json}"
     );
     assert!(

@@ -1122,7 +1122,7 @@ pub struct PermissionDef {
     /// for the default `(ALL)` (root) run-spec.
     ///
     /// A service utility must often be launched under a non-root service account
-    /// (`sudo -u bfs_solutions ./QToolplus`), never as root. Setting `runas` to
+    /// (`sudo -u app_svc ./MyApp`), never as root. Setting `runas` to
     /// that account narrows the grant: every command this permission contributes
     /// renders under `(<runas>)` instead of `(ALL)`, so the privilege handed out
     /// is "be that service account for these commands", not a root-equivalent.
@@ -4697,7 +4697,7 @@ include_categories = ["network"]
     #[test]
     fn bundle_preserves_each_members_runas_per_command() {
         // Fail-open regression guard. A member de-roots its own command
-        // (`runas = "bfs_solutions"`); the bundle pulls it in and ALSO carries its
+        // (`runas = "app_svc"`); the bundle pulls it in and ALSO carries its
         // own command under its own run-spec (`runas = "ops"`). The member's
         // command MUST keep its service account — never silently widen back to the
         // bundle's run-spec or to root `(ALL)` — and the bundle's own command must
@@ -4706,8 +4706,8 @@ include_categories = ["network"]
             .with(
                 "linux",
                 PermissionDef {
-                    sudo: ListOverride::Replace(vec!["/opt/QToolplus".to_owned()]),
-                    runas: Some("bfs_solutions".to_owned()),
+                    sudo: ListOverride::Replace(vec!["/opt/MyApp".to_owned()]),
+                    runas: Some("app_svc".to_owned()),
                     ..def("db-tool")
                 },
             )
@@ -4727,11 +4727,11 @@ include_categories = ["network"]
         let member_cmd = r
             .sudo
             .iter()
-            .find(|p| p.value == "/opt/QToolplus")
+            .find(|p| p.value == "/opt/MyApp")
             .expect("member command present");
         assert_eq!(
             member_cmd.runas.as_deref(),
-            Some("bfs_solutions"),
+            Some("app_svc"),
             "the member's de-rooted command must keep its own run-spec, not widen to the bundle's"
         );
         assert_eq!(member_cmd.via.as_deref(), Some("db-tool"));
@@ -5640,7 +5640,7 @@ include_categories = ["network"]
     fn valid_runas_is_accepted_and_resolves() {
         // A plain service-account name and the machine-account `$` form are both
         // accepted, and the resolved permission carries the run-as account.
-        for user in ["bfs_solutions", "_svc", "app-runner", "machine$"] {
+        for user in ["app_svc", "_svc", "app-runner", "machine$"] {
             let cat = FakeCatalog::new().with(
                 "linux",
                 PermissionDef {
@@ -5663,12 +5663,12 @@ include_categories = ["network"]
         // must be `InvalidRunas` and name the offending permission id.
         let os = OsTarget::new("linux", "debian", None).unwrap();
         for bad in [
-            "",              // empty
-            "root, evil",    // comma + space: would split the Cmnd list
-            "bfs solutions", // embedded space
-            "a(b)",          // parens: open/close a nested run-spec
-            "{param}",       // templated runas is out of scope
-            "ro\tot",        // control char (tab)
+            "",           // empty
+            "root, evil", // comma + space: would split the Cmnd list
+            "app svc",    // embedded space
+            "a(b)",       // parens: open/close a nested run-spec
+            "{param}",    // templated runas is out of scope
+            "ro\tot",     // control char (tab)
         ] {
             let cat = FakeCatalog::new().with(
                 "linux",

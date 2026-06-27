@@ -401,18 +401,15 @@ shell = "/bin/bash"
 from_version = 3
 
 [[account.sudo_commands]]
-command = "/opt/QToolplus"
-runas = "bfs_solutions"
+command = "/opt/MyApp"
+runas = "app_svc"
 "#,
         )
         .unwrap();
         let st = RegistryState::load(&path).unwrap();
         assert_eq!(
             st.managed_accounts()["oper"].sudo_commands,
-            vec![crate::model::SudoCommand::as_user(
-                "/opt/QToolplus",
-                "bfs_solutions"
-            )]
+            vec![crate::model::SudoCommand::as_user("/opt/MyApp", "app_svc")]
         );
     }
 

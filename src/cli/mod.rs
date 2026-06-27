@@ -157,7 +157,7 @@ pub fn render_plan(p: &plan::Plan) -> String {
 /// With `diff` set (`--diff`), the terse account-level summary is replaced by an
 /// artifact preview: for each mutation, a unified diff of the sudoers fragment
 /// Census would write (current managed → resolved target — so the run-as,
-/// `(bfs_solutions)` vs `(ALL)`, is visible), the target file path, and the
+/// `(app_svc)` vs `(ALL)`, is visible), the target file path, and the
 /// file-access ACL grant delta. The preview is pure — it renders the artifacts
 /// from managed state and the resolved target, reading no filesystem and needing
 /// no root (disk-vs-managed drift is `doctor`'s job). The operator can therefore

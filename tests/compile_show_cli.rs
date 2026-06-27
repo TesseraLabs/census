@@ -161,13 +161,13 @@ fn compile_renders_file_grants_human_and_json() {
 #[test]
 fn compile_shows_runas_human_and_json() {
     // A permission that narrows its command to a service account. The human view
-    // shows `(runas bfs_solutions)` next to the command; the JSON sudo entry
+    // shows `(runas app_svc)` next to the command; the JSON sudo entry
     // carries a `"runas"` field.
     let tmp = tempfile::tempdir().unwrap();
     let (decl, catalog_root) = fixtures(
         tmp.path(),
-        "[payload]\npermissions = [\"run-cdmtool\"]\n",
-        "id = \"run-cdmtool\"\nsudo = [\"/usr/bin/id\"]\nrunas = \"bfs_solutions\"\n",
+        "[payload]\npermissions = [\"run-apptool\"]\n",
+        "id = \"run-apptool\"\nsudo = [\"/usr/bin/id\"]\nrunas = \"app_svc\"\n",
     );
 
     // Human view.
@@ -186,7 +186,7 @@ fn compile_shows_runas_human_and_json() {
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("/usr/bin/id (runas bfs_solutions) [perm run-cdmtool @ linux]"),
+        stdout.contains("/usr/bin/id (runas app_svc) [perm run-apptool @ linux]"),
         "human view must show the run-as: {stdout}"
     );
 
@@ -202,7 +202,7 @@ fn compile_shows_runas_human_and_json() {
     assert!(out_json.status.success());
     let json = String::from_utf8(out_json.stdout).unwrap();
     assert!(
-        json.contains("\"runas\":\"bfs_solutions\""),
+        json.contains("\"runas\":\"app_svc\""),
         "JSON sudo entry must carry the run-as: {json}"
     );
 }

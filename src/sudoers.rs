@@ -637,8 +637,8 @@ mod tests {
         let content = build_sudoers_content(&acct_runas(
             "oper",
             vec![
-                SudoCommand::as_user("/opt/x", "bfs_solutions"),
-                SudoCommand::as_user("/opt/y", "bfs_solutions"),
+                SudoCommand::as_user("/opt/x", "app_svc"),
+                SudoCommand::as_user("/opt/y", "app_svc"),
                 SudoCommand::root("/usr/sbin/ip"),
             ],
         ))
@@ -649,7 +649,7 @@ mod tests {
             .expect("a rule line");
         assert_eq!(
             rule,
-            "oper ALL=(bfs_solutions) NOPASSWD: /opt/x, /opt/y, (ALL) NOPASSWD: /usr/sbin/ip"
+            "oper ALL=(app_svc) NOPASSWD: /opt/x, /opt/y, (ALL) NOPASSWD: /usr/sbin/ip"
         );
     }
 
@@ -659,8 +659,8 @@ mod tests {
         let content = build_group_sudoers_content(&group_runas(
             "wheel",
             vec![
-                SudoCommand::as_user("/opt/x", "bfs_solutions"),
-                SudoCommand::as_user("/opt/y", "bfs_solutions"),
+                SudoCommand::as_user("/opt/x", "app_svc"),
+                SudoCommand::as_user("/opt/y", "app_svc"),
                 SudoCommand::root("/usr/sbin/ip"),
             ],
         ))
@@ -671,7 +671,7 @@ mod tests {
             .expect("a rule line");
         assert_eq!(
             rule,
-            "%wheel ALL=(bfs_solutions) NOPASSWD: /opt/x, /opt/y, (ALL) NOPASSWD: /usr/sbin/ip"
+            "%wheel ALL=(app_svc) NOPASSWD: /opt/x, /opt/y, (ALL) NOPASSWD: /usr/sbin/ip"
         );
     }
 
@@ -704,7 +704,7 @@ mod tests {
         let content = build_sudoers_content(&acct_runas(
             "oper",
             vec![
-                SudoCommand::as_user("/opt/x", "bfs_solutions"),
+                SudoCommand::as_user("/opt/x", "app_svc"),
                 SudoCommand::root("/usr/sbin/ip"),
             ],
         ))

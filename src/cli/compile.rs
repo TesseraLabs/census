@@ -347,7 +347,7 @@ pub fn render_compile_human(compiled: &CompiledRole) -> String {
     } else {
         for s in &sudo {
             // Run-as before provenance: the operator reads what privilege the
-            // command grants (e.g. runs as `bfs_solutions`, not root) next to the
+            // command grants (e.g. runs as `app_svc`, not root) next to the
             // command, then where it came from.
             out.push_str(&format!(
                 "  {}{}{}\n",
@@ -979,7 +979,7 @@ pub fn render_show_tree(compiled: &CompiledRole, lang: &str, l10n: &dyn L10nSour
             ));
         }
         for s in &r.sudo {
-            // Surface the run-as next to the command (e.g. `(runas bfs_solutions)`)
+            // Surface the run-as next to the command (e.g. `(runas app_svc)`)
             // so the show tree previews that a command grants a service-account
             // shell, not root; omitted for the default root run-spec.
             let runas = match &s.runas {

@@ -58,7 +58,7 @@ master-code-reviewer, фикс CRITICAL/HIGH.
       `share/permissions/` слои `linux`/`linux-debian`/`linux-ubuntu`/`linux-astra`; бандлы
       (host-hardening/boot-admin/storage-admin/observability/device-operator/peripheral-operator).
       Astra-слой несёт `astra-admin`/`astra-console` (сверено). service-restart эмитит обе формы
-      `<unit>`/`<unit>.service`. App-группы (bfs_*) НЕ в базе — пример site-слоя в доке.
+      `<unit>`/`<unit>.service`. App-группы (app_*) НЕ в базе — пример site-слоя в доке.
 - [x] 6.2 l10n `en` + `ru` + `zh` для стартового набора (и для add-on docker).
 - [x] 6.3 Open add-on `docker` (namespace `docker.*`) + его l10n.
 - [x] 6.4 Контейнер: роль в разрешениях → реальные группы/sudoers (`visudo -c`); docker add-on

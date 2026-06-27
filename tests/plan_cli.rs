@@ -65,19 +65,19 @@ fn plan_diff_shows_runas_fragment_and_target_path_for_create() {
     // A role whose permission narrows a command to a service account. `plan
     // --diff` must name the target sudoers path and show the new fragment's rule
     // line with the run-as — the operator previews that the command runs as
-    // `bfs_solutions`, not root, before any apply.
+    // `app_svc`, not root, before any apply.
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("roles");
     std::fs::create_dir(&store).unwrap();
     write(
         &store.join("svc.toml"),
-        "role = \"svc\"\nversion = 1\nos = \"linux\"\nname = \"Service\"\nlevel = 5\n[payload]\npermissions = [\"run-cdmtool\"]\n",
+        "role = \"svc\"\nversion = 1\nos = \"linux\"\nname = \"Service\"\nlevel = 5\n[payload]\npermissions = [\"run-apptool\"]\n",
     );
     let catalog_root = tmp.path().join("permissions");
     std::fs::create_dir_all(catalog_root.join("linux")).unwrap();
     write(
-        &catalog_root.join("linux").join("cdmtool.toml"),
-        "id = \"run-cdmtool\"\nsudo = [\"/usr/bin/id\"]\nrunas = \"bfs_solutions\"\n",
+        &catalog_root.join("linux").join("apptool.toml"),
+        "id = \"run-apptool\"\nsudo = [\"/usr/bin/id\"]\nrunas = \"app_svc\"\n",
     );
     let decl = tmp.path().join("declaration.toml");
     write(
@@ -111,7 +111,7 @@ fn plan_diff_shows_runas_fragment_and_target_path_for_create() {
         "must name the target sudoers path: {stdout}"
     );
     assert!(
-        stdout.contains("+ svc ALL=(bfs_solutions) NOPASSWD: /usr/bin/id"),
+        stdout.contains("+ svc ALL=(app_svc) NOPASSWD: /usr/bin/id"),
         "must show the run-as in the new fragment: {stdout}"
     );
 }

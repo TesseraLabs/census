@@ -1178,8 +1178,8 @@ fn intentional_exclusion(object: &SurfaceObject) -> Option<String> {
                 || g == "astra-console"
                 || g == "sudo"
                 || g == "wheel"
-                || g.starts_with("bfs_")
-                || g.starts_with("ndc_")
+                || g.starts_with("app_")
+                || g.starts_with("site_")
             {
                 return Some("admin-by-design / app site-layer group".to_owned());
             }

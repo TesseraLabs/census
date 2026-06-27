@@ -77,7 +77,7 @@
       ]
     },
     "runas": {
-      "description": "The Unix account this permission's `sudo` commands run *as*, or `None`\nfor the default `(ALL)` (root) run-spec.\n\nA service utility must often be launched under a non-root service account\n(`sudo -u bfs_solutions ./QToolplus`), never as root. Setting `runas` to\nthat account narrows the grant: every command this permission contributes\nrenders under `(<runas>)` instead of `(ALL)`, so the privilege handed out\nis \"be that service account for these commands\", not a root-equivalent.\nOverrides across layers exactly like `risk`: the topmost layer that sets\n`runas` wins; a higher layer that restates `sudo` without `runas` leaves\nthe lower layer's run-spec standing. Validated at the read boundary.",
+      "description": "The Unix account this permission's `sudo` commands run *as*, or `None`\nfor the default `(ALL)` (root) run-spec.\n\nA service utility must often be launched under a non-root service account\n(`sudo -u app_svc ./MyApp`), never as root. Setting `runas` to\nthat account narrows the grant: every command this permission contributes\nrenders under `(<runas>)` instead of `(ALL)`, so the privilege handed out\nis \"be that service account for these commands\", not a root-equivalent.\nOverrides across layers exactly like `risk`: the topmost layer that sets\n`runas` wins; a higher layer that restates `sudo` without `runas` leaves\nthe lower layer's run-spec standing. Validated at the read boundary.",
       "type": [
         "string",
         "null"

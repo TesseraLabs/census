@@ -4,7 +4,7 @@
 //!
 //! The terse `plan` output names account-level actions (`CREATE/UPDATE/DELETE
 //! svc (uid …)`) but hides WHAT and HOW Census would actually write: the sudoers
-//! fragment content (including the run-as — `(bfs_solutions)` vs `(ALL)`), the
+//! fragment content (including the run-as — `(app_svc)` vs `(ALL)`), the
 //! target file path (`/etc/sudoers.d/census-<role>`), and the file-access ACL
 //! grants. An operator about to run a privileged `apply` as root must be able to
 //! preview those artifacts — a wrong run-spec hands out a root shell where only
@@ -453,7 +453,7 @@ mod tests {
         // account: the whole fragment is new → every rule line is `+`, the run-as
         // is visible, and the target path is named.
         let mut t = target("svc", 9100);
-        t.sudo_commands = vec![SudoCommand::as_user("/usr/bin/id", "bfs_solutions")];
+        t.sudo_commands = vec![SudoCommand::as_user("/usr/bin/id", "app_svc")];
         let plan = Plan {
             actions: vec![Action::Create(t)],
             group_actions: Vec::new(),
@@ -464,7 +464,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("+ svc ALL=(bfs_solutions) NOPASSWD: /usr/bin/id"),
+            out.contains("+ svc ALL=(app_svc) NOPASSWD: /usr/bin/id"),
             "the new fragment's rule line must be added with the run-as: {out}"
         );
         // The comment header lines are part of the new fragment too (all `+`).
@@ -484,7 +484,7 @@ mod tests {
         let mut m = managed("svc", 9100);
         m.sudo_commands = vec![SudoCommand::root("/usr/bin/id")];
         let mut t = target("svc", 9100);
-        t.sudo_commands = vec![SudoCommand::as_user("/usr/bin/id", "bfs_solutions")];
+        t.sudo_commands = vec![SudoCommand::as_user("/usr/bin/id", "app_svc")];
         let plan = Plan {
             actions: vec![Action::Update {
                 account: t,
@@ -502,7 +502,7 @@ mod tests {
             "the old root run-spec must be removed: {out}"
         );
         assert!(
-            out.contains("+ svc ALL=(bfs_solutions) NOPASSWD: /usr/bin/id"),
+            out.contains("+ svc ALL=(app_svc) NOPASSWD: /usr/bin/id"),
             "the new service-account run-spec must be added: {out}"
         );
         // The comment header is unchanged → it is NOT in the diff (no `+ #`/`- #`).
@@ -513,9 +513,7 @@ mod tests {
         // Conventional order: the removed (old) line renders before the added (new)
         // one, so the operator reads root → service top to bottom.
         let minus = out.find("- svc ALL=(ALL)").expect("removed line present");
-        let plus = out
-            .find("+ svc ALL=(bfs_solutions)")
-            .expect("added line present");
+        let plus = out.find("+ svc ALL=(app_svc)").expect("added line present");
         assert!(minus < plus, "removed line must precede added line: {out}");
     }
 

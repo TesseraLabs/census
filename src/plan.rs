@@ -852,7 +852,7 @@ mod tests {
         // service account). The run-as is part of the grant, so this MUST be an
         // Update so the NOPASSWD fragment is rewritten with the narrowed run-spec.
         let mut t = target("oper", 9010, "/bin/bash", &["wheel"]);
-        t.sudo_commands = vec![SudoCommand::as_user("/opt/tool", "bfs_solutions")];
+        t.sudo_commands = vec![SudoCommand::as_user("/opt/tool", "app_svc")];
         let mut m = managed("oper", 9010, "/bin/bash", &["wheel"], 3);
         m.sudo_commands = vec![SudoCommand::root("/opt/tool")];
         let plan = diff(&[t], &state_of(vec![m]));
