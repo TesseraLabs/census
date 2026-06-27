@@ -99,7 +99,7 @@ pub(crate) fn detect_os_target(override_spec: Option<&str>) -> Result<OsTarget, 
 /// an I/O or parse failure. Shared by the optional-declaration paths of coverage
 /// and which-grants so both report a malformed declaration the same way.
 pub(crate) fn read_declaration(path: &Path) -> Result<Declaration, String> {
-    let text = std::fs::read_to_string(path)
+    let text = crate::fsutil::read_capped(path, crate::fsutil::MAX_INPUT_FILE_BYTES)
         .map_err(|e| format!("cannot read declaration {}: {e}", path.display()))?;
     Declaration::parse(&text).map_err(|e| e.to_string())
 }
@@ -169,7 +169,7 @@ pub fn run_plan(
     os_target: Option<&str>,
     diff: bool,
 ) -> ExitCode {
-    let text = match std::fs::read_to_string(declaration) {
+    let text = match crate::fsutil::read_capped(declaration, crate::fsutil::MAX_INPUT_FILE_BYTES) {
         Ok(t) => t,
         Err(e) => {
             eprintln!(
@@ -328,16 +328,17 @@ pub struct ApplyOpts<'a> {
 /// → apply phases over shadow-utils → write the managed registry atomically and
 /// last. Returns a non-zero exit on any error (fail-closed).
 pub fn run_apply(opts: ApplyOpts<'_>) -> ExitCode {
-    let text = match std::fs::read_to_string(opts.declaration) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "census: cannot read declaration {}: {e}",
-                opts.declaration.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    let text =
+        match crate::fsutil::read_capped(opts.declaration, crate::fsutil::MAX_INPUT_FILE_BYTES) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "census: cannot read declaration {}: {e}",
+                    opts.declaration.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
     let decl = match Declaration::parse(&text) {
         Ok(d) => d,
         Err(e) => {
@@ -508,7 +509,7 @@ pub fn render_report(report: &DoctorReport) -> String {
 /// Permission expansion uses the default catalog roots and autodetected OS
 /// target (these read-only commands report drift, not enforce trust).
 fn resolve_targets(path: &Path) -> Option<Vec<ResolvedAccount>> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match crate::fsutil::read_capped(path, crate::fsutil::MAX_INPUT_FILE_BYTES) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("warning: cannot read declaration {}: {e}", path.display());

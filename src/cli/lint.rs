@@ -112,16 +112,8 @@ const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
 /// path is the broader one. A plain prefix test would miss the parent-grant case
 /// or wrongly match a textual neighbour.
 fn path_boundary_overlaps(base: &str, candidate: &str) -> bool {
-    fn at_or_under(parent: &str, child: &str) -> bool {
-        if parent == child {
-            return true;
-        }
-        let parent = parent.strip_suffix('/').unwrap_or(parent);
-        child
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.starts_with('/'))
-    }
-    at_or_under(base, candidate) || at_or_under(candidate, base)
+    use crate::catalog::path_at_or_under;
+    path_at_or_under(base, candidate) || path_at_or_under(candidate, base)
 }
 
 /// Whether a grant on `path` touches a secret. The single classifier for both the

@@ -297,9 +297,11 @@ pub enum ParamConstraint {
     /// `deny_glob = false` — contain no glob metacharacter (`*?[`).
     #[serde(rename = "path")]
     Path {
-        /// Allowed path prefixes; the substituted path must start with one of
-        /// them. At least one prefix is required (an empty list would allow any
-        /// absolute path, defeating the constraint) — enforced at parse.
+        /// Allowed path prefixes; the substituted path must be at, or under, one
+        /// of them on a `/`-component boundary (so `/etc/app/` admits
+        /// `/etc/app/x` but never the sibling `/etc/apparmor.d`). Each prefix
+        /// must be an absolute directory ending in `/`; at least one is required
+        /// (an empty list would allow any absolute path) — both enforced at parse.
         allow_prefix: Vec<String>,
         /// Reject glob metacharacters (`*?[`) in the substituted path unless set
         /// to `false`. Defaults to [`PARAM_PATH_DENY_GLOB_DEFAULT`] (true).
@@ -359,6 +361,25 @@ const TOKEN_EXTRA_CHARS: &[char] = &['-', '_', '.', '@', ':', '\\', '/'];
 /// path, or a second path level.
 const SEGMENT_EXTRA_CHARS: &[char] = &['.', '_', '-'];
 
+/// Whether `child` is `parent` itself, or lies under it on a `/`-component
+/// boundary. Unlike a raw [`str::starts_with`], `parent = "/etc/app"` matches
+/// `/etc/app` and `/etc/app/conf` but never the textual sibling
+/// `/etc/apparmor.d`. A single trailing `/` on `parent` is ignored, so
+/// `"/etc/app"` and `"/etc/app/"` behave identically.
+///
+/// This is the enforcement counterpart of the advisory boundary test used by the
+/// risk lints (`crate::cli::lint`), which builds its bidirectional overlap check
+/// on top of this same matcher so the two can never drift apart.
+pub(crate) fn path_at_or_under(parent: &str, child: &str) -> bool {
+    let parent = parent.strip_suffix('/').unwrap_or(parent);
+    if parent == child {
+        return true;
+    }
+    child
+        .strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 impl ParamConstraint {
     /// Validate the constraint declaration itself (independent of any value).
     ///
@@ -375,6 +396,13 @@ impl ParamConstraint {
                     Some("path constraint requires a non-empty allow_prefix")
                 } else if allow_prefix.iter().any(|p| !p.starts_with('/')) {
                     Some("every allow_prefix must be an absolute path (start with '/')")
+                } else if allow_prefix.iter().any(|p| !p.ends_with('/')) {
+                    // A prefix must name a directory boundary. Without the
+                    // trailing `/`, a containment test could admit a textual
+                    // sibling (`/etc/app` matching `/etc/apparmor.d/...`); fail
+                    // closed at parse so only component-bounded prefixes are
+                    // ever enforced.
+                    Some("every allow_prefix must name a directory (end with '/')")
                 } else {
                     None
                 }
@@ -458,8 +486,13 @@ impl ParamConstraint {
                     return Some("path value exceeds max_len");
                 }
                 // The absolute/`..`/control checks are the file-path gate's job and
-                // run right after; here we own the prefix and glob policy.
-                if !allow_prefix.iter().any(|p| value.starts_with(p.as_str())) {
+                // run right after; here we own the prefix and glob policy. The
+                // prefix test is on a `/`-component boundary, not a raw text
+                // prefix, so a sibling directory can never satisfy it.
+                if !allow_prefix
+                    .iter()
+                    .any(|p| path_at_or_under(p.as_str(), value))
+                {
                     return Some("path value is not under any allowed prefix");
                 }
                 if deny_glob.unwrap_or(PARAM_PATH_DENY_GLOB_DEFAULT) && has_glob_metachar(value) {
@@ -1566,9 +1599,12 @@ impl OsTarget {
     /// still resolves against the `linux` base plus an optional
     /// `linux-<id>` layer.
     pub fn detect_from(path: &Path) -> Result<OsTarget, CatalogError> {
-        let text = std::fs::read_to_string(path).map_err(|e| CatalogError::OsRelease {
-            reason: format!("cannot read {}: {e}", path.display()),
-        })?;
+        let text =
+            crate::fsutil::read_capped(path, crate::fsutil::MAX_INPUT_FILE_BYTES).map_err(|e| {
+                CatalogError::OsRelease {
+                    reason: format!("cannot read {}: {e}", path.display()),
+                }
+            })?;
 
         let mut id: Option<String> = None;
         let mut version_id: Option<String> = None;
@@ -1739,10 +1775,12 @@ impl LiveCatalog {
     /// add-on dir (e.g. `docker.ps` placed under `k8s/`) is caught before it can
     /// expand into sudo commands, rather than silently resolving.
     fn read_policy_file(path: &Path, subdir: Option<&str>) -> Result<PermissionDef, CatalogError> {
-        let text = std::fs::read_to_string(path).map_err(|source| CatalogError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
+        let text = crate::fsutil::read_capped(path, crate::fsutil::MAX_INPUT_FILE_BYTES).map_err(
+            |source| CatalogError::Io {
+                path: path.to_owned(),
+                source,
+            },
+        )?;
         let def: PermissionDef =
             toml::from_str(&text).map_err(|source| CatalogError::TomlParse {
                 path: path.to_owned(),
@@ -6920,6 +6958,65 @@ access = "wo"
             CatalogError::ParamConstraintViolation { ref id, ref param, .. }
                 if id == "app-config" && param == "path"
         ));
+    }
+
+    #[test]
+    fn path_constraint_declaration_requires_trailing_slash() {
+        // A prefix without a trailing `/` lets a textual `starts_with` admit a
+        // sibling directory (`/etc/app` would match `/etc/apparmor.d/...`). The
+        // declaration gate must fail closed at parse so only component-bounded
+        // prefixes ever reach enforcement.
+        let no_slash = ParamConstraint::Path {
+            allow_prefix: vec!["/etc/app".to_owned()],
+            deny_glob: None,
+            max_len: None,
+        };
+        assert!(
+            no_slash.declaration_defect().is_some(),
+            "an allow_prefix without a trailing '/' must be rejected at parse"
+        );
+        let with_slash = ParamConstraint::Path {
+            allow_prefix: vec!["/etc/app/".to_owned()],
+            deny_glob: None,
+            max_len: None,
+        };
+        assert!(
+            with_slash.declaration_defect().is_none(),
+            "a component-bounded allow_prefix must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_constraint_value_check_is_component_bounded() {
+        // Defence in depth behind the declaration gate: the value check itself
+        // must match on a `/`-component boundary, never a raw text prefix. Even
+        // given a (now parse-rejected) slash-less prefix, a sibling directory
+        // must not be admitted.
+        let c = ParamConstraint::Path {
+            allow_prefix: vec!["/etc/app".to_owned()],
+            deny_glob: None,
+            max_len: None,
+        };
+        // The classic sibling escape: `/etc/app` must NOT admit `/etc/apparmor.d`.
+        assert_eq!(
+            c.value_defect("/etc/apparmor.d/usr.sbin.foo"),
+            Some("path value is not under any allowed prefix"),
+            "a sibling directory must never satisfy the prefix"
+        );
+        // A genuine child, and the directory itself, are admitted.
+        assert!(c.value_defect("/etc/app/conf").is_none());
+        assert!(c.value_defect("/etc/app").is_none());
+        // A trailing-slash prefix behaves identically on the boundary.
+        let c_slash = ParamConstraint::Path {
+            allow_prefix: vec!["/etc/app/".to_owned()],
+            deny_glob: None,
+            max_len: None,
+        };
+        assert_eq!(
+            c_slash.value_defect("/etc/apparmor.d/x"),
+            Some("path value is not under any allowed prefix")
+        );
+        assert!(c_slash.value_defect("/etc/app/x").is_none());
     }
 
     #[test]

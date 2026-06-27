@@ -734,10 +734,12 @@ fn read_toml_files(dir: &Path) -> Result<Vec<(PathBuf, String)>, FrameworkError>
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        let text = std::fs::read_to_string(&path).map_err(|e| FrameworkError::Io {
-            path: path.clone(),
-            reason: e.to_string(),
-        })?;
+        let text = crate::fsutil::read_capped(&path, crate::fsutil::MAX_INPUT_FILE_BYTES).map_err(
+            |e| FrameworkError::Io {
+                path: path.clone(),
+                reason: e.to_string(),
+            },
+        )?;
         out.push((path, text));
     }
     Ok(out)
@@ -860,10 +862,12 @@ fn load_one_framework(
         return Ok(());
     }
     let manifest_text =
-        std::fs::read_to_string(&manifest_path).map_err(|e| FrameworkError::Io {
-            path: manifest_path.clone(),
-            reason: e.to_string(),
-        })?;
+        crate::fsutil::read_capped(&manifest_path, crate::fsutil::MAX_INPUT_FILE_BYTES).map_err(
+            |e| FrameworkError::Io {
+                path: manifest_path.clone(),
+                reason: e.to_string(),
+            },
+        )?;
     let manifest = parse_manifest(&manifest_text).map_err(|e| FrameworkError::TomlParse {
         path: manifest_path.clone(),
         reason: e.to_string(),
@@ -954,10 +958,11 @@ fn load_one_framework(
     let controls_path = fw_dir.join("controls.toml");
     if !controls_path.is_symlink() && controls_path.is_file() {
         let controls_text =
-            std::fs::read_to_string(&controls_path).map_err(|e| FrameworkError::Io {
-                path: controls_path.clone(),
-                reason: e.to_string(),
-            })?;
+            crate::fsutil::read_capped(&controls_path, crate::fsutil::MAX_INPUT_FILE_BYTES)
+                .map_err(|e| FrameworkError::Io {
+                    path: controls_path.clone(),
+                    reason: e.to_string(),
+                })?;
         let defs = parse_controls(&controls_text).map_err(|e| FrameworkError::TomlParse {
             path: controls_path.clone(),
             reason: e.to_string(),

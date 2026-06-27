@@ -239,10 +239,12 @@ impl RegistryState {
         if !path.exists() {
             return Ok(RegistryState::default_empty());
         }
-        let text = std::fs::read_to_string(path).map_err(|source| StateError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let text = crate::fsutil::read_capped(path, crate::fsutil::MAX_INPUT_FILE_BYTES).map_err(
+            |source| StateError::Io {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
         let file: RegistryFile = toml::from_str(&text).map_err(|source| StateError::TomlParse {
             path: path.to_path_buf(),
             source,

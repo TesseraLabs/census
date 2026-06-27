@@ -1557,7 +1557,7 @@ impl LiveSurface {
     /// silently under-report gate-keeping groups.
     fn scan_groups(&self) -> Result<Vec<SurfaceObject>, CoverageError> {
         let path = self.root.join("etc/group");
-        let text = std::fs::read_to_string(&path)
+        let text = crate::fsutil::read_capped(&path, crate::fsutil::MAX_INPUT_FILE_BYTES)
             .map_err(|e| CoverageError::Scan(format!("cannot read {}: {e}", path.display())))?;
         Ok(parse_etc_group(&text)
             .into_iter()

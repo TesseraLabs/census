@@ -68,6 +68,7 @@ pub mod cli;
 // --- Internal plumbing (not part of the public API) ----------------------
 pub(crate) mod apply;
 pub(crate) mod backup;
+pub(crate) mod fsutil;
 pub(crate) mod inspect;
 pub(crate) mod lockout;
 pub(crate) mod mutate;
