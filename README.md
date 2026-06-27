@@ -160,4 +160,10 @@ without any server — Census is not crippleware.
 
 ## License
 
-[AGPL-3.0-only](https://www.gnu.org/licenses/agpl-3.0.en.html).
+Dual-licensed: [GNU AGPL-3.0](LICENSE) OR [commercial](LICENSE.commercial).
+Choose AGPL-3.0 and accept its obligations (including source disclosure of
+derivative works), or see [LICENSE.commercial](LICENSE.commercial) for a
+commercial license without AGPL obligations.
+
+Contributions are accepted under a Contributor License Agreement — see
+[`docs/cla/`](docs/cla/). The CLA bot guides you on your first pull request.

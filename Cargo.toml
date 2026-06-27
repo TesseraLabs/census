@@ -3,6 +3,7 @@ name = "census"
 version = "0.1.0"
 edition = "2021"
 description = "Declarative provisioner of Unix access objects from a Tessera role-store"
+# Dual-licensed: AGPL-3.0-only OR commercial (LICENSE.commercial).
 license = "AGPL-3.0-only"
 repository = "https://github.com/TesseraLabs/census"
 keywords = ["unix", "provisioning", "access-control", "sudoers", "tessera"]
