@@ -5,7 +5,7 @@
 КИИ) нужно показать аудитору, как эти разрешения соотносятся с требованиями compliance-
 фреймворков (PCI-DSS, CIS) и что из access-требований не покрыто. Сейчас связь ведётся
 вручную. Полный приватный дизайн с рыночным обоснованием:
-`tessera-ws/specs/2026-06-22-framework-crossref-census-design.md`.
+`internal/specs/2026-06-22-framework-crossref-census-design.md`.
 
 Census оперирует **только** пользователями/ролями/группами/sudo-грантами. Device-hardening
 (login.defs, PAM, sysctl, глобальные sudoers `Defaults`) — **вне продукта**.

@@ -1,6 +1,6 @@
 # Design: file-access
 
-Полный дизайн (механизм, ход обсуждения, граница МКЦ, обоснование SPI/dir-only) — tessera-ws
+Полный дизайн (механизм, ход обсуждения, граница МКЦ, обоснование SPI/dir-only) — internal
 `specs/2026-06-22-file-access-primitive-design.md`. Здесь — привязка к коду (public-safe).
 
 ## Типы

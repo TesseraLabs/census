@@ -51,7 +51,7 @@ DISA STIG) добавляется данными, без правки кода.
   `--framework` опирается на него.
 - Данные: новое дерево `/usr/share/census/frameworks/` (vendor) + `/etc/census/frameworks.d/`
   (site-overlay); пакетная поставка подписанным `.deb` (как vendor-каталог).
-- Threat-model: аддендум в `tessera-ws/specs/threat-model.md` §5.14 — framework-слой read-only,
+- Threat-model: аддендум в `internal/specs/threat-model.md` §5.14 — framework-слой read-only,
   риск = искажение compliance-заявления (не эскалация), контроль = подпись пакета + штамп версии.
 - Лиценз: заголовки контролей пишутся своими словами (номера = факты; текст требований
   PCI-DSS / CIS — копирайт, не воспроизводим).

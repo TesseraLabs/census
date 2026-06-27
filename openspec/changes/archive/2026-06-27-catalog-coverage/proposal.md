@@ -8,7 +8,7 @@
 security-конфиги `/etc`, systemd-юниты, привратные группы) покрыты хотя бы одним разрешением?
 Сейчас способа нет. `census catalog coverage` перечисляет живую привилегированную поверхность
 устройства и показывает, что НЕ покрыто установленным каталогом — гарантия полноты и сигнал
-курирования (исследование: tessera-ws `specs/2026-06-21-permission-catalog-coverage-research.md`).
+курирования (исследование: internal `specs/2026-06-21-permission-catalog-coverage-research.md`).
 
 ## What Changes
 

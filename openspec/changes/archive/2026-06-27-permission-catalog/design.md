@@ -1,6 +1,6 @@
 # Design: permission-catalog
 
-Полный продуктовый дизайн с обоснованиями — tessera-ws
+Полный продуктовый дизайн с обоснованиями — internal
 `specs/2026-06-21-permission-catalog-census-design.md`. Здесь — техническая привязка к коду
 Census (public-safe).
 
@@ -70,7 +70,7 @@ declaration → role.toml(payload.permissions + сырые)
   конкретные команды раскрытия (argv-безопасно; `visudo -c` валидирует фрагмент как сейчас).
   Параметризованные команды с именем юнита (`service-restart(units)`) ОБЯЗАНЫ эмитить обе формы
   `<unit>` и `<unit>.service` — sudoers матчит аргументы точно (сверено с боевым atm-ansible;
-  tessera-ws design §7.10). Фрагменты роль-учёток — `NOPASSWD` (вход закрыт, пароля нет).
+  internal design §7.10). Фрагменты роль-учёток — `NOPASSWD` (вход закрыт, пароля нет).
 
 ## Безопасность (дельта)
 

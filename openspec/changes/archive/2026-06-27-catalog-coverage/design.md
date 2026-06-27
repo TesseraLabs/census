@@ -1,6 +1,6 @@
 # Design: catalog-coverage
 
-Полное исследование (методология, команды перечисления, ground-truth матрица) — tessera-ws
+Полное исследование (методология, команды перечисления, ground-truth матрица) — internal
 `specs/2026-06-21-permission-catalog-coverage-research.md` (Часть A — поверхность, Часть C — CLI).
 Здесь — техническая привязка (public-safe).
 

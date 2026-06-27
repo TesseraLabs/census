@@ -10,7 +10,7 @@
 логи»), а продукт сам раскрывает их в конкретные группы/sudo-команды/лимиты для данной ОС.
 
 Это смысловое ядро Census («группа заявляет способность — продукт выдаёт права»). Дизайн
-одобрен (tessera-ws `specs/2026-06-21-permission-catalog-census-design.md`, рефреш
+одобрен (internal `specs/2026-06-21-permission-catalog-census-design.md`, рефреш
 `2026-06-07-permission-catalog-design.md` под раскол на Census). Compile — Census-локально:
 устройство знает дистрибутив/версию, само резолвит каталог в плоское раскрытие; standalone
 самодостаточен.

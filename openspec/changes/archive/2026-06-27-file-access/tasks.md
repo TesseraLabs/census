@@ -70,6 +70,6 @@
       L2 (убрана 3-я копия `path_at_or_under`). Фикс верифицирован повторным ревью. Follow-up (accepted):
       L3 (route_grants single-backend dispatch), L4 (doctor drift не покрывает `g:group`).
 - [x] 8.3 `openspec validate file-access --strict`.
-- [x] 8.4 Угроза-дельта (setfacl-мутация, SPI-загрузка `.so`) → threat-model §5.14 (tessera-ws):
+- [x] 8.4 Угроза-дельта (setfacl-мутация, SPI-загрузка `.so`) → threat-model §5.14 (internal):
       CN10 (setfacl overbroad/симлинк — обновлён: symlink-корень блокируется на всех 3 root-операциях),
       CN11 (молча-слабый ACL → cap-gating fail-closed), CN12 (неподписанный backend-`.so`).
