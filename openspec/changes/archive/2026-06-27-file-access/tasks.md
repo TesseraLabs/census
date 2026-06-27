@@ -46,13 +46,14 @@
       ОТЛОЖЕНО — нужен прогон на Astra VM (стартовый каталог file-грантов 6.1 готов; верификация на живой ФС — отдельный VM-проход).
 
 ## Срез 7. Контейнер
-ОТЛОЖЕНО — реальный `setfacl`/`getfacl`-E2E нужен в контейнере/Astra VM (docker недоступен в текущей среде).
-Unit-эквиваленты (FakeBackend: materialize/revoke/откат/идемпотентность; `route_grants` fail-closed) зелёные и
-покрывают логику; ниже — проверка живого ядра ACL отдельным прогоном.
-- [~] 7.1 Реальный setfacl: `getfacl` показывает `u:role:rwX` + default-ACL на папке.
-- [~] 7.2 Rewrite-proof: новый файл в папке (создать+rename) наследует default-ACL → доступ цел.
-- [~] 7.3 ro=`r-X`/rw=`rwX`; откат при сбое фазы; отзыв снимает ТОЛЬКО `u:role` (чужая `u:other` цела).
-- [~] 7.4 File/Pattern грант без способного бэкенда → apply отказывает (fail-closed). [unit-проверено `route_grants`; контейнер-форма отложена]
+ПРОГНАНО 2026-06-27 в docker (rust:bookworm, реальные setfacl/getfacl/visudo) через
+`tests/integration/container-apply.sh` (sc.28–31 file-access + sc.32–38 group-grants g:group),
+билд текущего main (incl H1/M1 + follow-ups): **122 passed, 0 failed**.
+- [x] 7.1 Реальный setfacl: `getfacl` показывает `u:role:rwX` + default-ACL на папке. [sc.28: `user:faop:rwx` + `default:user:faop:rwx`]
+- [x] 7.2 Rewrite-proof: новый файл в папке наследует default-ACL → доступ цел. [sc.29: `user:faop:rw` на new file]
+- [x] 7.3 отзыв снимает ТОЛЬКО `u:role` (чужая `u:other` цела). [sc.30: faop снят, `user:faother` цел].
+      Нюанс: ro=`r-X` визуал и откат-при-сбое-фазы — unit (FakeBackend), в контейнере ассертился rw + revoke-precision.
+- [x] 7.4 File/Pattern грант без способного бэкенда → apply отказывает (fail-closed). [sc.31: bare-file грант → apply fails, нет мутации `/etc/hosts`]
 
 ## Проверки
 - [x] 8.1 `cargo test` зелёные (829, 0 failed); `cargo clippy --all-targets --locked` deny-tier чист
