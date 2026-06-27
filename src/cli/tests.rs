@@ -49,7 +49,7 @@ fn fixtures(dir: &Path) -> (PathBuf, PathBuf) {
     std::fs::write(
             &decl,
             format!(
-                "version = 5\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
+                "version = 5\nschema = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
                 store.display()
             ),
         )
@@ -128,7 +128,7 @@ fn signed_fixtures(
         )
         .unwrap();
     let head = format!(
-        "version = {version}\nrole_store = \"{}\"\n",
+        "version = {version}\nschema = 1\nrole_store = \"{}\"\n",
         store.display()
     );
     let tail = "[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n";
@@ -423,6 +423,7 @@ fn render_compile_human_shows_primitives_and_provenance() {
         )],
         raw_groups: vec!["wheel".to_owned()],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let text = render_compile_human(&compiled);
@@ -440,6 +441,64 @@ fn render_compile_human_shows_primitives_and_provenance() {
 }
 
 #[test]
+fn render_compile_human_marks_inline_sudo_as_raw() {
+    // An inline payload.sudo command is the sudo escape hatch: it must render in
+    // the sudo section tagged [raw] (uncurated, escalation-capable), next to the
+    // catalog-sourced command that carries its provenance layer.
+    let compiled = CompiledRole {
+        role: "oper".to_owned(),
+        permissions: vec![compiled_perm(
+            "net-admin",
+            Some(Risk::EscalationCapable),
+            vec![],
+            vec![sourced("/usr/sbin/ip", "linux-debian", None)],
+        )],
+        raw_groups: vec![],
+        raw_sudo_role: None,
+        raw_sudo: vec!["/usr/sbin/myapp-reload".to_owned()],
+        raw_limits: Limits::default(),
+    };
+    let text = render_compile_human(&compiled);
+    assert!(text.contains("/usr/sbin/myapp-reload [raw]"), "{text}");
+    assert!(
+        text.contains("/usr/sbin/ip [perm net-admin @ linux-debian]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn lint_role_flags_inline_sudo_as_raw_unlabeled_escalation() {
+    // Inline payload.sudo bypasses the catalog risk-label, so lint must flag it as
+    // a raw / unlabeled escalation-capable primitive — even on a permission-free
+    // role (the warning is emitted unconditionally).
+    let compiled = CompiledRole {
+        role: "oper".to_owned(),
+        permissions: vec![],
+        raw_groups: vec![],
+        raw_sudo_role: None,
+        raw_sudo: vec!["/usr/sbin/myapp-reload".to_owned()],
+        raw_limits: Limits::default(),
+    };
+    let warnings = vec![model::ResolveWarning::InlineSudoUnlabeled {
+        role: "oper".to_owned(),
+    }];
+    let decl = Declaration::parse(
+            "version = 1\nschema = 1\nrole_store = \"/r\"\n[defaults]\nuid_range = [9000,9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
+        )
+        .unwrap();
+    let os = OsTarget::new("linux", "debian", None).unwrap();
+    let catalog = LiveCatalog::new(vec![]);
+    let l10n = FakeL10n::new();
+    let findings = lint_role(&compiled, &warnings, &decl, &os, &catalog, &l10n);
+    assert!(
+        findings.iter().any(|f| f.code == "raw-primitive"
+            && f.severity == LintSeverity::Warning
+            && f.message.contains("escalation-capable")),
+        "expected raw / unlabeled escalation-capable finding: {findings:?}"
+    );
+}
+
+#[test]
 fn render_compile_human_shows_bundle_via_provenance() {
     // A primitive pulled in through a bundle member shows `via`.
     let compiled = CompiledRole {
@@ -452,6 +511,7 @@ fn render_compile_human_shows_bundle_via_provenance() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let text = render_compile_human(&compiled);
@@ -473,6 +533,7 @@ fn render_compile_json_is_well_formed_shape() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits {
             nofile: Some(1024),
             nproc: None,
@@ -504,6 +565,7 @@ fn render_compile_human_shows_runas_on_service_account_command() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let text = render_compile_human(&compiled);
@@ -526,6 +588,7 @@ fn render_compile_human_omits_runas_for_root_command() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let text = render_compile_human(&compiled);
@@ -556,6 +619,7 @@ fn render_compile_json_emits_runas_field_on_sudo_entries() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let json = render_compile_json(&compiled);
@@ -589,6 +653,7 @@ fn render_compile_human_shows_file_grants_dir_and_file() {
         ],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let text = render_compile_human(&compiled);
@@ -617,6 +682,7 @@ fn render_compile_json_emits_file_grants_array_escaped() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let json = render_compile_json(&compiled);
@@ -646,6 +712,7 @@ fn render_show_tree_shows_file_grant_with_backend() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let l10n = FakeL10n::new();
@@ -673,6 +740,7 @@ fn risk_lint_flags_rw_on_root_equivalent() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let findings = file_grant_risk_findings(&compiled);
@@ -700,6 +768,7 @@ fn risk_lint_flags_secret_path_read() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let findings = file_grant_risk_findings(&compiled);
@@ -727,6 +796,7 @@ fn risk_lint_flags_ssh_host_key_read() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let findings = file_grant_risk_findings(&compiled);
@@ -748,6 +818,7 @@ fn risk_lint_flags_ssh_host_key_read() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     assert!(
@@ -773,6 +844,7 @@ fn risk_lint_clean_grant_no_finding() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     assert!(file_grant_risk_findings(&compiled).is_empty());
@@ -920,7 +992,7 @@ fn compile_fixture(
     std::fs::write(
             &decl,
             format!(
-                "version = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
+                "version = 1\nschema = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
                 store.display()
             ),
         )
@@ -1102,6 +1174,7 @@ fn lint_role_emits_raw_and_missing_translation_warnings() {
         )],
         raw_groups: vec!["wheel".to_owned()],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let warnings = vec![model::ResolveWarning::RawPrimitiveAlongsidePermissions {
@@ -1109,7 +1182,7 @@ fn lint_role_emits_raw_and_missing_translation_warnings() {
         primitive: "groups",
     }];
     let decl = Declaration::parse(
-            "version = 1\nrole_store = \"/r\"\n[defaults]\nuid_range = [9000,9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
+            "version = 1\nschema = 1\nrole_store = \"/r\"\n[defaults]\nuid_range = [9000,9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n",
         )
         .unwrap();
     let os = OsTarget::new("linux", "debian", None).unwrap();
@@ -1150,6 +1223,7 @@ fn render_show_tree_localizes_and_shows_risk() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let l10n = FakeL10n::new().with(
@@ -1183,6 +1257,7 @@ fn render_show_tree_falls_back_to_id_when_untranslated() {
         )],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let l10n = FakeL10n::new();
@@ -1290,7 +1365,7 @@ fn sample_report() -> CoverageReport {
 }
 
 #[test]
-fn resolve_roles_honours_catalog_dir_override() {
+fn resolve_roles_honours_additional_catalog_dir_override() {
     // A role references a permission defined ONLY in a site catalog passed via
     // the same roots the coverage pass uses. resolve_roles must resolve it
     // against those roots (not the bare defaults) so the role contributes its
@@ -1684,7 +1759,7 @@ fn build_group_grant_sources_emits_group_targets() {
         )
         .unwrap();
     let decl_text = format!(
-            "version = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n\
+            "version = 1\nschema = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n\
              [[group]]\nname = \"netops\"\ngid = 8020\n\
              [[group]]\nname = \"empty-grp\"\ngid = 8021\n\
              [[role_group]]\nrole = \"netops\"\ngroup = \"netops\"\n",
@@ -1869,6 +1944,7 @@ fn show_role() -> CompiledRole {
         ],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     }
 }
@@ -2269,6 +2345,7 @@ fn show_framework_human_prints_polarity() {
         ],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let sel = FrameworkSelection::resolve("pci-dss", &loaded);
@@ -2303,6 +2380,7 @@ fn show_framework_json_carries_each_polarity() {
         ],
         raw_groups: vec![],
         raw_sudo_role: None,
+        raw_sudo: Vec::new(),
         raw_limits: Limits::default(),
     };
     let sel = FrameworkSelection::resolve("pci-dss", &loaded);

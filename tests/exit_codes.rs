@@ -63,7 +63,12 @@ fn which_grants_always_exits_zero_on_no_match() {
     std::fs::create_dir_all(catalog_root.join("linux")).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
-        .args(["catalog", "which-grants", "/usr/sbin/ip", "--catalog-dir"])
+        .args([
+            "catalog",
+            "which-grants",
+            "/usr/sbin/ip",
+            "--additional-catalog-dir",
+        ])
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -93,7 +98,7 @@ fn coverage_min_coverage_gate_exits_nonzero_on_shortfall() {
     // gate behaviour is the same for any class, and the empty catalog leaves it
     // uncovered regardless.
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
-        .args(["catalog", "coverage", "--catalog-dir"])
+        .args(["catalog", "coverage", "--additional-catalog-dir"])
         .arg(&catalog_root)
         .args([
             "--os-target",
@@ -194,6 +199,57 @@ fn coverage_rejects_out_of_range_min_coverage() {
         .output()
         .unwrap();
     assert_out_of_range_rejected("-1", &out);
+}
+
+#[test]
+fn no_default_catalog_dirs_without_additional_fails_closed() {
+    // `--no-default-catalog-dirs` drops the packaged roots; with no
+    // `--additional-catalog-dir` that leaves zero roots. Expanding the catalog
+    // against nothing would silently resolve every permission to empty, so the
+    // command must refuse with a non-zero exit and a clear diagnostic rather than
+    // open the catalog into the void.
+    let out = Command::new(env!("CARGO_BIN_EXE_census"))
+        .args([
+            "compile",
+            "some-role",
+            "--no-default-catalog-dirs",
+            "--os-target",
+            "linux-debian-12",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "zero catalog roots must fail closed (non-zero exit); got {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no catalog roots configured"),
+        "must name the empty-roots failure; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn old_catalog_dir_flag_is_rejected() {
+    // `--catalog-dir` was renamed to `--additional-catalog-dir` with no alias
+    // (private repo, no external consumers). The old spelling must now be an
+    // unknown-argument usage error (clap exit 2), proving the rename took effect.
+    let out = Command::new(env!("CARGO_BIN_EXE_census"))
+        .args(["compile", "some-role", "--catalog-dir", "/tmp/whatever"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the removed --catalog-dir flag must be a clap usage error (exit 2); \
+         got {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Assert the binary rejected an out-of-range `--min-coverage` value via the

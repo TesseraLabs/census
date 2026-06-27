@@ -57,6 +57,7 @@ write_decl() {
   local serv="$1"
   cat > "$DECL" <<EOF
 version = $2
+schema = 1
 role_store = "$STORE"
 [defaults]
 uid_range = [9000, 9999]
@@ -143,6 +144,7 @@ openssl pkey -in "$MROOT/priv.pem" -pubout -outform DER 2>/dev/null | tail -c 32
 build_unsigned() { # $1=outfile $2=version
   cat > "$1" <<EOF
 version = $2
+schema = 1
 role_store = "$MSTORE"
 [defaults]
 uid_range = [9000, 9999]
@@ -231,6 +233,7 @@ groups = [$2]
 EOF
   cat > "$GROOT/decl.toml" <<EOF
 version = $1
+schema = 1
 role_store = "$GSTORE"
 [defaults]
 uid_range = [9000, 9999]
@@ -297,6 +300,7 @@ EOF
 l_decl() { # $1=version $2=include-lr? (yes/no)
   cat > "$LROOT/decl.toml" <<EOF
 version = $1
+schema = 1
 role_store = "$LSTORE"
 [defaults]
 uid_range = [9000, 9999]
@@ -367,7 +371,7 @@ assert     "output names trust/registry/error"         "echo \"\$out21\" | grep 
 
 echo "== scenario 22-24: PERMISSION CATALOG (permissions[] → expanded groups + concrete sudoers) =="
 # Isolated subtree. Roles carry `permissions = [...]` (catalog ids), NOT raw
-# groups/sudo_role; `census apply --catalog-dir /work/share/permissions` expands
+# groups/sudo_role; `census apply --additional-catalog-dir /work/share/permissions` expands
 # them per OS target. Container is debian/bookworm → resolves linux + linux-debian
 # + linux-debian-12 layers. Real catalog facts asserted on (from share/permissions):
 #   network-admin → groups=[netdev], sudo=[/usr/sbin/ip,/usr/bin/nmcli]
@@ -392,6 +396,7 @@ EOF
 c_decl() { # $1 = version
   cat > "$CROOT/decl.toml" <<EOF
 version = $1
+schema = 1
 role_store = "$CSTORE"
 [defaults]
 uid_range = [9000, 9999]
@@ -402,7 +407,7 @@ role = "netop"
 uid = 9060
 EOF
 }
-c_apply() { "$CENSUS" apply --declaration "$CROOT/decl.toml" --managed "$CMAN" --trust-fs --i-understand-no-rescue --catalog-dir /work/share/permissions 2>&1; }
+c_apply() { "$CENSUS" apply --declaration "$CROOT/decl.toml" --managed "$CMAN" --trust-fs --i-understand-no-rescue --additional-catalog-dir /work/share/permissions 2>&1; }
 
 echo "-- 22: permission-authored role materializes catalog-expanded groups + concrete sudoers --"
 c_store '"network-admin", "log-read"'
@@ -440,7 +445,7 @@ echo "== scenario 25-27: CATALOG COVERAGE (read-only audit of live privileged su
 # mutates nothing. Prefer cheap classes (group, sudo_bin) over the full setuid walk
 # of / so the run stays fast and deterministic. Exit codes: 0 normal; 4 when
 # --min-coverage threshold is not met; 1 on scan/catalog error or unknown --class.
-COV() { "$CENSUS" catalog coverage --catalog-dir /work/share/permissions "$@" 2>&1; }
+COV() { "$CENSUS" catalog coverage --additional-catalog-dir /work/share/permissions "$@" 2>&1; }
 
 echo "-- 25: coverage runs read-only and reports a summary --"
 out25="$(COV --class group,sudo_bin)"; rc25=$?; echo ":: $out25"
@@ -490,6 +495,7 @@ EOF
 f_decl() { # $1 = version
   cat > "$FROOT/decl.toml" <<EOF
 version = $1
+schema = 1
 role_store = "$FSTORE"
 [defaults]
 uid_range = [9000, 9999]
@@ -500,7 +506,7 @@ role = "faop"
 uid = 9070
 EOF
 }
-f_apply() { "$CENSUS" apply --declaration "$FROOT/decl.toml" --managed "$FMAN" --trust-fs --i-understand-no-rescue --catalog-dir /work/share/permissions 2>&1; }
+f_apply() { "$CENSUS" apply --declaration "$FROOT/decl.toml" --managed "$FMAN" --trust-fs --i-understand-no-rescue --additional-catalog-dir /work/share/permissions 2>&1; }
 
 echo "-- 28: directory grant materializes as access + default ACL (any-tool access) --"
 f_store '"ssh-admin"'
@@ -546,7 +552,7 @@ access = "rw"
 EOF
 f_store '"fa-file"'
 f_decl 3                                              # bump version
-out31="$("$CENSUS" apply --declaration "$FROOT/decl.toml" --managed "$FMAN" --trust-fs --i-understand-no-rescue --catalog-dir "$FCAT" 2>&1)"; rc31=$?
+out31="$("$CENSUS" apply --declaration "$FROOT/decl.toml" --managed "$FMAN" --trust-fs --i-understand-no-rescue --additional-catalog-dir "$FCAT" 2>&1)"; rc31=$?
 echo ":: $out31"
 assert     "file-grant apply fails (capability-gated)" "[ $rc31 -ne 0 ]"
 assert     "error names file/backend/directory"        "echo \"\$out31\" | grep -qiE 'file|backend|director|capab'"
@@ -586,6 +592,7 @@ EOF
 gg_decl() {
   cat > "$GGROOT/decl.toml" <<EOF
 version = $1
+schema = 1
 role_store = "$GGSTORE"
 [defaults]
 uid_range = [9000, 9999]
@@ -594,7 +601,7 @@ home_base = "/var/lib/census/home"
 $2
 EOF
 }
-gg_apply() { "$CENSUS" apply --declaration "$GGROOT/decl.toml" --managed "$GGMAN" --trust-fs --i-understand-no-rescue --catalog-dir /work/share/permissions 2>&1; }
+gg_apply() { "$CENSUS" apply --declaration "$GGROOT/decl.toml" --managed "$GGMAN" --trust-fs --i-understand-no-rescue --additional-catalog-dir /work/share/permissions 2>&1; }
 
 # /etc/ssh exists on bookworm; create it defensively so the g:group ACL target is present.
 [ -d /etc/ssh ] || mkdir -p /etc/ssh

@@ -123,7 +123,10 @@ command -v setfacl     # нужен только для файловых permiss
 стабильному UID:
 
 ```toml
-version    = 1
+schema     = 1                # версия формата парсера — обязательно (fail-closed,
+                              #   если эта сборка Census её не поддерживает)
+version    = 1                # монотонный anti-rollback счётчик контента
+                              #   (проверяется только в managed/signed-режиме)
 role_store = "roles"          # путь к role-store, относительно рабочего
                               #   каталога, из которого запускается census
 
@@ -141,6 +144,13 @@ role = "admin"
 uid  = 9002
 ```
 
+- `schema` — это **версия формата парсера**, и она **обязательна**. Census
+  отвергает декларацию, чью `schema` он не поддерживает, до любой мутации —
+  копируйте строку `schema = 1` в каждую декларацию, которую пишете.
+- `version` — отдельный монотонный **anti-rollback счётчик контента
+  декларации**; он проверяется только в managed-режиме (с подписью) и не
+  проверяется под `--trust-fs`. Полное различие `schema` и `version` — в
+  [справочнике TOML](toml-reference.md#11-верхний-уровень).
 - `role_store` разрешается **относительно рабочего каталога**, из которого
   запущен Census. Либо запускайте Census из каталога, содержащего `roles/`,
   либо укажите абсолютный путь.
@@ -187,12 +197,29 @@ Permission — это одно из:
 
 **Каталог** превращает permissions в конкретные OS-примитивы (`groups`,
 команды `sudo`, `limits`, файловые ACL). Стартовый каталог поставляется внутри
-Census в `share/permissions/`. Укажите дополнительный корень каталога через
-`--catalog-dir` (повторяемо; более поздние корни побеждают):
+Census в `share/permissions/`. Кроме того, Census ищет в дефолтных корнях
+каталога `/usr/share/census/permissions` и `/etc/census/permissions.d`. Укажите
+**дополнительный** корень через `--additional-catalog-dir` (повторяемо;
+дописывается к дефолтам, при коллизии id побеждает корень позже по списку):
 
 ```sh
-census compile oper --catalog-dir /opt/census/share/permissions
+census compile oper --additional-catalog-dir /opt/census/share/permissions
 ```
+
+Чтобы прогнать **только** против своих корней — изолированный прогон без
+встроенных дефолтов — добавьте `--no-default-catalog-dirs`:
+
+```sh
+census compile oper \
+  --no-default-catalog-dirs \
+  --additional-catalog-dir /opt/census/share/permissions
+```
+
+`--no-default-catalog-dirs` выкидывает оба встроенных дефолта из списка корней.
+Заданный **без** единого `--additional-catalog-dir`, он оставил бы ноль корней —
+поэтому Census отказывается с ненулевым кодом возврата (он никогда не
+разрешается против пустого каталога). Старый флаг `--catalog-dir`, который лишь
+дописывал, удалён — используйте `--additional-catalog-dir`.
 
 Каталог **слоистый по ОС**: permission разрешается по цепочке
 `linux → linux-debian → linux-debian-12` (а также `linux-ubuntu`,
@@ -265,7 +292,7 @@ Census никогда не выдаёт permission за «ограниченны
 
 ```sh
 cd /etc/census          # чтобы role_store="roles" разрешился
-census plan --declaration declaration.toml --catalog-dir /opt/census/share/permissions
+census plan --declaration declaration.toml --additional-catalog-dir /opt/census/share/permissions
 #   CREATE oper  (uid 9001, shell /bin/bash)
 #   CREATE admin (uid 9002, shell /bin/bash)
 ```
@@ -277,14 +304,14 @@ permission породил каждую строку `sudo` / группу / фа
 
 ```sh
 census compile oper --declaration declaration.toml \
-  --catalog-dir /opt/census/share/permissions --os-target linux-astra-1.8 --lint
+  --additional-catalog-dir /opt/census/share/permissions --os-target linux-astra-1.8 --lint
 ```
 
 `show` рендерит то же как локализованное дерево permissions → примитивы, с
 классом риска каждого (используйте `--lang en|ru|zh`):
 
 ```sh
-census show oper --lang ru --catalog-dir /opt/census/share/permissions
+census show oper --lang ru --additional-catalog-dir /opt/census/share/permissions
 ```
 
 Используйте `--lint` у `compile` в CI: он завершается ненулевым кодом при любой
@@ -301,7 +328,7 @@ census show oper --lang ru --catalog-dir /opt/census/share/permissions
 cd /etc/census
 sudo census apply \
   --declaration declaration.toml \
-  --catalog-dir /opt/census/share/permissions \
+  --additional-catalog-dir /opt/census/share/permissions \
   --trust-fs \
   --i-understand-no-rescue
 #   census: create: create oper (uid 9001)
@@ -348,7 +375,7 @@ sudo -l -U oper                          # что oper авторизован з
 пути:
 
 ```sh
-census catalog which-grants /etc/nginx --catalog-dir /opt/census/share/permissions --os-target linux-astra-1.8
+census catalog which-grants /etc/nginx --additional-catalog-dir /opt/census/share/permissions --os-target linux-astra-1.8
 ```
 
 ---
@@ -372,7 +399,7 @@ Type=oneshot
 WorkingDirectory=/etc/census
 ExecStart=/usr/local/sbin/census apply \
   --declaration declaration.toml \
-  --catalog-dir /opt/census/share/permissions \
+  --additional-catalog-dir /opt/census/share/permissions \
   --trust-fs --i-understand-no-rescue
 ```
 
@@ -413,8 +440,8 @@ census doctor   --declaration declaration.toml   # read-only проверки ц
 
 ```sh
 # отредактируйте roles/oper.toml — добавьте или уберите permission
-census plan  --declaration declaration.toml --catalog-dir /opt/census/share/permissions   # предпросмотр дельты
-sudo census apply --declaration declaration.toml --catalog-dir /opt/census/share/permissions --trust-fs --i-understand-no-rescue
+census plan  --declaration declaration.toml --additional-catalog-dir /opt/census/share/permissions   # предпросмотр дельты
+sudo census apply --declaration declaration.toml --additional-catalog-dir /opt/census/share/permissions --trust-fs --i-understand-no-rescue
 ```
 
 Census вычисляет минимальное обновление (добавить/убрать изменившиеся строки

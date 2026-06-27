@@ -1,5 +1,5 @@
 //! End-to-end tests of `census compile` and `census show` against on-disk
-//! fixtures (real `--catalog-dir`, role-store, and l10n tree).
+//! fixtures (real `--additional-catalog-dir`, role-store, and l10n tree).
 
 // Integration tests are a separate crate, so the crate-root test exemption in
 // lib.rs does not reach them. In a test a panic on a broken fixture is the
@@ -41,7 +41,7 @@ fn fixtures(
     write(
         &decl,
         &format!(
-            "version = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
+            "version = 1\nschema = 1\nrole_store = \"{}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"oper\"\nuid = 9010\n",
             store.display()
         ),
     );
@@ -64,7 +64,7 @@ fn compile_prints_primitives_with_provenance() {
         .arg("oper")
         .arg("--declaration")
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -97,7 +97,7 @@ fn compile_json_emits_machine_shape() {
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["compile", "oper", "--json", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -126,7 +126,7 @@ fn compile_renders_file_grants_human_and_json() {
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["compile", "oper", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -146,7 +146,7 @@ fn compile_renders_file_grants_human_and_json() {
     let out_json = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["compile", "oper", "--json", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -174,7 +174,7 @@ fn compile_shows_runas_human_and_json() {
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["compile", "oper", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -194,7 +194,7 @@ fn compile_shows_runas_human_and_json() {
     let out_json = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["compile", "oper", "--json", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -220,7 +220,7 @@ fn compile_omits_runas_for_root_command_json_null() {
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["compile", "oper", "--json", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian-12"])
         .output()
@@ -246,7 +246,7 @@ fn compile_lint_unknown_permission_exits_nonzero() {
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["compile", "oper", "--lint", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian"])
         .output()
@@ -275,7 +275,7 @@ fn show_renders_localized_tree() {
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["show", "oper", "--lang", "ru", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian"])
         .output()
@@ -310,7 +310,7 @@ fn show_falls_back_to_id_when_translation_missing() {
     let out = Command::new(env!("CARGO_BIN_EXE_census"))
         .args(["show", "oper", "--lang", "ru", "--declaration"])
         .arg(&decl)
-        .arg("--catalog-dir")
+        .arg("--additional-catalog-dir")
         .arg(&catalog_root)
         .args(["--os-target", "linux-debian"])
         .output()

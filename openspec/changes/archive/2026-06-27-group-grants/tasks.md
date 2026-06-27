@@ -64,5 +64,6 @@
 - [x] 8.2 master-code-reviewer; фикс CRITICAL/HIGH (gpasswd/setfacl/%group как root —
       injection, симлинки, anti-lockout, adoption-захват).
 - [x] 8.3 `openspec validate group-grants --strict`.
-- [ ] 8.4 Угроза-дельта (gpasswd/%group/g:group, adoption-захват) → threat-model §5.14 (tessera-ws).
-      ОТЛОЖЕНО (follow-up, не блокирует реализацию).
+- [x] 8.4 Угроза-дельта (gpasswd/%group/g:group, adoption-захват) → threat-model §5.14 (tessera-ws):
+      CN13 (over-exposure `%group`/`g:group`), CN14 (adoption-захват/`gpasswd`), CN15 (group
+      privilege-retention), CN16 (adopt-baseline гонка).

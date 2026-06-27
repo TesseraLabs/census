@@ -6,6 +6,14 @@
 
 use std::path::PathBuf;
 
+/// Highest declaration `schema` (parser-format version) this build understands.
+///
+/// Bumped only when the on-disk declaration format changes in a way the parser
+/// must branch on. A declaration whose `schema` exceeds this is rejected up
+/// front (a newer writer produced a format this binary cannot read); a `schema`
+/// below this is still accepted, reserved for a future format-migration branch.
+pub const SUPPORTED_SCHEMA: u32 = 1;
+
 /// Defaults applied to role accounts that omit a field.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -105,7 +113,21 @@ pub struct RoleGroup {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Declaration {
-    /// Monotonic version; anti-rollback uses it (verification is a later slice).
+    /// Format version of the declaration parser, distinct from `version`. It
+    /// pins which on-disk shape the document was written for, so a too-new
+    /// document fails with a clear message instead of a confusing field error.
+    /// Checked before any other validation against [`SUPPORTED_SCHEMA`]: a value
+    /// above it is rejected, a value below it is reserved for a future
+    /// format-migration branch. Required — a missing `schema` is a parse error.
+    pub schema: u32,
+    /// Monotonic anti-rollback counter over the declaration *content* (not the
+    /// format). It is the replay guard for the signature: each newly signed
+    /// declaration that supersedes a prior one must carry a strictly higher
+    /// `version`, so a captured older-but-validly-signed declaration cannot be
+    /// replayed. Enforced only in managed/signed mode (see `trust.rs`); under
+    /// `--trust-fs` it is not checked. Bump it on every new signed declaration
+    /// that replaces the previous one. Contrast with `schema`, which versions
+    /// the parser format, not the content.
     pub version: u32,
     /// Path to the role-store directory (source of role composition).
     pub role_store: PathBuf,
@@ -138,6 +160,10 @@ pub enum DeclarationError {
     /// TOML parse / type / unknown-field error.
     #[error("declaration TOML is invalid: {0}")]
     TomlParse(String),
+    /// `schema` (parser-format version) is newer than this build supports.
+    /// Checked before any other validation so a too-new format fails clearly.
+    #[error("declaration schema {got} is not supported (max {supported})")]
+    SchemaUnsupported { got: u32, supported: u32 },
     /// `version` must be >= 1.
     #[error("declaration version must be >= 1, got {0}")]
     VersionZero(u32),
@@ -292,6 +318,15 @@ impl Declaration {
     }
 
     fn validate(&self) -> Result<(), DeclarationError> {
+        // Format gate first: a document written for a newer parser shape must
+        // fail with a precise message before any content-level check runs, so a
+        // format mismatch never surfaces as a misleading downstream error.
+        if self.schema > SUPPORTED_SCHEMA {
+            return Err(DeclarationError::SchemaUnsupported {
+                got: self.schema,
+                supported: SUPPORTED_SCHEMA,
+            });
+        }
         if self.version < 1 {
             return Err(DeclarationError::VersionZero(self.version));
         }
@@ -520,6 +555,7 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"
+schema = 1
 version = 12
 role_store = "/var/lib/tessera/roles"
 
@@ -542,12 +578,52 @@ uid = 9020
     #[test]
     fn parses_sample() {
         let d = Declaration::parse(SAMPLE).unwrap();
+        assert_eq!(d.schema, 1);
         assert_eq!(d.version, 12);
         assert_eq!(d.role_store, PathBuf::from("/var/lib/tessera/roles"));
         assert_eq!(d.defaults.uid_range, [9000, 9999]);
         assert_eq!(d.role_accounts.len(), 2);
         assert_eq!(d.role_accounts[0].role, "oper");
         assert_eq!(d.role_accounts[0].uid, Some(9010));
+    }
+
+    #[test]
+    fn supported_schema_parses() {
+        // schema == SUPPORTED_SCHEMA is accepted and validation proceeds.
+        let d = Declaration::parse(SAMPLE).unwrap();
+        assert_eq!(d.schema, SUPPORTED_SCHEMA);
+    }
+
+    #[test]
+    fn future_schema_rejected() {
+        let doc = SAMPLE.replace("schema = 1", "schema = 2");
+        assert!(matches!(
+            Declaration::parse(&doc).unwrap_err(),
+            DeclarationError::SchemaUnsupported { got: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn missing_schema_rejected() {
+        // schema has no serde default, so its absence is a TOML parse error.
+        let doc = SAMPLE.replace("schema = 1\n", "");
+        assert!(matches!(
+            Declaration::parse(&doc).unwrap_err(),
+            DeclarationError::TomlParse(_)
+        ));
+    }
+
+    #[test]
+    fn schema_checked_before_other_validation() {
+        // An unsupported schema AND an inverted uid_range: the format gate wins,
+        // so the error is SchemaUnsupported, never UidRangeInverted.
+        let doc = SAMPLE
+            .replace("schema = 1", "schema = 2")
+            .replace("uid_range = [9000, 9999]", "uid_range = [9999, 9000]");
+        assert!(matches!(
+            Declaration::parse(&doc).unwrap_err(),
+            DeclarationError::SchemaUnsupported { got: 2, .. }
+        ));
     }
 
     #[test]
@@ -630,7 +706,7 @@ uid = 9020
     fn signature_line_accepted_by_strict_parser() {
         // deny_unknown_fields must not reject a `signature = "..."` line. As a
         // top-level scalar key it must precede any `[table]` header.
-        let doc = "version = 12\nrole_store = \"/r\"\nsignature = \"abcdef\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n";
+        let doc = "schema = 1\nversion = 12\nrole_store = \"/r\"\nsignature = \"abcdef\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/h\"\n";
         let d = Declaration::parse(doc).unwrap();
         assert_eq!(d.signature.as_deref(), Some("abcdef"));
     }

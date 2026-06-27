@@ -96,7 +96,8 @@ nproc  = 512            # RLIMIT_NPROC
 
 ```toml
 # /etc/census/declaration.toml
-version = 12                            # монотонный; anti-rollback (§9)
+schema = 1                             # версия формата парсера; обязательно, fail-closed
+version = 12                            # монотонный; anti-rollback контента (§9)
 role_store = "/var/lib/tessera/roles"   # откуда брать состав
 
 [defaults]
@@ -273,6 +274,7 @@ sudo_role = "atm-admin"
 ```
 `declaration.toml`:
 ```toml
+schema = 1
 version = 1
 role_store = "/var/lib/tessera/roles"
 [defaults]

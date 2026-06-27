@@ -35,13 +35,39 @@ should exist. It is parsed **strictly** — an unknown key anywhere is an error.
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
-| `version` | integer | yes | Declaration schema version. `1` today. |
+| `schema` | integer | yes | **Parser format version** of the declaration. `1` today. Census checks it **first**, before any other validation, and refuses a declaration whose `schema` exceeds what this build supports (fail-closed, no mutation) — see §1.1.1. |
+| `version` | integer | yes | **Monotonic anti-rollback counter for the declaration's content** (replay protection for the signature) — *not* a format version. Enforced only in managed/signed mode; **not checked** under `--trust-fs`. Bump it on every newly signed declaration. See §1.1.1. |
 | `role_store` | path | yes | Path to the role-store directory, resolved **relative to the working directory** Census runs from (or absolute). |
 | `[defaults]` | table | yes | Default account attributes (§1.2). |
 | `[[role_account]]` | array of tables | no | The role-accounts to provision (§1.3). |
 | `[[group]]` | array of tables | no | Standalone groups to provision (§1.4). |
 | `[[role_group]]` | array of tables | no | Bind a role's grants to a declared group (§1.5). |
 | `signature` | string (hex) | only in managed mode | Detached Ed25519 signature over the declaration bytes. Present when the declaration is centrally signed; **absent** under `--trust-fs` (standalone). You do not write this by hand — the control plane adds it. |
+
+#### 1.1.1 `schema` vs `version` — two different numbers
+
+These two integer fields look alike and are easy to confuse, but they answer
+different questions:
+
+| Field | Answers | Enforced |
+|---|---|---|
+| `schema` | *"Which TOML format is this?"* — the parser format version. | Always. Checked **first**, before any other field; a `schema` newer than this build supports → refuse, fail-closed, no mutation. |
+| `version` | *"How recent is this content?"* — a monotonic anti-rollback counter that protects the signature against replay. | Only in managed (signed) mode; **not** checked under `--trust-fs`. |
+
+- **`schema`** is about the *shape* of the file. Bump it only when the format
+  itself changes incompatibly; a build that does not understand a newer `schema`
+  stops cleanly with a clear message instead of failing deep inside on an
+  unknown key.
+- **`version`** is about the *contents*. Bump it on **every newly signed
+  declaration** so an attacker cannot replay an older signed copy to roll a
+  device back to stale access. In standalone (`--trust-fs`) mode there is no
+  signature to replay, so `version` is recorded but not enforced.
+
+They move independently: re-issuing a device's access bumps `version` while
+`schema` stays put; migrating the file format bumps `schema` while `version` is
+unaffected. Collapsing them into one field would force either a false rollback
+refusal on a format upgrade, or a hole in replay protection on a schema
+refactor.
 
 ### 1.2 `[defaults]`
 
@@ -164,13 +190,14 @@ Unknown top-level keys are ignored (tolerant).
 ### 2.2 `[payload]`
 
 All fields optional; tolerant (unknown keys ignored). The raw primitives
-(`groups`, `sudo_role`, `limits`, `files`) are an **escape hatch** that is
-**unioned** with the expansion of `permissions` — you can use either, or both.
+(`groups`, `sudo`, `sudo_role`, `limits`, `files`) are an **escape hatch** that
+is **unioned** with the expansion of `permissions` — you can use either, or both.
 
 | Key | Type | Meaning |
 |---|---|---|
 | `permissions` | array | Permission references expanded against the catalog (§2.3). The normal way to grant access. |
 | `groups` | array of string | Raw supplementary groups added directly (escape hatch — bypasses the catalog). |
+| `sudo` | array of string | Raw inline `sudo` command rules carried directly (escape hatch — bypasses the catalog). Literal absolute command paths only; see §2.7. |
 | `sudo_role` | string | A raw sudo role name carried directly (escape hatch). |
 | `[payload.limits]` | table | Resource limits (§2.4). |
 | `[[payload.files]]` | array of tables | Raw inline file-access grants (§2.5). |
@@ -185,6 +212,7 @@ level   = 3
 [payload]
 permissions = ["service-restart", "log-read", { id = "service-control", units = "nginx" }, "nginx.operate"]
 groups      = ["video"]                 # escape hatch, unioned in
+sudo        = ["/usr/sbin/reboot"]      # escape hatch, raw sudo command (§2.7)
 sudo_role   = "operations"              # escape hatch
 
 [payload.limits]
@@ -261,6 +289,36 @@ common cases, and there are canonical compact strings for the rest:
 
 For most grants `"ro"` and `"rw"` are what you want.
 
+### 2.7 `payload.sudo` — raw sudo commands (escape hatch)
+
+`sudo` under `[payload]` is the command-level twin of `[[payload.files]]`: a raw
+list of `sudo` command rules carried **directly** into the role, **unioned** with
+whatever the role's `permissions` expand to — the same way a catalog permission's
+`sudo` field is. Use it for a command that has no catalog permission yet.
+
+```toml
+[payload]
+sudo = ["/usr/sbin/reboot", "/usr/bin/systemctl"]
+```
+
+Constraints — validated **before** anything is written to `sudoers`, fail-closed
+on a violation:
+
+- **Literal absolute command paths only** — each entry must start with `/`.
+- **No arguments and no `{placeholder}` templates.** Parametrization with
+  confinement (a `{unit}` guarded by `[params]` constraints) stays the
+  prerogative of a catalog id — there is nothing to bound an inline parameter, so
+  it is rejected.
+- **Printable ASCII, no shell metacharacters** (`; | & $ < >` …) — refused so a
+  value cannot smuggle a second command into the sudoers line.
+
+Each entry materializes into `sudoers.d/census-<role>` **as root**, so it is a
+genuine privilege grant. Because it bypasses the curated catalog it carries **no
+risk label** — `census show` and `census compile --lint` therefore flag inline
+`payload.sudo` (like `[[payload.files]]`) as **raw / unlabeled
+escalation-capable**, so a reviewer always sees it. Prefer a catalog permission
+when one exists; reach for `payload.sudo` only as a deliberate escape hatch.
+
 ---
 
 ## 3. Catalog permission files (summary)
@@ -328,7 +386,7 @@ to see the **concrete artifacts** each change would write, as a unified diff —
 current managed state vs the resolved target:
 
 ```sh
-census plan --declaration declaration.toml --catalog-dir /opt/census/share/permissions --diff
+census plan --declaration declaration.toml --additional-catalog-dir /opt/census/share/permissions --diff
 ```
 
 `plan --diff` shows, per changed account:

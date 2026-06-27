@@ -1494,8 +1494,9 @@ fn file_path_defect_substituted(path: &str) -> Option<&'static str> {
 
 /// Whether `path` has a `..` as a whole `/`-separated component. A literal `..`
 /// inside a longer name (`a..b`) is not a traversal and is allowed; only the bare
-/// `..` component is a climb-the-tree primitive.
-fn has_dotdot_component(path: &str) -> bool {
+/// `..` component is a climb-the-tree primitive. `pub(crate)` so the resolver can
+/// reuse the same traversal check on a raw inline-sudo command literal.
+pub(crate) fn has_dotdot_component(path: &str) -> bool {
     path.split('/').any(|c| c == "..")
 }
 

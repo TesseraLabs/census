@@ -1748,7 +1748,7 @@ mod tests {
         .unwrap();
         let store = tmp.path().display().to_string();
         let text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
         );
         let d = Declaration::parse(&text).unwrap();
         (tmp, d)
@@ -1935,7 +1935,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path().display().to_string();
         let text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
         );
         let d = Declaration::parse(&text).unwrap();
         let st = fake_state(vec![managed("oper", 9010, &["wheel"], 5)]);
@@ -1976,7 +1976,7 @@ mod tests {
         .unwrap();
         let store = tmp.path().display().to_string();
         let text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
         );
         let d = Declaration::parse(&text).unwrap();
         (tmp, d)
@@ -2040,7 +2040,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path().display().to_string();
         let text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
         );
         let d = Declaration::parse(&text).unwrap();
         let st = fake_state(vec![managed("oper", 9010, &["wheel"], 5)]);
@@ -2190,7 +2190,7 @@ mod tests {
         .unwrap();
         let store = tmp.path().display().to_string();
         // signature line precedes the [defaults] table (TOML top-level key).
-        let head = format!("version = {version}\nrole_store = \"{store}\"\n");
+        let head = format!("version = {version}\nschema = 1\nrole_store = \"{store}\"\n");
         let tail = format!(
             "[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
         );
@@ -2378,7 +2378,7 @@ mod tests {
         .unwrap();
         let store = tmp.path().display().to_string();
         let mut text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
         );
         if let Some(g) = pin {
             text.push_str(&format!("[[group]]\nname = \"{group}\"\ngid = {g}\n"));
@@ -2536,7 +2536,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path().display().to_string();
         let text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
         );
         let d = Declaration::parse(&text).unwrap();
         let st = fake_state_with_groups(
@@ -2665,7 +2665,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path().display().to_string();
         let text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
         );
         let d = Declaration::parse(&text).unwrap();
         (tmp, d)
@@ -3125,7 +3125,7 @@ mod tests {
         .unwrap();
         let store = tmp.path().display().to_string();
         let text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n[[role_account]]\nrole = \"{role}\"\nuid = {uid}\n"
         );
         let d = Declaration::parse(&text).unwrap();
         (tmp, d)
@@ -3432,7 +3432,7 @@ mod tests {
         .unwrap();
         let store = tmp.path().display().to_string();
         let mut text = format!(
-            "version = 5\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
+            "version = 5\nschema = 1\nrole_store = \"{store}\"\n[defaults]\nuid_range = [9000, 9999]\nshell = \"/bin/bash\"\nhome_base = \"/var/lib/census/home\"\n"
         );
         for (r, uid) in accounts {
             text.push_str(&format!("[[role_account]]\nrole = \"{r}\"\nuid = {uid}\n"));

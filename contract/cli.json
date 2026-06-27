@@ -8,8 +8,8 @@
       "subcommands": [],
       "args": [
         {
-          "id": "catalog_dir",
-          "long": "catalog-dir",
+          "id": "additional_catalog_dir",
+          "long": "additional-catalog-dir",
           "takes_value": true,
           "required": false,
           "default": null,
@@ -40,6 +40,15 @@
           "takes_value": true,
           "required": false,
           "default": "/var/lib/census/managed.toml",
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "no_default_catalog_dirs",
+          "long": "no-default-catalog-dirs",
+          "takes_value": false,
+          "required": false,
+          "default": null,
           "repeatable": false,
           "num_args": null
         },
@@ -82,21 +91,21 @@
           "subcommands": [],
           "args": [
             {
+              "id": "additional_catalog_dir",
+              "long": "additional-catalog-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
               "id": "cache",
               "long": "cache",
               "takes_value": false,
               "required": false,
               "default": null,
               "repeatable": false,
-              "num_args": null
-            },
-            {
-              "id": "catalog_dir",
-              "long": "catalog-dir",
-              "takes_value": true,
-              "required": false,
-              "default": null,
-              "repeatable": true,
               "num_args": null
             },
             {
@@ -145,6 +154,15 @@
               "num_args": null
             },
             {
+              "id": "no_default_catalog_dirs",
+              "long": "no-default-catalog-dirs",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
               "id": "os_target",
               "long": "os-target",
               "takes_value": true,
@@ -179,21 +197,21 @@
           "subcommands": [],
           "args": [
             {
+              "id": "additional_catalog_dir",
+              "long": "additional-catalog-dir",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            },
+            {
               "id": "arg",
               "long": null,
               "takes_value": true,
               "required": true,
               "default": null,
               "repeatable": false,
-              "num_args": null
-            },
-            {
-              "id": "catalog_dir",
-              "long": "catalog-dir",
-              "takes_value": true,
-              "required": false,
-              "default": null,
-              "repeatable": true,
               "num_args": null
             },
             {
@@ -208,6 +226,15 @@
             {
               "id": "json",
               "long": "json",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "no_default_catalog_dirs",
+              "long": "no-default-catalog-dirs",
               "takes_value": false,
               "required": false,
               "default": null,
@@ -234,8 +261,8 @@
       "subcommands": [],
       "args": [
         {
-          "id": "catalog_dir",
-          "long": "catalog-dir",
+          "id": "additional_catalog_dir",
+          "long": "additional-catalog-dir",
           "takes_value": true,
           "required": false,
           "default": null,
@@ -263,6 +290,15 @@
         {
           "id": "lint",
           "long": "lint",
+          "takes_value": false,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "no_default_catalog_dirs",
+          "long": "no-default-catalog-dirs",
           "takes_value": false,
           "required": false,
           "default": null,
@@ -367,8 +403,8 @@
           "subcommands": [],
           "args": [
             {
-              "id": "catalog_dir",
-              "long": "catalog-dir",
+              "id": "additional_catalog_dir",
+              "long": "additional-catalog-dir",
               "takes_value": true,
               "required": false,
               "default": null,
@@ -391,6 +427,15 @@
               "required": false,
               "default": null,
               "repeatable": true,
+              "num_args": null
+            },
+            {
+              "id": "no_default_catalog_dirs",
+              "long": "no-default-catalog-dirs",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
               "num_args": null
             },
             {
@@ -551,8 +596,8 @@
       "subcommands": [],
       "args": [
         {
-          "id": "catalog_dir",
-          "long": "catalog-dir",
+          "id": "additional_catalog_dir",
+          "long": "additional-catalog-dir",
           "takes_value": true,
           "required": false,
           "default": null,
@@ -587,6 +632,15 @@
           "num_args": null
         },
         {
+          "id": "no_default_catalog_dirs",
+          "long": "no-default-catalog-dirs",
+          "takes_value": false,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
           "id": "os_target",
           "long": "os-target",
           "takes_value": true,
@@ -603,8 +657,8 @@
       "subcommands": [],
       "args": [
         {
-          "id": "catalog_dir",
-          "long": "catalog-dir",
+          "id": "additional_catalog_dir",
+          "long": "additional-catalog-dir",
           "takes_value": true,
           "required": false,
           "default": null,
@@ -651,6 +705,15 @@
           "id": "lang",
           "long": "lang",
           "takes_value": true,
+          "required": false,
+          "default": null,
+          "repeatable": false,
+          "num_args": null
+        },
+        {
+          "id": "no_default_catalog_dirs",
+          "long": "no-default-catalog-dirs",
+          "takes_value": false,
           "required": false,
           "default": null,
           "repeatable": false,

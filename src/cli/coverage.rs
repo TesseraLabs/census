@@ -104,7 +104,7 @@ fn all_classes() -> Vec<SurfaceClass> {
 /// run over the roles that DO resolve rather than abort on one bad slice.
 ///
 /// `catalog_roots` MUST be the same roots the main coverage pass uses (including
-/// any `--catalog-dir` site overrides). A role may reference a permission defined
+/// any `--additional-catalog-dir` site overrides). A role may reference a permission defined
 /// only in a site catalog; resolving roles against the bare defaults would fail
 /// to expand it and under-contribute coverage.
 pub(crate) fn resolve_roles(

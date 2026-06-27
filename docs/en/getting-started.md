@@ -121,7 +121,10 @@ The declaration lists the role-accounts this device should have and binds each
 to a stable UID:
 
 ```toml
-version    = 1
+schema     = 1                # parser format version — required (fail-closed if
+                              #   this Census build does not support it)
+version    = 1                # monotonic anti-rollback content counter
+                              #   (enforced only in managed/signed mode)
 role_store = "roles"          # path to the role-store, relative to the
                               #   working directory `census` runs from
 
@@ -139,6 +142,13 @@ role = "admin"
 uid  = 9002
 ```
 
+- `schema` is the **parser format version** and is **required**. Census refuses
+  a declaration whose `schema` it does not support, before any mutation — copy
+  the `schema = 1` line into every declaration you write.
+- `version` is a separate, monotonic **anti-rollback counter for the
+  declaration's content**; it is enforced only in managed (signed) mode and is
+  not checked under `--trust-fs`. See the [TOML reference](toml-reference.md#11-top-level)
+  for the full `schema` vs `version` distinction.
 - `role_store` is resolved **relative to the working directory** Census runs
   from. Either run Census from the directory that contains `roles/`, or use an
   absolute path.
@@ -185,12 +195,29 @@ with `census compile` / `census show` (§3.2).
 
 The **catalog** turns permissions into concrete OS primitives (`groups`,
 `sudo` commands, `limits`, file ACLs). The starter catalog ships inside Census
-under `share/permissions/`. Point Census at an additional catalog root with
-`--catalog-dir` (repeatable; later roots win):
+under `share/permissions/`. Census also looks in the default catalog roots
+`/usr/share/census/permissions` and `/etc/census/permissions.d`. Point Census at
+an **additional** catalog root with `--additional-catalog-dir` (repeatable; it
+appends to the defaults, and later roots win on an id collision):
 
 ```sh
-census compile oper --catalog-dir /opt/census/share/permissions
+census compile oper --additional-catalog-dir /opt/census/share/permissions
 ```
+
+To run against **only** your own roots — an isolated run that ignores the
+built-in defaults — add `--no-default-catalog-dirs`:
+
+```sh
+census compile oper \
+  --no-default-catalog-dirs \
+  --additional-catalog-dir /opt/census/share/permissions
+```
+
+`--no-default-catalog-dirs` drops both built-in defaults from the root list.
+Given **without** any `--additional-catalog-dir` it would leave zero catalog
+roots, so Census refuses it with a non-zero exit (it never resolves against an
+empty catalog). The old `--catalog-dir` flag — which only appended — has been
+removed; use `--additional-catalog-dir` instead.
 
 The catalog is **layered per OS**: a permission resolves along a chain
 `linux → linux-debian → linux-debian-12` (and `linux-ubuntu`, `linux-astra`),
@@ -262,7 +289,7 @@ Work through `plan` → `compile`/`show` (inspect) → `apply` (mutate) → veri
 
 ```sh
 cd /etc/census          # so role_store="roles" resolves
-census plan --declaration declaration.toml --catalog-dir /opt/census/share/permissions
+census plan --declaration declaration.toml --additional-catalog-dir /opt/census/share/permissions
 #   CREATE oper  (uid 9001, shell /bin/bash)
 #   CREATE admin (uid 9002, shell /bin/bash)
 ```
@@ -274,14 +301,14 @@ permission produced each `sudo` line / group / file grant):
 
 ```sh
 census compile oper --declaration declaration.toml \
-  --catalog-dir /opt/census/share/permissions --os-target linux-astra-1.8 --lint
+  --additional-catalog-dir /opt/census/share/permissions --os-target linux-astra-1.8 --lint
 ```
 
 `show` renders the same as a localized tree of permissions → primitives, with
 the risk class of each (use `--lang en|ru|zh`):
 
 ```sh
-census show oper --lang en --catalog-dir /opt/census/share/permissions
+census show oper --lang en --additional-catalog-dir /opt/census/share/permissions
 ```
 
 Use `--lint` on `compile` in CI: it exits non-zero on any catalog lint error.
@@ -297,7 +324,7 @@ to proceed (anti-lockout) unless you acknowledge with
 cd /etc/census
 sudo census apply \
   --declaration declaration.toml \
-  --catalog-dir /opt/census/share/permissions \
+  --additional-catalog-dir /opt/census/share/permissions \
   --trust-fs \
   --i-understand-no-rescue
 #   census: create: create oper (uid 9001)
@@ -343,7 +370,7 @@ You can also confirm reverse-lookup — which permissions would grant access to 
 path:
 
 ```sh
-census catalog which-grants /etc/nginx --catalog-dir /opt/census/share/permissions --os-target linux-astra-1.8
+census catalog which-grants /etc/nginx --additional-catalog-dir /opt/census/share/permissions --os-target linux-astra-1.8
 ```
 
 ---
@@ -366,7 +393,7 @@ Type=oneshot
 WorkingDirectory=/etc/census
 ExecStart=/usr/local/sbin/census apply \
   --declaration declaration.toml \
-  --catalog-dir /opt/census/share/permissions \
+  --additional-catalog-dir /opt/census/share/permissions \
   --trust-fs --i-understand-no-rescue
 ```
 
@@ -406,8 +433,8 @@ Edit the role-store (or the declaration), preview, then apply:
 
 ```sh
 # edit roles/oper.toml — add or remove a permission
-census plan  --declaration declaration.toml --catalog-dir /opt/census/share/permissions   # preview the delta
-sudo census apply --declaration declaration.toml --catalog-dir /opt/census/share/permissions --trust-fs --i-understand-no-rescue
+census plan  --declaration declaration.toml --additional-catalog-dir /opt/census/share/permissions   # preview the delta
+sudo census apply --declaration declaration.toml --additional-catalog-dir /opt/census/share/permissions --trust-fs --i-understand-no-rescue
 ```
 
 Census computes the minimal update (add/remove the changed sudo lines, groups,

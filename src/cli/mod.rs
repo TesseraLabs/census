@@ -316,7 +316,8 @@ pub struct ApplyOpts<'a> {
     /// account with a live session is deferred (not executed).
     pub sessions_file: PathBuf,
     /// Catalog roots in precedence order (lowest first) for permission
-    /// expansion. `--catalog-dir` accumulates onto [`default_catalog_roots`].
+    /// expansion. `--additional-catalog-dir` accumulates onto
+    /// [`default_catalog_roots`]; `--no-default-catalog-dirs` drops them.
     pub catalog_roots: Vec<PathBuf>,
     /// `--os-target family-distro-version` override. `None` autodetects from
     /// `/etc/os-release`.

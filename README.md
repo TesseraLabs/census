@@ -93,13 +93,13 @@ census plan      [--declaration P] [--managed P]        # diff, no mutations
 census apply     [--declaration P] [--managed P] ...     # verify → plan → backup → apply
 census doctor    [--declaration P] [--managed P]         # read-only readiness/integrity checks
 census status    [--declaration P] [--managed P]         # managed accounts, version, drift
-census compile   <role> [--os-target T] [--catalog-dir D] [--lint]   # expand permissions → primitives + provenance
+census compile   <role> [--os-target T] [--additional-catalog-dir D] [--lint]   # expand permissions → primitives + provenance
 census show      <role> [--lang ru|en|zh] [--os-target T] [--framework F]   # tree of permissions → primitives, localized; with --framework, control ids per permission
 census framework list                                                # installed compliance frameworks (id, version, provides)
 census framework show     <fw>                                       # a framework's controls + coverage stats
 census framework coverage <fw>                                       # gap-oracle: owned controls with no mapping
 census framework risk     <fw>                                       # controls a mapping undermines (risk links) + threatening permissions
-census framework lint     [--catalog-dir D]                          # validate mappings against the catalog
+census framework lint     [--additional-catalog-dir D]                          # validate mappings against the catalog
 ```
 
 (`census catalog coverage` — auditing which privileged surface is not covered by
