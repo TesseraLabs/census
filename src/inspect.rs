@@ -105,6 +105,18 @@ pub trait SystemInspector {
     /// file-access drift check, which is best-effort — a `None` is not a finding.
     fn file_access_present(&self, path: &str, account: &str) -> Option<bool>;
 
+    /// Whether group `group` currently has its own POSIX ACL access entry on `path`.
+    ///
+    /// The group analogue of [`file_access_present`](Self::file_access_present): a
+    /// managed group's file grants materialize as `group:<group>:…` ACL entries
+    /// (what `setfacl -m g:<group>:…` set), so the drift check needs the same probe
+    /// keyed on the group subject. `Some(true)` if the entry (or its
+    /// `default:group:<group>:…` inheritance form) is present, `Some(false)` if the
+    /// path is readable but carries no such entry (a managed group grant that
+    /// drifted away), `None` if the answer cannot be determined (no `getfacl`, path
+    /// absent/unreadable). Read-only; best-effort — a `None` is not a finding.
+    fn group_file_access_present(&self, path: &str, group: &str) -> Option<bool>;
+
     /// Accounts NOT in `managed` that can actually log in — the rescue/break-glass
     /// set the anti-lockout check (§7) wants to be non-empty.
     ///
@@ -256,6 +268,38 @@ impl LiveInspector {
             .map(str::trim)
             .any(|line| line.starts_with(&named) || line.starts_with(&default_named))
     }
+
+    /// Whether a `getfacl` dump carries a NAMED group ACL entry for `group`.
+    ///
+    /// Mirrors [`acl_has_user_entry`](Self::acl_has_user_entry) for the
+    /// `group:<group>:…` subject (and its `default:group:<group>:…` inheritance
+    /// form). The bare owning-group entry `group::…` has an EMPTY name field and so
+    /// never matches a named group. Pure so it is unit-tested without `getfacl`.
+    fn acl_has_group_entry(dump: &str, group: &str) -> bool {
+        let named = format!("group:{group}:");
+        let default_named = format!("default:group:{group}:");
+        dump.lines()
+            .map(str::trim)
+            .any(|line| line.starts_with(&named) || line.starts_with(&default_named))
+    }
+
+    /// Run `getfacl --omit-header --absolute-names <path>` and return its stdout, or
+    /// `None` on any failure (no `getfacl`, path absent/unreadable, non-zero exit,
+    /// non-UTF-8). Read-only, argv array (no shell) — `getfacl` never mutates state.
+    /// Shared by the user- and group-subject ACL drift probes so the spawn logic
+    /// lives in exactly one place.
+    fn getfacl_dump(path: &str) -> Option<String> {
+        let out = Command::new("getfacl")
+            .arg("--omit-header")
+            .arg("--absolute-names")
+            .arg(path)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()
+    }
 }
 
 impl SystemInspector for LiveInspector {
@@ -393,21 +437,20 @@ impl SystemInspector for LiveInspector {
     }
 
     fn file_access_present(&self, path: &str, account: &str) -> Option<bool> {
-        // `getfacl --omit-header --absolute-names <path>` lists the ACL entries.
-        // Read-only, argv array (no shell). A spawn failure (no getfacl) or a
-        // non-zero exit (path absent/unreadable) yields `None` — best-effort, not a
-        // finding. The `user:<account>:` entry is what `setfacl -m u:<acct>:…` set.
-        let out = Command::new("getfacl")
-            .arg("--omit-header")
-            .arg("--absolute-names")
-            .arg(path)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let text = String::from_utf8(out.stdout).ok()?;
-        Some(Self::acl_has_user_entry(&text, account))
+        // A spawn failure (no getfacl) or a non-zero exit (path absent/unreadable)
+        // yields `None` — best-effort, not a finding. The `user:<account>:` entry is
+        // what `setfacl -m u:<acct>:…` set.
+        Some(Self::acl_has_user_entry(
+            &Self::getfacl_dump(path)?,
+            account,
+        ))
+    }
+
+    fn group_file_access_present(&self, path: &str, group: &str) -> Option<bool> {
+        // Group analogue of `file_access_present`. The `group:<group>:` entry is
+        // what `setfacl -m g:<group>:…` set; an indeterminate read (no getfacl, path
+        // absent) is `None`, never a finding.
+        Some(Self::acl_has_group_entry(&Self::getfacl_dump(path)?, group))
     }
 
     fn login_capable_non_managed(&self, managed: &BTreeSet<String>) -> Vec<String> {
@@ -473,6 +516,11 @@ pub struct FakeInspector {
     /// `true` = entry present, `false` = path readable but no entry. A key that is
     /// absent maps to `None` (cannot determine — best-effort).
     pub file_acls: std::collections::BTreeMap<(String, String), bool>,
+    /// Group file-access ACL state for the drift check, keyed by `(path, group)`:
+    /// `true` = `group:<group>:` entry present, `false` = path readable but no such
+    /// entry. An absent key maps to `None` (cannot determine — best-effort),
+    /// matching `file_acls` for the account subject.
+    pub group_file_acls: std::collections::BTreeMap<(String, String), bool>,
     /// Presence of the `census-grp-<group>` sudoers fragment, keyed by group
     /// name: `true` = on disk, `false` = removed. An absent key maps to `None`
     /// (cannot determine — best-effort), matching the live inspector's behavior
@@ -530,6 +578,12 @@ impl SystemInspector for FakeInspector {
     fn file_access_present(&self, path: &str, account: &str) -> Option<bool> {
         self.file_acls
             .get(&(path.to_owned(), account.to_owned()))
+            .copied()
+    }
+
+    fn group_file_access_present(&self, path: &str, group: &str) -> Option<bool> {
+        self.group_file_acls
+            .get(&(path.to_owned(), group.to_owned()))
             .copied()
     }
 
@@ -662,6 +716,31 @@ default:user:alice:rwx
         // The owner entry (empty name) must not match an account named "".
         let owner_only = "user::rwx\ngroup::r-x\nother::r-x\n";
         assert!(!LiveInspector::acl_has_user_entry(owner_only, "alice"));
+    }
+
+    #[test]
+    fn acl_has_group_entry_matches_named_not_owner() {
+        // A getfacl dump with the owning-group entry `group::`, a named group
+        // `group:tellers:`, and a default-ACL `default:group:tellers:`. Only the
+        // NAMED group matches; the bare owning-group `group::r-x` must NOT be read
+        // as a match for "tellers".
+        let dump = "\
+user::rwx
+user:alice:r-x
+group::r-x
+group:tellers:rwx
+mask::r-x
+other::r-x
+default:group:tellers:rwx
+";
+        assert!(LiveInspector::acl_has_group_entry(dump, "tellers"));
+        // A different group is not present.
+        assert!(!LiveInspector::acl_has_group_entry(dump, "wheel"));
+        // A named USER entry must not be mistaken for a group of the same name.
+        assert!(!LiveInspector::acl_has_group_entry(dump, "alice"));
+        // The owning-group entry (empty name) must not match a group named "".
+        let owner_only = "user::rwx\ngroup::r-x\nother::r-x\n";
+        assert!(!LiveInspector::acl_has_group_entry(owner_only, "tellers"));
     }
 
     #[test]

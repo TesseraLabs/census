@@ -2066,6 +2066,9 @@ fn run_capture_inner(
             }
             Err(e) => {
                 let _ = child.kill();
+                // Reap the killed child so a transient `try_wait` error does not
+                // leave a zombie, matching the timeout arm above.
+                let _ = child.wait();
                 if let Some(reader) = reader {
                     let _ = reader.join();
                 }
@@ -2125,11 +2128,22 @@ fn classify_owner(pkg: &str) -> Provenance {
 
 // --- pure parsers (unit-tested with in-memory inputs) -----------------------
 
+/// Trailing marker words `dpkg` may append after the checksum in a `${Conffiles}`
+/// record. Peeled off the END before the checksum so a path with a space is not
+/// confused with these fixed-shape trailing fields.
+const CONFFILE_MARKERS: &[&str] = &["obsolete", "newconffile", "remove-on-upgrade", "remove"];
+
 /// Parse the `${Conffiles}` output of `dpkg-query -W -f='${Conffiles}\n'`. Each
-/// non-empty line is `"<path> <md5>[ obsolete]"` (leading whitespace common);
-/// we keep only `<path>` and only those under `/etc` (the security-relevant
-/// surface). The checksum and any `obsolete` marker are ignored — we never read
-/// content. Order-preserving, deduped.
+/// non-empty line is `"<path> <md5>[ <marker>]"` (leading whitespace common); we
+/// keep only `<path>` and only those under `/etc` (the security-relevant surface).
+/// The checksum and any marker are ignored — we never read content.
+/// Order-preserving, deduped.
+///
+/// The fixed-shape fields (`<md5>` and an optional trailing marker) are peeled off
+/// the END, so a path that itself contains a space stays intact rather than being
+/// truncated at its first space. A record with no checksum field (e.g. the trailing
+/// half of a path split by an embedded newline) is skipped, and the `/etc/` prefix
+/// gate drops any other stray fragment — neither fabricates a phantom conffile key.
 fn parse_dpkg_conffiles(stdout: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in stdout.lines() {
@@ -2137,10 +2151,17 @@ fn parse_dpkg_conffiles(stdout: &str) -> Vec<String> {
         if line.is_empty() {
             continue;
         }
-        // The path is the first whitespace-delimited token.
-        let path = match line.split_whitespace().next() {
-            Some(p) => p,
-            None => continue,
+        // Peel an optional trailing marker word, then the md5 checksum, leaving the
+        // (possibly space-bearing) path.
+        let mut rest = line;
+        if let Some((head, last)) = rest.rsplit_once(char::is_whitespace) {
+            if CONFFILE_MARKERS.contains(&last) {
+                rest = head.trim_end();
+            }
+        }
+        let path = match rest.rsplit_once(char::is_whitespace) {
+            Some((path, _md5)) => path.trim_end(),
+            None => continue, // no checksum field → not a conffile record
         };
         if !path.starts_with("/etc/") {
             continue;
@@ -2205,6 +2226,15 @@ fn parse_etc_group(text: &str) -> Vec<String> {
 
 /// Parse `getcap -r <root>` output: each line is `"<path> <caps>"` (older getcap)
 /// or `"<path> = <caps>"` (newer). Returns `(path, caps)` pairs. Order-preserving.
+///
+/// The capability set is a single whitespace-free token at the END of the line
+/// (e.g. `cap_net_raw+ep`, or `cap_net_admin,cap_net_raw+ep` — comma-joined, no
+/// inner space), so the path is everything before it. Splitting from the END (not
+/// the first whitespace) keeps a path that itself contains spaces intact. A line
+/// that does not begin with `/` (a banner, or the trailing half of a path with an
+/// embedded newline that `lines()` split) or that has no capability token is
+/// skipped rather than turned into a bogus object — a path is never fabricated
+/// from a fragment we could not parse confidently.
 fn parse_getcap(stdout: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for line in stdout.lines() {
@@ -2212,18 +2242,23 @@ fn parse_getcap(stdout: &str) -> Vec<(String, String)> {
         if line.is_empty() {
             continue;
         }
-        // Path is the first whitespace token; the rest (minus a leading `=`) is the
-        // capability string.
-        let mut parts = line.splitn(2, char::is_whitespace);
-        let path = match parts.next() {
-            Some(p) if !p.is_empty() => p.to_owned(),
-            _ => continue,
+        // A getcap record always names an absolute path. Anything else is a banner
+        // or a wrapped fragment — skip it, do not key an object on it.
+        if !line.starts_with('/') {
+            continue;
+        }
+        // Peel the trailing capability token; the remainder (minus the optional
+        // ` =` separator of the newer format) is the path.
+        let Some((head, caps)) = line.rsplit_once(char::is_whitespace) else {
+            // No whitespace at all → no capability token; cannot parse confidently.
+            continue;
         };
-        let caps = parts
-            .next()
-            .map(|c| c.trim_start_matches('=').trim().to_owned())
-            .unwrap_or_default();
-        out.push((path, caps));
+        let path = head.trim_end().trim_end_matches('=').trim_end();
+        let caps = caps.trim();
+        if path.is_empty() || !path.starts_with('/') {
+            continue;
+        }
+        out.push((path.to_owned(), caps.to_owned()));
     }
     out
 }
@@ -3497,6 +3532,71 @@ netdev:x:108:
                 "cap_net_raw+ep".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn parse_getcap_path_with_space_keeps_full_path() {
+        // A path containing a space must stay intact: the capability token is peeled
+        // off the END, not the path truncated at its first space.
+        let old_fmt = parse_getcap("/opt/my app/tool cap_net_raw+ep\n");
+        assert_eq!(
+            old_fmt,
+            vec![("/opt/my app/tool".to_owned(), "cap_net_raw+ep".to_owned())]
+        );
+        let new_fmt = parse_getcap("/opt/my app/tool = cap_net_raw+ep\n");
+        assert_eq!(
+            new_fmt,
+            vec![("/opt/my app/tool".to_owned(), "cap_net_raw+ep".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parse_getcap_embedded_newline_no_phantom() {
+        // A path with an embedded newline is split by `lines()` into a fragment with
+        // no capability token (`/opt/weird`) and a non-absolute fragment
+        // (`name cap_...`). Neither must fabricate an object.
+        let got = parse_getcap("/opt/weird\nname cap_net_raw+ep\n");
+        assert!(
+            got.is_empty(),
+            "an embedded-newline split must not fabricate a record: {got:?}"
+        );
+        // Comma-joined multi-cap token (single whitespace-free token) parses whole.
+        let multi = parse_getcap("/usr/bin/foo cap_net_admin,cap_net_raw+ep\n");
+        assert_eq!(
+            multi,
+            vec![(
+                "/usr/bin/foo".to_owned(),
+                "cap_net_admin,cap_net_raw+ep".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_dpkg_conffiles_path_with_space_keeps_full_path() {
+        // A conffile path containing a space stays intact (md5/marker peeled off the
+        // end); an embedded-newline fragment with no checksum is skipped.
+        let stdout = "\
+/etc/my app.conf 1a2b3c
+/etc/x deadbeef obsolete
+/etc/frag
+";
+        assert_eq!(
+            parse_dpkg_conffiles(stdout),
+            vec!["/etc/my app.conf".to_owned(), "/etc/x".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parse_dpkg_search_embedded_newline_no_phantom() {
+        // A path split by an embedded newline yields a trailing fragment with no
+        // `": "` (or one not starting with `/`); it must not become a phantom key.
+        let stdout = "\
+openssh-server: /etc/ssh/sshd_config
+frag-without-prefix
+";
+        let got = parse_dpkg_search(stdout);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "/etc/ssh/sshd_config");
     }
 
     #[test]
