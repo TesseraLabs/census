@@ -1,0 +1,7 @@
+id       = "astra-ad-integration"
+risk     = "contained"
+category = "identity"
+# Astra Active Directory integration helper: notify users whose AD/Kerberos
+# password is about to expire. It only reads expiry state and emits a
+# notification, so it is contained.
+sudo = ["/usr/sbin/ad-password-expiry-notify.sh"]

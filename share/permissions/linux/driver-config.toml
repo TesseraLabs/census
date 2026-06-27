@@ -1,0 +1,17 @@
+id       = "driver-config"
+risk     = "escalation-capable"
+category = "kernel-hw"
+sudo     = ["/usr/sbin/modprobe", "/usr/sbin/rmmod", "/usr/bin/modinfo", "/usr/bin/kmod"]
+
+# Module load options and the boot-time auto-load list. Writing these drop-ins
+# loads/blacklists arbitrary kernel modules at boot, i.e. arbitrary ring-0 code
+# (escalation-capable).
+[[file]]
+path      = "/etc/modprobe.d"
+access    = "rw"
+recursive = true
+
+[[file]]
+path      = "/etc/modules-load.d"
+access    = "rw"
+recursive = true

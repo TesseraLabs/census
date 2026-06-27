@@ -1,0 +1,35 @@
+# English titles for access-relevant PCI DSS 4.0 requirements, surfaced by
+# census framework reports. Titles are paraphrased in our own words — the normative
+# PCI DSS requirement text (© PCI Security Standards Council) is copyrighted and is
+# NOT reproduced here. Keys are requirement numbers (strings, since a dot is a TOML
+# separator), matching controls.toml.
+
+["7.2.1"]
+title = "An access-control model and roles are defined"
+
+["7.2.2"]
+title = "Access is assigned on a least-privilege basis"
+
+["7.2.4"]
+title = "Accounts and granted privileges are reviewed periodically"
+
+["7.2.5"]
+title = "System and service accounts are managed"
+
+["7.2.6"]
+title = "Read access to audit data is restricted by role"
+
+["7.3.1"]
+title = "The access-control mechanism enforces the defined rules"
+
+["7.3.2"]
+title = "Access to system components is controlled by role"
+
+["8.2.1"]
+title = "Users have unique identifiers and are authenticated"
+
+["10.2.1"]
+title = "User actions are logged"
+
+["10.5.1"]
+title = "Audit logs are protected from modification"

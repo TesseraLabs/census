@@ -1,0 +1,29 @@
+id       = "rsyslog.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for rsyslog (the system logging daemon). Pins
+# service-observe to the unit `rsyslog` and binds the ro config-tree convention
+# component for the drop-in directory /etc/rsyslog.d.
+#
+# Managed surface is the drop-in tree /etc/rsyslog.d — the modern,
+# rewrite-proof-grantable surface (rsyslog's default `$IncludeConfig
+# /etc/rsyslog.d/*.conf` on Debian/Astra pulls every drop-in in). The main
+# /etc/rsyslog.conf is deliberately OUT OF SCOPE: it is a single system-global
+# file, and census enforces rewrite-proof config access through DIRECTORY-level
+# ACLs (a per-file ACL is defeated by atomic-replace). A single file in /etc
+# cannot be granted rewrite-proof without granting all of /etc, and a single-file
+# grant is rejected at apply by any target without a per-file ACL backend (stock
+# Astra/Debian). Admins who must edit the main conf do so out-of-band.
+#
+# Contained: read-only status + ro ACL on the drop-in tree, no mutation, no root
+# path. rsyslogd runs as ROOT (it reads /proc/kmsg, binds 514, and writes any
+# log), so rw on the drop-in tree WOULD be a root code-load path — but observe is
+# ro only, so containment holds.
+#
+# Values verified against rsyslog on Debian 12 (unit rsyslog, drop-in tree
+# /etc/rsyslog.d, daemon runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "rsyslog" },
+    { id = "app-config-ro", app = "rsyslog.d" },
+]

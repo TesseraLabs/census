@@ -1,0 +1,4 @@
+id = "polkit-config"
+# Astra ships pkla-admin-identities to manage the local-authority (.pkla)
+# admin-identity list; append it to the family base polkit tools.
+sudo.append = ["/usr/sbin/pkla-admin-identities"]

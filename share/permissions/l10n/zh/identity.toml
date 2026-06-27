@@ -1,0 +1,44 @@
+[admin]
+title     = "管理员"
+summary   = "授予平台 admin 组（sudo）；发行版层会追加各操作系统专有的 admin 组。"
+risk_note = "完整的管理权限——属于策划决策，绝不作为默认。"
+
+[console-access]
+title     = "本地控制台访问"
+summary   = "授予本地控制台成员资格；发行版层会追加操作系统控制台组。"
+risk_note = "受限：仅限物理/本地控制台，本身不含远程或特权命令。"
+
+[ssh-admin]
+title     = "SSH 管理"
+summary   = "管理并重启 SSH 守护进程（sshd、systemctl restart ssh）。"
+risk_note = "开放远程入口——与机群的离线设计前提相悖。"
+
+[user-admin]
+title     = "用户管理"
+summary   = "创建、修改和删除用户与密码（useradd、usermod、passwd）。"
+risk_note = "与 Census 的角色账户模型冲突：可绕过受管账户——强 lint 警告，不用于普通角色。"
+
+[sudo-config]
+title     = "sudoers 配置"
+summary   = "编辑 sudoers 策略（visudo）。"
+risk_note = "直达 root 的途径：可为自己授予不受限的 sudo——几乎从不授予。"
+
+[pam-config]
+title     = "PAM 配置"
+summary   = "管理 PAM 认证栈（pam-auth-update、faillock）。"
+risk_note = "控制认证的工作方式——可削弱或绕过登录检查。"
+
+[nss-config]
+title     = "NSS／目录配置"
+summary   = "配置名称解析和 SSSD/Kerberos（sssctl、restart sssd、kinit）。"
+risk_note = "重新定义身份来源可改变谁映射到哪个 uid/组。"
+
+[polkit-config]
+title     = "Polkit 配置"
+summary   = "查看并重载 polkit 授权（pkaction、restart polkit）。"
+risk_note = "polkit 规则管控特权操作——宽松的规则即一条提权途径。"
+
+[astra-ad-integration]
+title     = "Astra AD 集成"
+summary   = "通知用户 AD/Kerberos 密码即将过期（ad-password-expiry-notify.sh）。"
+risk_note = "受限：仅读取过期状态并发出通知。"

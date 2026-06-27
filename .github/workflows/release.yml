@@ -1,0 +1,69 @@
+# Release: on a pushed `v*` tag, build the static (musl) Linux x86_64 binary and
+# publish it on a GitHub Release with a SHA-256 checksum.
+#
+# The release artifact is the production deploy unit: a `static-pie`, stripped,
+# musl-linked `census` with no libc version dependency — it runs as-is on old
+# glibc targets (e.g. Astra Linux SE 1.8). Tag with an annotated, signed tag:
+#   git tag -s v0.1.0 -m 'census 0.1.0' && git push origin v0.1.0
+#
+# Tag and version must agree: the job fails if the tag (`vX.Y.Z`) does not match
+# the `[package] version` in Cargo.toml, so a release can never ship a mismatched
+# binary.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build + publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build static binary
+        env:
+          RUSTFLAGS: '-C target-feature=+crt-static'
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/census
+          strip "$bin"
+          file "$bin"
+          out="census-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl"
+          install -m 0755 "$bin" "$out"
+          sha256sum "$out" > "$out.sha256"
+          echo "ASSET=$out" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256

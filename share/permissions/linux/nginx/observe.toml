@@ -1,0 +1,16 @@
+id       = "nginx.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for nginx. Pins service-observe to the unit `nginx`
+# and binds the ro config + ro logs convention components (config /etc/nginx and
+# logs /var/log/nginx both follow the convention). Contained: read-only status +
+# ro ACL on config and logs, no root path.
+#
+# Values verified against nginx on Debian 12 (unit nginx, config /etc/nginx, logs
+# /var/log/nginx). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "nginx" },
+    { id = "app-config-ro", app = "nginx" },
+    { id = "app-logs-ro", app = "nginx" },
+]

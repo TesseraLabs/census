@@ -1,0 +1,54 @@
+id       = "chromium.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for a Chromium KIOSK deployment. Two distinct
+# privileged surfaces are modelled here, and NEITHER is the browser process
+# itself: Chromium runs as an UNPRIVILEGED guest user, not a daemon. The census-
+# relevant surfaces are (a) the ROOT-owned enterprise managed-policy tree that
+# locks the kiosk down, and (b) the session unit that launches X + Chromium.
+#
+# This observe package pins service-observe to the unit `kiosk` (status/query
+# only) and adds an inline ro [[file]] on the managed-policy tree
+# /etc/chromium/policies/managed — so an operator can audit the ACTIVE lockdown
+# (which extensions are force-installed, which URLs are allow/blocklisted) without
+# being able to change it.
+#
+# The managed-policy tree is NOT off the flat /etc/{app} convention
+# (/etc/chromium/policies/managed is a deep path, not /etc/chromium), so it is an
+# inline literal [[file]], not the app-config-ro convention component — the
+# postgresql /etc/postgresql precedent for a literal-path inline grant.
+#
+# Contained: read-only unit status + ro ACL on the policy tree, no mutation. The
+# "no root path" claim holds for the baseline where the kiosk session runs the
+# browser as a non-root guest user (see the run-as-user caveat in operate/admin);
+# observe is ro-only so it stays contained regardless, but the policy tree it
+# reads is only privilege-relevant because a root-run browser would consume it.
+#
+# *** DEPLOYMENT-SPECIFIC unit `kiosk` ***
+# The kiosk SESSION unit name is deployment-specific — there is no canonical name.
+# Real setups use lightdm autologin into a session, a custom kiosk.service, or a
+# getty-autologin + .xinitrc that exec's Chromium. `kiosk` is only a sensible
+# default; a role overrides `units` to its actual session unit (the openvpn-
+# instance precedent).
+#
+# *** CHROME PATH VARIANT (NOT shipped as verified) ***
+# Google Chrome (not Chromium) reads its managed policies from a SIBLING path,
+# /etc/opt/chrome/policies/managed. That path is intentionally NOT granted here:
+# it is a per-OS/variant delta a layer/role adds once verified, not a value this
+# baseline ships. See the package note rather than assuming it.
+#
+# Values verified against Chromium managed policies on Debian 12 (policy tree
+# /etc/chromium/policies/managed, browser runs as an unprivileged guest user).
+# Per-OS unit/path deltas (incl. the Google Chrome policy path) land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "kiosk" },
+]
+
+# Enterprise managed-policy tree granted inline, read-only. A deep path off the
+# flat /etc/{app} convention, so it is a literal inline [[file]] (the postgresql
+# precedent). `recursive` → the whole managed/ directory of policy JSON.
+[[file]]
+path      = "/etc/chromium/policies/managed"
+access    = "ro"
+recursive = true

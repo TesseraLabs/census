@@ -1,0 +1,25 @@
+id       = "service-observe"
+risk     = "contained"
+category = "os-config"
+# Read-only half of the service-restart split: status/query verbs only, no
+# state change. Parametrized — the role supplies `units = [...]`; the placeholder
+# name must match the param key EXACTLY (the engine does literal-name matching,
+# no singular/plural inference), so the placeholder is `{units}`. A list param
+# expands to one rendered Cmnd per element. sudoers matches argv exactly, so BOTH
+# the bare `{units}` and the `{units}.service` forms are emitted explicitly here —
+# the engine is a generic substitutor and does not synthesise alternative
+# unit-name forms.
+sudo = [
+    "/usr/bin/systemctl status {units}",
+    "/usr/bin/systemctl status {units}.service",
+    "/usr/bin/systemctl is-active {units}",
+    "/usr/bin/systemctl is-active {units}.service",
+]
+
+# Guard rail for the {units} placeholder: a role-supplied unit must be a portable
+# systemd unit name (alphanumerics plus the `-_.@:\/` set that instance and slice
+# unit names use), not an arbitrary token that could widen the rendered Cmnd. The
+# token kind also bounds the length. Enforced at resolve, ahead of the static
+# sudo gate.
+[params.units]
+kind = "token"

@@ -1,0 +1,41 @@
+id       = "greengrass.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for AWS IoT Greengrass v2: service-control on the
+# `greengrass` Core unit plus READ-WRITE config (inline, recursive on
+# /greengrass/v2/config) and an explicit sudo to restart the Core daemon.
+#
+# This is escalation-capable, and there is DELIBERATELY NO contained operate tier
+# for Greengrass: managing Greengrass is inherently root.
+#   1. The Greengrass installer requires a sudoers entry granting sudo with ANY
+#      user/group (`(ALL : ALL)`), which is root-equivalent by definition.
+#   2. The Core runs as root (it creates the ggc_user / ggc_group and launches
+#      components, some configured to run as root).
+#   3. /greengrass/v2/config holds the device deployment/component configuration
+#      and recipes. rw on that tree lets one rewrite a component recipe / lifecycle
+#      script that the root Core then executes — a direct root code-exec path. The
+#      same tree holds the device private key and certificate (credential surface).
+# So rw config + Core control is a root code-exec surface; this is admin, never a
+# contained operate.
+#
+# Install path is off the /etc/{app} convention (Greengrass installs under
+# /greengrass/v2), so the config grant is an inline literal-path [[file]]
+# (postgresql/node-red precedent), not the app-config-rw component.
+#
+# Values verified against the Greengrass v2 default install (unit greengrass,
+# install root /greengrass/v2, Core runs as root, install needs sudo-ALL). Per-OS
+# unit/path deltas land in linux-<distro> layers once verified — unverified values
+# are not shipped.
+includes = [
+    { id = "service-control", units = "greengrass" },
+]
+sudo = ["/usr/bin/systemctl restart greengrass"]
+
+# Inline literal-path grant on the Core config/recipe tree, read-write — Greengrass
+# installs under /greengrass/v2, not /etc/{app}, so it cannot use the app-config-rw
+# component. rw here rewrites component recipes the root Core executes = root
+# code-exec; the tree also holds the device private key + certificate.
+[[file]]
+path      = "/greengrass/v2/config"
+access    = "rw"
+recursive = true

@@ -1,0 +1,37 @@
+id       = "x11vnc.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for x11vnc: read-only observe (service-observe on the
+# `x11vnc` unit) plus service-control on the same unit and the console-access leaf
+# for attaching to the local graphical session.
+#
+# HIGH-SENSITIVITY EVEN WHEN CONTAINED: x11vnc exports a LIVE X session — anyone who
+# can connect gets the screen contents AND keyboard/mouse INPUT INJECTION into that
+# session (full interactive remote control, not view-only). That is a powerful grant
+# regardless of the risk label below; treat x11vnc.operate as a sensitive
+# capability even in the contained (kiosk) case.
+#
+# Risk is `contained` ONLY for the kiosk / guest-user-session deployment: on a kiosk
+# x11vnc attaches to the unprivileged guest user's display (the session it injects
+# into runs as that non-root kiosk user), and console-access is itself a contained
+# leaf (local-console group), so the package stays contained — full control of a
+# NON-root session, no host privilege gain.
+#
+# *** ROOT-:0 CAVEAT — DEPLOYMENT MUST RE-EVALUATE ***
+# If x11vnc is instead attached to the display-manager / login screen on `:0`
+# (login-screen VNC, the `-auth /var/run/lightdm/root/:0` style setup), it runs AS
+# ROOT and injects input into the ROOT login session — that is root-level session
+# injection = ESCALATION, NOT contained. A login-screen-VNC deployment MUST NOT ship
+# x11vnc.operate as contained: it has to re-evaluate and use a separate root-tier
+# (escalation-capable) package. The contained label here is valid only under the
+# kiosk-guest-session assumption; verify which display x11vnc attaches to before
+# trusting it.
+#
+# Values verified against x11vnc run as a systemd service attaching to a kiosk
+# guest-user session (unit x11vnc). Per-OS unit/path deltas land in linux-<distro>
+# layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "x11vnc" },
+    { id = "service-control", units = "x11vnc" },
+    "console-access",
+]

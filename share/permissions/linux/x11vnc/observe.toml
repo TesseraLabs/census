@@ -1,0 +1,26 @@
+id       = "x11vnc.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for x11vnc (a VNC server that exports a live X
+# session). Pins service-observe to the unit `x11vnc`.
+#
+# Status only — NO ro [[file]] on the password file: x11vnc's auth file
+# (-rfbauth) has no fixed system path. The common location is the invoking user's
+# ~/.vnc/passwd (a home-dir path that cannot be a literal inline grant), and a
+# system service may point -rfbauth anywhere via its unit flags. So there is no
+# stable path to grant ro here; observe stops at unit status. A deployment with a
+# fixed password-file path knowingly adds a ro [[file]] on it at the role level.
+#
+# Contained: read-only status on the x11vnc unit, no mutation, no root path.
+#
+# NOTE on sensitivity (carried for completeness — see x11vnc.operate): x11vnc grants
+# full live-session control (screen view + keyboard/mouse INPUT injection) once it
+# is operating. observe itself is only status, but x11vnc is a high-sensitivity
+# capability whenever it runs.
+#
+# Values verified against x11vnc run as a systemd service (unit x11vnc). Per-OS
+# unit/path deltas land in linux-<distro> layers once verified — unverified values
+# are not shipped.
+includes = [
+    { id = "service-observe", units = "x11vnc" },
+]

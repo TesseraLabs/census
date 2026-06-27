@@ -1,0 +1,4 @@
+id       = "locale-config"
+risk     = "contained"
+category = "os-config"
+sudo     = ["/usr/bin/localectl"]

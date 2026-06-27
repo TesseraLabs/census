@@ -1,0 +1,18 @@
+id       = "timer-admin"
+risk     = "contained"
+category = "os-config"
+# Parametrized: role supplies `timers = [...]` (placeholder name matches the
+# param key exactly). A list param expands to one Cmnd per timer.
+sudo = [
+    "/usr/bin/systemctl start {timers}",
+    "/usr/bin/systemctl stop {timers}",
+    "/usr/bin/systemctl enable {timers}",
+    "/usr/bin/systemctl disable {timers}",
+]
+
+# Guard rail for the {timers} placeholder: a role-supplied timer name must be a
+# portable systemd unit name (the token charset), not an arbitrary token that
+# could widen the rendered Cmnd. Enforced at resolve, ahead of the static sudo
+# gate.
+[params.timers]
+kind = "token"

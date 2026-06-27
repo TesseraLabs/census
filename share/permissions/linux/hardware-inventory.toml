@@ -1,0 +1,4 @@
+id       = "hardware-inventory"
+risk     = "contained"
+category = "kernel-hw"
+sudo     = ["/usr/bin/lshw", "/usr/sbin/dmidecode"]

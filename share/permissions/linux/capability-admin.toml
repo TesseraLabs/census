@@ -1,0 +1,4 @@
+id       = "capability-admin"
+risk     = "escalation-capable"
+category = "kernel-hw"
+sudo     = ["/usr/sbin/setcap", "/usr/sbin/getcap"]

@@ -1,0 +1,4 @@
+id       = "device-operator"
+risk     = "escalation-capable"
+category = "device"
+includes = ["device-serial", "device-usb", "device-bus", "device-video", "udev-config"]

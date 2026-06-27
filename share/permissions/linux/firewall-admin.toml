@@ -1,0 +1,12 @@
+id       = "firewall-admin"
+risk     = "escalation-capable"
+category = "network"
+sudo     = [
+    "/usr/sbin/nft",
+    "/usr/sbin/iptables",
+    "/usr/sbin/iptables-restore",
+    "/usr/sbin/ip6tables",
+    "/usr/sbin/ip6tables-restore",
+    "/usr/sbin/xtables-nft-multi",
+    "/usr/sbin/xtables-legacy-multi",
+]

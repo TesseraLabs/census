@@ -1,0 +1,17 @@
+id       = "user-admin"
+risk     = "escalation-capable"
+category = "identity"
+sudo     = [
+    "/usr/sbin/useradd",
+    "/usr/sbin/usermod",
+    "/usr/sbin/userdel",
+    "/usr/bin/passwd",
+    "/usr/sbin/chpasswd",
+    "/usr/sbin/adduser",
+    "/usr/sbin/deluser",
+    "/usr/sbin/groupadd",
+    "/usr/sbin/groupmod",
+    "/usr/sbin/groupdel",
+    "/usr/sbin/cppw",
+    "/usr/sbin/mkhomedir_helper",
+]

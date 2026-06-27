@@ -1,0 +1,24 @@
+id       = "app-config-rw"
+risk     = "contained"
+category = "app"
+# Reusable convention component: read-write ACL on an application's own config
+# tree at /etc/{app}. A LEAF (no includes → no bound members), so a curated
+# package may bind it (e.g. `{ id = "app-config-rw", app = "zabbix" }`) without
+# tripping the nested-param-mapping guard.
+#
+# The `segment` param bounds {app} to a single subdir under /etc — no `/`, no
+# `..`, so it cannot escape /etc into another tree. It can still NAME a sensitive
+# directory (e.g. app="sudoers.d" → /etc/sudoers.d). `risk = "contained"` reflects
+# the INTENDED use — an application's own config tree, which is not a root path.
+# The safety of the concrete bound value is a CURATION / review concern
+# (supply-chain), exactly as it is for an inline file grant: do not point this at
+# a system directory. (A service-control binding needs no such caveat —
+# controlling any unit is uniformly contained; file risk is path-dependent, which
+# is why this component carries the intended-use note.)
+[[file]]
+path      = "/etc/{app}"
+access    = "rw"
+recursive = true
+
+[params.app]
+kind = "segment"

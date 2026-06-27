@@ -1,0 +1,38 @@
+id       = "mosquitto.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for the Mosquitto MQTT broker: read-only observe
+# (service-observe on the `mosquitto` unit) plus service-control on the same unit,
+# the rw config convention component, and ro logs.
+#
+# Containment here is NOT structural the way Redis is (Redis pins User=redis at the
+# unit level, and the process can never be anything else). Mosquitto starts AS ROOT
+# and self-drops to the mosquitto user only because of the `user mosquitto`
+# directive read from /etc/mosquitto/mosquitto.conf — the very tree this package
+# grants rw. What actually pins it non-root on Debian 12 is that the packaged
+# `mosquitto` unit ALSO sets User=mosquitto, so systemd starts it unprivileged
+# regardless of the conf directive. THAT is the containment guarantee on this
+# target: with User=mosquitto in force, rw /etc/mosquitto only ever reaches the
+# mosquitto user — (1) rw includes acl_file/password_file, an authn/authz bypass
+# for the broker, and (2) the auth_plugin directive loads a shared object, but as
+# the mosquitto user, so code-exec stays contained to that service user, NOT root.
+#
+# CAVEAT for per-OS layers: this containment rests on the unit carrying
+# User=mosquitto. On any layer whose mosquitto unit OMITS User= and relies on the
+# conf-directive self-drop, rw config + restart is a ROOT path — blank the `user`
+# directive, `systemctl restart mosquitto`, and the broker comes up as root with
+# the auth_plugin .so loading as root = root code-exec. Such a layer must NOT ship
+# mosquitto.operate as contained without first verifying User=mosquitto is present
+# on its unit (and must move rw config into a mosquitto.admin escalation tier if it
+# is not).
+#
+# Values verified against mosquitto on Debian 12 (unit mosquitto with
+# User=mosquitto, config /etc/mosquitto, logs /var/log/mosquitto). Per-OS
+# unit/path deltas land in linux-<distro> layers once verified — unverified values
+# are not shipped.
+includes = [
+    { id = "service-observe", units = "mosquitto" },
+    { id = "service-control", units = "mosquitto" },
+    { id = "app-config-rw", app = "mosquitto" },
+    { id = "app-logs-ro", app = "mosquitto" },
+]

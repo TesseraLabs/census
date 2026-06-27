@@ -1,0 +1,20 @@
+role    = "webops"
+version = 1
+os      = "linux"
+name    = "Web/DB operator"
+level   = 4
+
+[payload]
+# A web/db-tier mix that demonstrates the operate-vs-admin split. nginx.operate
+# and redis.operate are both contained — but for different reasons: nginx.operate
+# is lifecycle + RO config (its rw lives in the escalation-capable nginx.admin,
+# because the root master can load_module), while redis.operate carries rw config
+# because the redis daemon is non-root (exec-as-app-user, not escalation).
+# postgresql.observe is read-only (its rw config is escalation — pg_hba trust /
+# preload libraries — so it lives in postgresql.admin). No admin package here, so
+# this role stays fully contained.
+permissions = [
+    "nginx.operate",
+    "redis.operate",
+    "postgresql.observe",
+]

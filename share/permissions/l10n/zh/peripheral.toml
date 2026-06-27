@@ -1,0 +1,24 @@
+[print-admin]
+title     = "打印管理"
+summary   = "管理 CUPS 打印机（lpadmin 组、cupsctl、lpadmin）。"
+risk_note = "受限：打印机设置；不提升主机权限。"
+
+[audio-access]
+title     = "音频访问"
+summary   = "访问音频设备（audio、pulse-access 组）。"
+risk_note = "受限：仅声音设备访问。"
+
+[display-config]
+title     = "显示配置"
+summary   = "配置屏幕分辨率和布局（xrandr）。"
+risk_note = "受限：仅显示设置。"
+
+[ups-admin]
+title     = "UPS 管理"
+summary   = "管理 UPS/NUT 栈（nut 组、upsdrvctl、upsc）。"
+risk_note = "受限，但 UPS 驱动可在电源事件时触发关机。"
+
+[atm-peripheral]
+title     = "ATM 外设访问"
+summary   = "访问钞箱/读卡器外设（dialout、plugdev 组）。"
+risk_note = "受限：厂商外设；确切的工具集由站点层定义。"

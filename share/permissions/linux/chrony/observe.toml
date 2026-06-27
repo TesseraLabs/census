@@ -1,0 +1,17 @@
+id       = "chrony.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for chrony — the NTP time-sync daemon. Pins
+# service-observe to the unit `chrony` (Debian; some distros name the unit
+# `chronyd` — that delta lands in a linux-<distro> layer once verified) and binds
+# the ro config convention component (config tree /etc/chrony follows /etc/{app};
+# chrony.conf lives under it). Contained: read-only status + ro ACL on
+# /etc/chrony, no root path.
+#
+# Values verified against chrony on Debian 12 (unit chrony, config /etc/chrony).
+# Per-OS unit/path deltas land in linux-<distro> layers once verified —
+# unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "chrony" },
+    { id = "app-config-ro", app = "chrony" },
+]

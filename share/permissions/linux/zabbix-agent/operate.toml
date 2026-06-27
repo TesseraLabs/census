@@ -1,0 +1,30 @@
+id       = "zabbix-agent.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for the Zabbix agent: read-only observe plus the
+# mutating half — service-observe AND service-control bound to the `zabbix-agent`
+# unit, the rw convention config component, and the ro convention logs component.
+# Contained: scoped service control + ACL file access, no root path.
+#
+# This package re-declares observe's pieces (service-observe + the file
+# components) DIRECTLY rather than including zabbix-agent.observe. Including a
+# permission that itself param-maps (observe binds service-observe and the file
+# components) is rejected by the engine: nested/transitive param-mapping is out of
+# scope for v1, so a parametrized bundle's members must be bound directly, not
+# inherited through an include. The cost is a few lines of duplication with
+# observe — the deliberate v1 trade-off.
+#
+# Config is bound rw (app-config-rw) and logs ro (app-logs-ro), both via the
+# convention components on app="zabbix" (/etc/zabbix, /var/log/zabbix). operate
+# does not include observe, so each role gets exactly the grant of the package it
+# references; a role holding both would union by path and the write bit wins.
+#
+# Values verified against zabbix-agent on Debian 12. Per-OS deltas are added as
+# linux-<distro> layer overrides only once verified — unverified values are not
+# shipped.
+includes = [
+    { id = "service-observe", units = "zabbix-agent" },
+    { id = "service-control", units = "zabbix-agent" },
+    { id = "app-config-rw", app = "zabbix" },
+    { id = "app-logs-ro", app = "zabbix" },
+]

@@ -1,0 +1,24 @@
+[print-admin]
+title     = "Администрирование печати"
+summary   = "Управление принтерами CUPS (группа lpadmin, cupsctl, lpadmin)."
+risk_note = "Contained: настройка принтеров; без роста привилегий хоста."
+
+[audio-access]
+title     = "Доступ к звуку"
+summary   = "Доступ к аудиоустройствам (группы audio, pulse-access)."
+risk_note = "Contained: только доступ к звуковым устройствам."
+
+[display-config]
+title     = "Настройка дисплея"
+summary   = "Настройка разрешения и раскладки экрана (xrandr)."
+risk_note = "Contained: только настройки дисплея."
+
+[ups-admin]
+title     = "Администрирование ИБП"
+summary   = "Управление стеком ИБП/NUT (группа nut, upsdrvctl, upsc)."
+risk_note = "Contained, хотя драйвер ИБП может инициировать выключение по событиям питания."
+
+[atm-peripheral]
+title     = "Доступ к периферии банкомата"
+summary   = "Доступ к диспенсеру/картридеру (группы dialout, plugdev)."
+risk_note = "Contained: вендорская периферия; точный набор утилит задаёт слой заказчика."

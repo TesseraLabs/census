@@ -1,0 +1,4 @@
+id       = "luks-admin"
+risk     = "escalation-capable"
+category = "storage"
+sudo     = ["/usr/sbin/cryptsetup"]

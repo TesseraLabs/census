@@ -1,0 +1,34 @@
+[mount-removable]
+title     = "挂载可移动介质"
+summary   = "挂载和卸载可移动卷（udisksctl、mount、umount）。"
+risk_note = "任意 mount 可遮蔽可信路径（如覆盖 /etc）——一种提权原语。"
+
+[disk-admin]
+title     = "磁盘管理"
+summary   = "对磁盘分区并创建文件系统/LVM（parted、fdisk、mkfs.*、lvm）。"
+risk_note = "具破坏性且为 root 级：可重新分区或抹除任何块设备。"
+
+[luks-admin]
+title     = "LUKS 加密管理"
+summary   = "管理 LUKS 加密卷（cryptsetup）。"
+risk_note = "控制磁盘加密密钥和头部——可锁死或泄露数据。"
+
+[swap-admin]
+title     = "交换分区管理"
+summary   = "管理 swap 和 zram 设备（swapon、swapoff、mkswap、zramctl）。"
+risk_note = "受限：开关 swap；滥用主要影响内存压力，而非权限。"
+
+[fstab-config]
+title     = "文件系统挂载配置"
+summary   = "管理持久挂载并检查挂载（mount、findmnt、systemctl）。"
+risk_note = "在 /etc/fstab 中伪造覆盖系统路径的挂载，会在下次挂载/启动时获得 root。"
+
+[backup-operator]
+title     = "备份操作员"
+summary   = "通过 backup 组对整个文件系统执行备份（restic、borg、rsync、tar）。"
+risk_note = "为备份读取整个文件系统——完全泄露磁盘上所有机密。"
+
+[quota-admin]
+title     = "磁盘配额管理"
+summary   = "管理并报告文件系统配额（setquota、repquota、quotacheck）。"
+risk_note = "受限：限制磁盘用量；无通往主机权限的途径。"

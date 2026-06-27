@@ -1,0 +1,27 @@
+id       = "astra-digsig-control"
+risk     = "escalation-capable"
+category = "security"
+# Astra SE closed software environment (ZPS/digsig): toggling the ELF
+# integrity-control mode and owning the digsig trust tree. Whoever can add a key
+# to /etc/digsig/keys (or flip the mode) decides what may execute under the
+# closed software environment (ZPS/digsig) at
+# all — a malicious binary signed by an attacker-planted trusted key passes the
+# kernel integrity check. That is root-equivalent, so the permission is
+# escalation-capable.
+#
+# Scope note: this is the *administration capability* on a managed host (predmet
+# C). Closed-software-environment (ZPS/digsig) posture — whether the mode is on — stays in the
+# device-readiness layer ("we check, we don't provide", granica A6). MAC/pdpl
+# (mandatory labels) is the commercial ParsecBackend layer and is out of the open
+# catalog. bsign is deliberately excluded: it is a generic Debian ELF signer, not
+# specific to the closed software environment (ZPS/digsig), and signing with an untrusted key is inert — the trust root is
+# the key tree below, not the signer.
+sudo = ["/usr/sbin/astra-digsig-control"]
+
+# digsig trust tree: signing keys, certs, revoked-key list, xattr control and the
+# initramfs integrity config. Editing it redefines what the host trusts to run
+# under the closed software environment (ZPS/digsig) — root-equivalent on Astra SE.
+[[file]]
+path      = "/etc/digsig"
+access    = "rw"
+recursive = true

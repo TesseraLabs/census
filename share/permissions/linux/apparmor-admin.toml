@@ -1,0 +1,11 @@
+id       = "apparmor-admin"
+risk     = "escalation-capable"
+category = "security"
+sudo     = ["/usr/sbin/aa-enforce", "/usr/sbin/aa-complain", "/usr/sbin/apparmor_parser", "/usr/sbin/aa-status"]
+
+# AppArmor profile tree. Editing/loosening a profile is root-equivalent (it
+# defines the MAC confinement of every confined binary).
+[[file]]
+path      = "/etc/apparmor.d"
+access    = "rw"
+recursive = true

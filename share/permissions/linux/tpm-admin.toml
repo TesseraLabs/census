@@ -1,0 +1,4 @@
+id       = "tpm-admin"
+risk     = "escalation-capable"
+category = "kernel-hw"
+sudo     = ["/usr/bin/systemd-cryptenroll", "/usr/bin/tpm2_pcrread", "/usr/bin/tpm2_getcap"]

@@ -1,0 +1,31 @@
+schema: spec-driven
+
+context: |
+  Language: Russian (ru-RU). Все артефакты пишутся на русском.
+  Ключевые слова требований: «ДОЛЖЕН/ДОЛЖНА/ДОЛЖНО (MUST)», «НЕ ДОЛЖЕН (MUST NOT)» —
+  английский дубль в скобках обязателен (валидатор ищет \b(SHALL|MUST)\b), в ПЕРВОЙ
+  строке тела требования. Маркеры сценариев WHEN/THEN — английские.
+
+  Census — отдельный open-продукт (AGPL), сосед Tessera: декларативный провижинер
+  Unix-объектов доступа. Приводит роль-учётки/группы/sudoers.d/systemd-лимиты устройства
+  в соответствие подписанной декларации (role-store → Unix-аккаунты). Вне auth-пути,
+  идемпотентно, fail-safe. CLI: census plan / apply / doctor / status.
+  Язык реализации: Rust (один крейт `census`; serde+toml, clap, thiserror).
+
+  Модель «роль = учётка»: роль-учётка — обычный аккаунт с реальным shell, вход закрыт
+  учётно (заблокированный пароль, нет authorized_keys, su/ssh закрыты); единственный путь
+  входа — cert-аутентификация Tessera. UID/GID стабильны по парку (явные в декларации).
+  Граница с МКЦ: Census владеет Unix-учётко-слоем (passwd/shadow/group/sudoers/limits);
+  parsec-метку-потолок (mac_mask) назначает коммерческий Tessera ParsecBackend отдельно.
+
+  Канон продукта: internal/specs/2026-06-18-census-product-design.md +
+  2026-06-18-census-core-spec.md. Open/commercial: census (ядро) открыт,
+  census-enterprise (доставка через Control, инвентарь/drift по парку, staged rollout) —
+  коммерческий. Open-ядро самодостаточно: apply локальной подписанной декларации работает
+  без Control (не crippleware).
+
+  Конвенции: fail-closed (невалидная подпись/anti-rollback → отказ до мутаций);
+  Census трогает только объекты в root-only реестре managed (/var/lib/census/managed.toml);
+  rescue/break-glass структурно вне managed (anti-lockout); строгий парсинг деклараций в
+  root (урок PwnKit); Rust-код пишется через сабагента с верификацией, ревью master-code-
+  reviewer перед коммитом.

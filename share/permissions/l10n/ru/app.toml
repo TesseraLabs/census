@@ -1,0 +1,369 @@
+[app-config-edit]
+title     = "Правка конфигов приложения"
+summary   = "Правка конкретных конфигов приложения через обёрнутый редактор (параметр: path)."
+risk_note = "Escalation-capable: редактор запускается под root и может породить shell, поэтому root достижим независимо от того, какой файл правится; allow_prefix ограничивает целевой файл, но не escape из редактора."
+
+[app-scope]
+title     = "Доступ к приложению по имени"
+summary   = "Доступ к приложению по имени: управление сервисом приложения (start/stop/restart), правка /etc/<app>, чтение /var/log/<app> (параметр: app)."
+risk_note = "Contained: доступ к файлам — это ACL на собственные деревья приложения /etc и /var/log, а управление сервисом — это ограниченное разрешение service-control (без редактора под root). Имя приложения — это один сегмент пути / имя юнита: только простые имена юнитов, не инстанс-юниты (name@inst)."
+
+[app-config-ro]
+title     = "Конфиг приложения — только чтение"
+summary   = "ACL только на чтение собственного дерева конфигов приложения /etc/<app> (параметр: app)."
+risk_note = "Contained для предполагаемого использования — собственное дерево конфигов приложения /etc/<app>, не путь к root. Параметр segment ограничивает <app> одним подкаталогом под /etc (без /, без ..), но он всё ещё может указать на чувствительный каталог; безопасность конкретного связанного значения — это вопрос курирования/ревью, ровно как для inline-гранта. Не направляйте его на системный каталог."
+
+[app-config-rw]
+title     = "Конфиг приложения — чтение и запись"
+summary   = "ACL на чтение и запись собственного дерева конфигов приложения /etc/<app> (параметр: app)."
+risk_note = "Contained для предполагаемого использования — собственное дерево конфигов приложения /etc/<app>, не путь к root. Параметр segment ограничивает <app> одним подкаталогом под /etc (без /, без ..), но он всё ещё может указать на чувствительный каталог; безопасность конкретного связанного значения — это вопрос курирования/ревью, ровно как для inline-гранта. Не направляйте его на системный каталог."
+
+[app-logs-ro]
+title     = "Логи приложения — только чтение"
+summary   = "ACL только на чтение собственного дерева логов приложения /var/log/<app> (параметр: app)."
+risk_note = "Contained для предполагаемого использования — собственное дерево логов приложения /var/log/<app>, не путь к root. Параметр segment ограничивает <app> одним подкаталогом под /var/log (без /, без ..), но он всё ещё может указать на чувствительный каталог; безопасность конкретного связанного значения — это вопрос курирования/ревью, ровно как для inline-гранта. Не направляйте его на системный каталог."
+
+["zabbix-agent.observe"]
+title     = "Zabbix-агент — наблюдение"
+summary   = "Только чтение для Zabbix-агента: запрос статуса его сервиса и чтение /etc/zabbix и /var/log/zabbix."
+risk_note = "Contained: только чтение статуса сервиса (без start/stop) плюс ACL ro на собственные деревья конфигов и логов агента, без пути к root."
+
+["zabbix-agent.operate"]
+title     = "Zabbix-агент — управление"
+summary   = "Управление Zabbix-агентом: start/stop/restart его сервиса, правка /etc/zabbix (rw), чтение /var/log/zabbix (включает наблюдение)."
+risk_note = "Contained: ограниченное управление сервисом юнита zabbix-agent плюс ACL-доступ к файлам (rw для конфигов, ro для логов), без пути к root."
+
+["node-exporter.operate"]
+title     = "Node exporter — управление"
+summary   = "Управление Prometheus node exporter: start/stop/restart prometheus-node-exporter и правка /etc/default/prometheus-node-exporter."
+risk_note = "Contained: ограниченное управление сервисом юнита prometheus-node-exporter плюс ACL rw на его единственный файл конфига, без пути к root."
+
+["nut.operate"]
+title     = "NUT — управление"
+summary   = "Управление NUT (Network UPS Tools): start/stop/restart обоих юнитов nut-server и nut-monitor, чтение /etc/nut (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом двух юнитов NUT плюс конфиг только для чтения, только жизненный цикл — без rw, без пути к root."
+
+["nut.admin"]
+title     = "NUT — администрирование"
+summary   = "Администрирование NUT: start/stop/restart обоих юнитов nut-server и nut-monitor, правка /etc/nut (rw)."
+risk_note = "Escalation-capable: upsmon держит привилегированный родительский процесс под root для выполнения SHUTDOWNCMD/NOTIFYCMD, поэтому rw на /etc/nut позволяет задать произвольный SHUTDOWNCMD в upsmon.conf и инициировать его (restart/FSD nut-monitor) → выполнение команды под root. Именно поэтому это admin, а не contained operate."
+
+["filebeat.observe"]
+title     = "Filebeat — наблюдение"
+summary   = "Только чтение для Filebeat: запрос статуса сервиса и чтение /etc/filebeat."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на собственное дерево конфигов шиппера, без пути к root. Примечание: filebeat работает под root (он читает все логи); в конфиге нет выполнения кода, но шиппер под root, чей конфиг можно переписать, может быть перенаправлен на эксфильтрацию произвольных файлов, читаемых root, — contained, но security-relevant."
+
+["filebeat.operate"]
+title     = "Filebeat — управление"
+summary   = "Управление Filebeat: start/stop/restart сервиса и правка /etc/filebeat (rw)."
+risk_note = "Contained: ограниченное управление сервисом юнита filebeat плюс ACL rw на его дерево конфигов, без пути к root. Примечание: filebeat работает под root (он читает все логи); в конфиге нет выполнения кода, но rw-конфиг на шиппере под root позволяет перенаправить его на эксфильтрацию произвольных файлов, читаемых root, — contained, но security-relevant."
+
+["ssh.observe"]
+title     = "Сервер OpenSSH — наблюдение"
+summary   = "Только чтение для сервера OpenSSH: запрос статуса сервиса ssh и чтение /etc/ssh."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/ssh, без изменений, без пути к root."
+
+["ssh.admin"]
+title     = "Сервер OpenSSH — администрирование"
+summary   = "Администрирование сервера OpenSSH: start/stop/restart сервиса ssh и правка /etc/ssh (rw)."
+risk_note = "Escalation-capable: rw на /etc/ssh позволяет править sshd_config (PermitRootLogin, AuthorizedKeysFile, ForceCommand, блоки Match) — прямой путь к входу под root. Именно поэтому это admin/escalation-capable, а не contained operate: доступ к файлам — это contained ACL, но контент, в который даётся запись, — это root-эквивалентная поверхность управления."
+
+["usbguard.observe"]
+title     = "USBGuard — наблюдение"
+summary   = "Только чтение для USBGuard: запрос статуса сервиса и чтение /etc/usbguard."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/usbguard, без пути к root."
+
+["usbguard.operate"]
+title     = "USBGuard — управление"
+summary   = "Управление USBGuard: start/stop/restart сервиса и правка /etc/usbguard (rw)."
+risk_note = "Contained: правка правил USB-устройств в /etc/usbguard определяет, какие периферийные устройства допускаются, — это security-relevant, но не путь к root. Ограниченное управление сервисом плюс ACL-доступ к файлам, без пути к root."
+
+["cups.observe"]
+title     = "CUPS — наблюдение"
+summary   = "Только чтение для CUPS: запрос статуса сервиса печати и чтение /etc/cups."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/cups, без пути к root."
+
+["cups.operate"]
+title     = "CUPS — управление"
+summary   = "Управление CUPS: start/stop/restart сервиса печати и чтение /etc/cups (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг только для чтения — без rw, без группы lpadmin, без пути к root."
+
+["cups.admin"]
+title     = "CUPS — администрирование"
+summary   = "Администрирование CUPS: start/stop/restart сервиса печати, правка /etc/cups (rw) и управление принтерами через группу lpadmin."
+risk_note = "Escalation-capable: cupsd работает под root, и rw на /etc/cups плюс lpadmin позволяет установить бэкенд/фильтр/PPD принтера, который cupsd затем запускает под root, — исторический класс root RCE. Именно поэтому это admin, а не contained operate."
+
+["chrony.observe"]
+title     = "chrony — наблюдение"
+summary   = "Только чтение для chrony: запрос статуса сервиса синхронизации времени и чтение /etc/chrony."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/chrony, без пути к root."
+
+["chrony.operate"]
+title     = "chrony — управление"
+summary   = "Управление chrony: start/stop/restart сервиса синхронизации времени и правка /etc/chrony (rw)."
+risk_note = "Contained: изменение синхронизации времени может сдвинуть часы, что влияет на окна валидности сертификатов, — это security-relevant, но не root. Ограниченное управление сервисом плюс ACL-доступ к файлам, без пути к root."
+
+["smartmontools.observe"]
+title     = "smartmontools — наблюдение"
+summary   = "Только чтение для smartmontools: запрос статуса сервиса smartd и чтение /etc/smartd.conf."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на единственный файл конфига /etc/smartd.conf, без пути к root."
+
+["smartmontools.operate"]
+title     = "smartmontools — управление"
+summary   = "Управление smartmontools: start/stop/restart сервиса smartd и чтение /etc/smartd.conf (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом юнита smartd плюс конфиг только для чтения — без rw, без пути к root."
+
+["smartmontools.admin"]
+title     = "smartmontools — администрирование"
+summary   = "Администрирование smartmontools: start/stop/restart сервиса smartd и правка /etc/smartd.conf (rw)."
+risk_note = "Escalation-capable: smartd работает под root, и директива -M exec в /etc/smartd.conf запускает произвольный скрипт под root при SMART-событиях — rw на этот файл является путём к выполнению кода под root. Именно поэтому это admin, а не contained operate."
+
+["nginx.observe"]
+title     = "nginx — наблюдение"
+summary   = "Только чтение для nginx: запрос статуса сервиса и чтение /etc/nginx и /var/log/nginx."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на конфиг и логи, без пути к root."
+
+["nginx.operate"]
+title     = "nginx — управление"
+summary   = "Управление nginx: start/stop/restart сервиса и чтение /etc/nginx и /var/log/nginx (конфиг и логи только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг и логи только для чтения — без rw, без пути к root."
+
+["nginx.admin"]
+title     = "nginx — администрирование"
+summary   = "Администрирование nginx: start/stop/restart сервиса и правка /etc/nginx (rw)."
+risk_note = "Escalation-capable: master-процесс nginx работает под root, и директива load_module в /etc/nginx загружает разделяемый объект в этот root-master — прямой путь к загрузке кода под root. Именно поэтому это admin, а не contained operate."
+
+["apache2.observe"]
+title     = "Веб-сервер Apache — наблюдение"
+summary   = "Только чтение для Apache: запрос статуса сервиса apache2 и чтение /etc/apache2 и /var/log/apache2."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на конфиг и логи, без пути к root."
+
+["apache2.operate"]
+title     = "Веб-сервер Apache — управление"
+summary   = "Управление Apache: start/stop/restart сервиса apache2 и чтение /etc/apache2 и /var/log/apache2 (конфиг и логи только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг и логи только для чтения — без rw, без пути к root."
+
+["apache2.admin"]
+title     = "Веб-сервер Apache — администрирование"
+summary   = "Администрирование Apache: start/stop/restart сервиса apache2 и правка /etc/apache2 (rw)."
+risk_note = "Escalation-capable: master-процесс Apache работает под root, и директивы LoadModule/Include в /etc/apache2 загружают код в этот root-master — прямой путь к загрузке кода под root. Именно поэтому это admin, а не contained operate."
+
+["postgresql.observe"]
+title     = "PostgreSQL — наблюдение"
+summary   = "Только чтение для PostgreSQL: запрос статуса сервиса postgresql и чтение /etc/postgresql и /var/log/postgresql."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на деревья конфигов и логов, без пути к root."
+
+["postgresql.operate"]
+title     = "PostgreSQL — управление"
+summary   = "Управление PostgreSQL: start/stop/restart сервиса postgresql и чтение /etc/postgresql и /var/log/postgresql (конфиг и логи только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг и логи только для чтения — без rw, без пути к root."
+
+["postgresql.admin"]
+title     = "PostgreSQL — администрирование"
+summary   = "Администрирование PostgreSQL: start/stop/restart сервиса postgresql и правка /etc/postgresql (rw)."
+risk_note = "Escalation-capable: rw на дерево конфигов postgres позволяет выставить pg_hba.conf в trust (любое локальное подключение становится суперпользователем БД) и shared_preload_libraries (загрузка кода, исполняемого в процессе postgres) — data-root плюс выполнение кода под пользователем postgres. Именно поэтому это admin, а не contained operate."
+
+["redis.observe"]
+title     = "Redis — наблюдение"
+summary   = "Только чтение для Redis: запрос статуса сервиса redis-server и чтение /etc/redis."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/redis, без пути к root."
+
+["redis.operate"]
+title     = "Redis — управление"
+summary   = "Управление Redis: start/stop/restart сервиса redis-server и правка /etc/redis (rw)."
+risk_note = "Contained: демон Redis работает под непривилегированным пользователем redis, поэтому rw на /etc/redis и MODULE LOAD во время выполнения исполняют код под пользователем redis, а не root, — exec-под-пользователем-приложения, не эскалация. Тир admin не нужен."
+
+["haproxy.observe"]
+title     = "HAProxy — наблюдение"
+summary   = "Только чтение для HAProxy: запрос статуса сервиса и чтение /etc/haproxy."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/haproxy, без пути к root."
+
+["haproxy.operate"]
+title     = "HAProxy — управление"
+summary   = "Управление HAProxy: start/stop/restart сервиса и чтение /etc/haproxy (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг только для чтения — без rw, без пути к root."
+
+["haproxy.admin"]
+title     = "HAProxy — администрирование"
+summary   = "Администрирование HAProxy: start/stop/restart сервиса и правка /etc/haproxy (rw)."
+risk_note = "Escalation-capable: master-процесс haproxy стартует под root, и директивы lua-load/external-check в /etc/haproxy запускают программы из этого root-процесса — путь к выполнению программ под root. Именно поэтому это admin, а не contained operate."
+
+["mosquitto.observe"]
+title     = "MQTT-брокер Mosquitto — наблюдение"
+summary   = "Только чтение для брокера Mosquitto: запрос статуса сервиса mosquitto и чтение /etc/mosquitto и /var/log/mosquitto."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на собственные деревья конфигов и логов брокера, без пути к root."
+
+["mosquitto.operate"]
+title     = "MQTT-брокер Mosquitto — управление"
+summary   = "Управление брокером Mosquitto: start/stop/restart сервиса mosquitto, правка /etc/mosquitto (rw), чтение /var/log/mosquitto."
+risk_note = "Contained ТОЛЬКО потому, что юнит mosquitto в Debian 12 задаёт User=mosquitto. Это НЕ структурный non-root, как у redis: mosquitto стартует под root и сам сбрасывает привилегии по директиве `user` из /etc/mosquitto (того самого дерева, которое здесь даётся под rw), поэтому именно User=mosquitto на юните реально пинит его непривилегированным. При этом пине rw /etc/mosquitto достаёт только до пользователя mosquitto: rw включает acl_file/password_file (обход authn/authz брокера), а auth_plugin грузит .so под пользователем mosquitto (выполнение кода ограничено этим пользователем, не root). Оговорка: на любом per-OS слое, чей юнит НЕ задаёт User= и полагается на self-drop из конфига, rw-конфиг + restart — это путь к root (обнулить `user`, restart → брокер поднимается под root, auth_plugin .so грузится под root); такой слой обязан проверить наличие User=mosquitto, прежде чем поставлять operate как contained. На Debian 12 тир admin не нужен."
+
+["pcscd.observe"]
+title     = "Демон смарт-карт PC/SC — наблюдение"
+summary   = "Только чтение для pcscd: запрос статуса юнитов pcscd и pcscd.socket и чтение /etc/reader.conf.d."
+risk_note = "Contained: только чтение статуса сервиса (демон и его юнит сокет-активации) плюс ACL ro на дерево конфигов драйверов /etc/reader.conf.d, без пути к root."
+
+["pcscd.operate"]
+title     = "Демон смарт-карт PC/SC — управление"
+summary   = "Управление pcscd: start/stop/restart юнитов pcscd и pcscd.socket и доступ к USB CCID-ридерам через leaf device-usb (группы plugdev/scanner)."
+risk_note = "Contained: ограниченное управление демоном и его юнитом сокет-активации плюс contained-доступ к USB-ридеру через leaf device-usb (группы plugdev/scanner). Без rw на /etc/reader.conf.d, поэтому нет пути к загрузке .so под root — это pcscd.admin."
+
+["pcscd.admin"]
+title     = "Демон смарт-карт PC/SC — администрирование"
+summary   = "Администрирование pcscd: start/stop/restart юнитов pcscd и pcscd.socket и правка /etc/reader.conf.d (rw)."
+risk_note = "Escalation-capable: pcscd работает под root, а запись в /etc/reader.conf.d задаёт LIBPATH на разделяемый объект CCID-драйвера, который pcscd через dlopen() загружает в свой root-процесс. Поэтому rw на /etc/reader.conf.d — прямой путь к загрузке кода под root: укажите LIBPATH на подконтрольный .so, и pcscd (root) загрузит его. Именно поэтому это admin, а не contained operate. (pcscd сокет-активируется, поэтому управляются оба юнита: pcscd и pcscd.socket.)"
+
+["salt-minion.observe"]
+title     = "Salt minion — наблюдение"
+summary   = "Только чтение для Salt minion: запрос статуса сервиса salt-minion и чтение /etc/salt и /var/log/salt."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на собственные деревья конфигов и логов миньона, без пути к root."
+
+["salt-minion.operate"]
+title     = "Salt minion — управление"
+summary   = "Управление Salt minion: start/stop/restart сервиса salt-minion и чтение /etc/salt и /var/log/salt (конфиг и логи только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг и логи только для чтения — без rw, без пути к root. rw на /etc/salt — это эскалация, она в salt-minion.admin."
+
+["salt-minion.admin"]
+title     = "Salt minion — администрирование"
+summary   = "Администрирование Salt minion: start/stop/restart сервиса salt-minion и правка /etc/salt (rw)."
+risk_note = "Escalation-capable: salt-minion работает под root, а /etc/salt/minion задаёт адрес master:, которому миньон подчиняется. rw на /etc/salt перенаправляет миньона на подконтрольный злоумышленнику Salt-мастер, который затем рассылает произвольные состояния/модули, исполняемые миньоном ПОД ROOT, — полный захват хоста. Именно поэтому это admin, а не contained operate."
+
+["rsyslog.observe"]
+title     = "rsyslog — наблюдение"
+summary   = "Только чтение для rsyslog: запрос статуса сервиса rsyslog и чтение дерева drop-in /etc/rsyslog.d."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на дерево drop-in /etc/rsyslog.d, без пути к root. rsyslogd работает под root, поэтому rw на дерево drop-in был бы путём загрузки кода под root — но observe только ro, поэтому контейнмент сохраняется. Управляемая поверхность — дерево drop-in /etc/rsyslog.d (дефолтный $IncludeConfig /etc/rsyslog.d/*.conf rsyslog подтягивает все drop-in). Главный /etc/rsyslog.conf — вне области: это единственный системный файл, а census требует ACL уровня каталога для rewrite-proof доступа к конфигу (per-file ACL побеждается atomic-replace), поэтому один файл в /etc нельзя выдать rewrite-proof, не выдав весь /etc — и грант на один файл отклоняется на apply на целях без per-file бэкенда. Главный конфиг админы правят вне census."
+
+["rsyslog.operate"]
+title     = "rsyslog — управление"
+summary   = "Управление rsyslog: start/stop/restart сервиса rsyslog и чтение дерева drop-in /etc/rsyslog.d (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг только для чтения — без rw, без пути к root. rsyslogd работает под root, поэтому rw-конфиг — это эскалация (omprog запускает программы под root, module(load=…) загружает .so в root-демон) и живёт в rsyslog.admin, не в operate. Управляемая поверхность — дерево drop-in /etc/rsyslog.d (дефолтный $IncludeConfig /etc/rsyslog.d/*.conf rsyslog подтягивает все drop-in). Главный /etc/rsyslog.conf — вне области: это единственный системный файл, а census требует ACL уровня каталога для rewrite-proof доступа к конфигу (per-file ACL побеждается atomic-replace), поэтому один файл в /etc нельзя выдать rewrite-proof, не выдав весь /etc — и грант на один файл отклоняется на apply на целях без per-file бэкенда. Главный конфиг админы правят вне census."
+
+["rsyslog.admin"]
+title     = "rsyslog — администрирование"
+summary   = "Администрирование rsyslog: start/stop/restart сервиса rsyslog и правка дерева drop-in /etc/rsyslog.d (rw)."
+risk_note = "Escalation-capable: rsyslogd работает под root, и rw на его дерево drop-in — это путь загрузки/исполнения кода под root: drop-in в /etc/rsyslog.d может нести модуль вывода omprog (запускает внешнюю программу под root) или module(load=\"im…\")/устаревший $ModLoad (загружает разделяемый объект в root-демон rsyslogd). Именно поэтому это admin, а не contained operate. Управляемая поверхность — дерево drop-in /etc/rsyslog.d (дефолтный $IncludeConfig /etc/rsyslog.d/*.conf rsyslog подтягивает все drop-in). Главный /etc/rsyslog.conf — вне области: это единственный системный файл, а census требует ACL уровня каталога для rewrite-proof доступа к конфигу (per-file ACL побеждается atomic-replace), поэтому один файл в /etc нельзя выдать rewrite-proof, не выдав весь /etc — и грант на один файл отклоняется на apply на целях без per-file бэкенда. Главный конфиг админы правят вне census."
+
+["fluent-bit.observe"]
+title     = "Fluent Bit — наблюдение"
+summary   = "Только чтение для Fluent Bit: запрос статуса сервиса fluent-bit и чтение /etc/fluent-bit."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на собственное дерево конфигов шиппера, без пути к root. На базовой системе Fluent Bit работает под root, поэтому rw-конфиг был бы путём исполнения кода под root — но observe только ro, поэтому контейнмент сохраняется."
+
+["fluent-bit.operate"]
+title     = "Fluent Bit — управление"
+summary   = "Управление Fluent Bit: start/stop/restart сервиса fluent-bit и чтение /etc/fluent-bit (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг только для чтения — без rw, без пути к root. На базовой системе Fluent Bit работает под root, поэтому rw-конфиг — это эскалация (вход exec/exec_wasi запускает команды под root, а .so-плагины загружаются в root-процесс) и живёт в fluent-bit.admin, не в operate."
+
+["fluent-bit.admin"]
+title     = "Fluent Bit — администрирование"
+summary   = "Администрирование Fluent Bit: start/stop/restart сервиса fluent-bit и правка /etc/fluent-bit (rw)."
+risk_note = "Escalation-capable: на базовой системе Fluent Bit работает под root (юнит upstream/td-agent-bit не задаёт User=), и rw на /etc/fluent-bit — это путь исполнения/загрузки кода под root: вход exec/exec_wasi запускает команды под root, а внешние .so-плагины загружаются в root-процесс. Именно поэтому это admin, а не contained operate. Слой под конкретную ОС, задающий User=<не-root>, сделал бы rw-конфиг contained."
+
+["telegraf.observe"]
+title     = "Telegraf — наблюдение"
+summary   = "Только чтение для Telegraf: запрос статуса сервиса telegraf и чтение /etc/telegraf."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на собственное дерево конфигов агента, без пути к root. Без гранта на логи: по умолчанию Telegraf пишет в journald (нет /var/log/telegraf), поэтому чтение journald относится к гранту journald/log-read, а не к этому пакету."
+
+["telegraf.operate"]
+title     = "Telegraf — управление"
+summary   = "Управление Telegraf: start/stop/restart сервиса telegraf и правка /etc/telegraf (rw)."
+risk_note = "Contained: демон Telegraf закреплён не под root юнитом User=telegraf, поэтому rw на /etc/telegraf даёт вход exec/execd = исполнение команд под пользователем telegraf (не root), а output-плагины могут хранить учётные данные — exec-as-app-user, не эскалация. Это прецедент redis (демон не под root → rw в operate, без admin-уровня). Оговорка: слой под конкретную ОС, чей юнит не задаёт User=, запускает демон под root и должен быть переоценён (rw-конфиг + restart становится путём исполнения кода под root)."
+
+["openvpn.observe"]
+title     = "OpenVPN — наблюдение"
+summary   = "Только чтение для OpenVPN: запрос статуса инстанс-юнита openvpn-server@server и чтение /etc/openvpn."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/openvpn, без мутаций, без пути к root. Имя инстанса зависит от развёртывания (юнит — шаблон, один инстанс на каждый туннель), роль его переопределяет. ВНИМАНИЕ: /etc/openvpn хранит ПРИВАТНЫЕ КЛЮЧИ и сертификаты туннеля, поэтому даже доступ только для чтения раскрывает секреты — это раскрытие учётных данных, не эскалация."
+
+["openvpn.operate"]
+title     = "OpenVPN — управление"
+summary   = "Управление OpenVPN: start/stop/restart инстанса openvpn-server@server и чтение /etc/openvpn (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг только для чтения — без rw, без пути к root. Запуск туннеля исполняет только проверенный конфиг на диске и его существующие хуки. rw на /etc/openvpn — это эскалация (скрипты up/down/route-up выполняются под root при script-security 2, а директива plugin загружает .so в root-процесс) и живёт в openvpn.admin, не в operate. ВНИМАНИЕ: /etc/openvpn хранит приватные ключи туннеля, поэтому встроенный грант ro всё равно раскрывает секреты."
+
+["openvpn.admin"]
+title     = "OpenVPN — администрирование"
+summary   = "Администрирование OpenVPN: start/stop/restart инстанса openvpn-server@server и правка /etc/openvpn (rw)."
+risk_note = "Escalation-capable: OpenVPN создаёт устройство tun и выполняет скрипты up/down/route-up/learn-address под root при script-security 2, а директива plugin загружает .so в root-процесс openvpn. Он может сбросить привилегии до user nobody после инициализации, но скрипты и плагин выполняются под root, поэтому rw на /etc/openvpn направляет root-процесс на подставленные скрипты/код — путь исполнения кода под root. Именно поэтому это admin, а не contained operate. Имя инстанса зависит от развёртывания; роль его переопределяет."
+
+["wireguard.observe"]
+title     = "WireGuard — наблюдение"
+summary   = "Только чтение для WireGuard: запрос статуса инстанс-юнита wg-quick@wg0 и чтение /etc/wireguard."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на /etc/wireguard, без мутаций, без пути к root. У WireGuard нет постоянного демона — wg-quick@<iface> это oneshot; имя интерфейса зависит от развёртывания, роль его переопределяет. ВНИМАНИЕ: /etc/wireguard/<iface>.conf СОДЕРЖИТ ПРИВАТНЫЙ КЛЮЧ интерфейса, поэтому даже доступ только для чтения раскрывает приватный ключ VPN — это раскрытие учётных данных, не эскалация."
+
+["wireguard.operate"]
+title     = "WireGuard — управление"
+summary   = "Управление WireGuard: поднятие/опускание интерфейса wg-quick@wg0 и чтение /etc/wireguard (конфиг только для чтения)."
+risk_note = "Contained: ограниченное управление сервисом плюс конфиг только для чтения — без rw, без пути к root. Поднятие интерфейса использует только проверенный конфиг на диске. rw на /etc/wireguard — это эскалация (PostUp/PostDown/PreUp/PreDown выполняются под root через wg-quick) и живёт в wireguard.admin, не в operate. ВНИМАНИЕ: /etc/wireguard хранит приватный ключ интерфейса, поэтому встроенный грант ro всё равно его раскрывает."
+
+["wireguard.admin"]
+title     = "WireGuard — администрирование"
+summary   = "Администрирование WireGuard: поднятие/опускание интерфейса wg-quick@wg0 и правка /etc/wireguard (rw)."
+risk_note = "Escalation-capable: wg-quick выполняет строки конфига PostUp/PostDown/PreUp/PreDown под root при поднятии или опускании интерфейса, поэтому rw на /etc/wireguard направляет wg-quick на подставленные команды, выполняемые под root — путь исполнения команд под root. Именно поэтому это admin, а не contained operate. Имя интерфейса зависит от развёртывания; роль его переопределяет."
+
+["node-red.observe"]
+title     = "Node-RED — наблюдение"
+summary   = "Только чтение для Node-RED: запрос статуса сервиса nodered и чтение userDir (по умолчанию /var/lib/node-red)."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на userDir, без мутаций, без пути к root. Путь userDir зависит от развёртывания: этот пакет по умолчанию использует /var/lib/node-red (соглашение для hardened/systemd-system), но userDir штатного UPSTREAM-установщика — /home/<user>/.node-red (закреплён через WorkingDirectory=$HOME); этот путь нельзя выразить литеральным inline-грантом, поэтому слой под ОС / роль его переопределяет. ВНИМАНИЕ: flows_cred.json в userDir хранит зашифрованные учётные данные узлов, поэтому доступ ro раскрывает этот материал."
+
+["node-red.operate"]
+title     = "Node-RED — управление"
+summary   = "Управление Node-RED: start/stop/restart сервиса nodered, правка userDir (по умолчанию /var/lib/node-red, rw) и доступ к GPIO через leaf device-bus (группа gpio)."
+risk_note = "Contained: штатная установка через systemd закрепляет Node-RED не под root через User= юнита (upstream закрепляет User=<invoking-user>), поэтому rw на userDir даёт исполнение команд только под этим сервисным пользователем (узел exec и child_process функционального узла выполняются под не-root пользователем node-red, не под root) — exec-as-app-user, не эскалация. Это прецедент redis (демон не под root → rw в operate, без admin-уровня). userDir здесь по умолчанию /var/lib/node-red (соглашение для hardened/systemd-system); userDir штатного установщика — /home/<user>/.node-red, который переопределяет слой под ОС / роль. GPIO через device-bus даёт группу gpio (цифровой ввод-вывод на /dev/gpiomem и /dev/gpiochip*), сам по себе contained leaf. ШИРОТА: device-bus также даёт группы i2c и spi, которые Node-RED не использует — на плате с i2c/spi EEPROM/TPM/RTC такой сырой доступ к шине — путь к аппаратному вмешательству (всё ещё contained, но обоснование gpio не распространяется на i2c/spi; более узкого leaf только для gpio не существует). flows_cred.json хранит зашифрованные учётные данные. ОГОВОРКА: распространённые любительские образы Pi запускают Node-RED под root или под pi с беспарольным sudo — на любом таком развёртывании rw flows = исполнение кода под root (узел exec выполняется под root), поэтому слой должен быть переоценён и переместить rw-конфиг в эскалационный уровень node-red.admin перед поставкой operate как contained."
+
+["greengrass.observe"]
+title     = "AWS IoT Greengrass v2 — наблюдение"
+summary   = "Только чтение для Greengrass v2: запрос статуса сервиса ядра greengrass и чтение /greengrass/v2/logs."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на дерево логов ядра, без пути к root. Конфиг (/greengrass/v2/config) намеренно НЕ включён даже в режиме чтения — он содержит приватный ключ и сертификат устройства, поэтому ro-грант на него — это раскрытие учётных данных; развёртывание, которому он нужен, осознанно добавляет ro-грант на уровне роли."
+
+["greengrass.admin"]
+title     = "AWS IoT Greengrass v2 — администрирование"
+summary   = "Администрирование Greengrass v2: start/stop/restart сервиса ядра greengrass и правка /greengrass/v2/config (rw)."
+risk_note = "Escalation-capable, и contained-уровня operate НЕТ: установщик Greengrass требует sudoers-записи с sudo-ALL (root-эквивалент), а ядро работает под root и запускает компоненты (часть — под root). rw на /greengrass/v2/config переписывает рецепты/скрипты жизненного цикла компонентов, которые исполняет root-ядро, — путь к исполнению кода под root; в этом дереве также лежат приватный ключ и сертификат устройства. Управление Greengrass по своей природе требует root."
+
+["azure-iot-edge.observe"]
+title     = "Azure IoT Edge — наблюдение"
+summary   = "Только чтение для Azure IoT Edge: запрос статуса сервиса aziot-edged и чтение /etc/aziot."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на дерево конфигурации, без пути к root. ВНИМАНИЕ: /etc/aziot содержит идентичность подготовки устройства и ключи/сертификаты, которыми демон аутентифицируется в IoT Hub, поэтому даже доступ ro раскрывает этот материал — раскрытие учётных данных, не эскалация."
+
+["azure-iot-edge.admin"]
+title     = "Azure IoT Edge — администрирование"
+summary   = "Администрирование Azure IoT Edge: start/stop/restart демона безопасности aziot-edged, правка /etc/aziot (rw) и управление сокетом Moby/Docker через группу docker."
+risk_note = "Escalation-capable, и contained-уровня operate НЕТ: edgeAgent управляет жизненным циклом рабочих модулей через сокет Docker, а группа docker — это и есть тот сокет, который является root-эквивалентом (монтирование корня хоста, --privileged). aziot-edged — привилегированный демон безопасности, а rw на /etc/aziot перенаправляет устройство на подконтрольную атакующему подготовку/сертификаты и меняет, какие модули (и CreateOptions/Binds) привилегированный демон запускает через root-сокет docker, — путь к исполнению кода под root."
+
+["edgex.observe"]
+title     = "EdgeX Foundry — наблюдение"
+summary   = "Только чтение для EdgeX Foundry (развёртывание snap): запрос статуса snap-сервисов (по умолчанию snap.edgexfoundry.core-data + .device-modbus) и чтение дерева конфигурации snap под /var/snap/edgexfoundry/current."
+risk_note = "Contained: только чтение статуса сервиса плюс ACL ro на дерево конфигурации snap, без мутаций. Это нацелено на SNAP EdgeX — единственное развёртывание, устанавливающее systemd-юниты (docker-compose — это контейнеры без юнитов). Сервисы snap работают ПОД ROOT (без пина User=), поэтому rw-конфиг — эскалация (edgex.admin), но наблюдение в режиме чтения остаётся contained. Набор юнитов зависит от развёртывания (EdgeX состоит из множества юнитов snap.edgexfoundry.<service>); роль его переопределяет. Конфигурация лежит под /var/snap/edgexfoundry/current (раскладка данных snap, НЕ /etc/edgex); точный подпуть закрепляется под развёртывание."
+
+["edgex.operate"]
+title     = "EdgeX Foundry — управление"
+summary   = "Управление EdgeX Foundry (развёртывание snap): start/stop/restart snap-сервисов (по умолчанию snap.edgexfoundry.core-data + .device-modbus), чтение дерева конфигурации snap (только чтение) и доступ к последовательным устройствам для Modbus RTU (device-serial, группа dialout)."
+risk_note = "Contained: жизненный цикл плюс только чтение конфигурации. Сервисы snap EdgeX работают ПОД ROOT (без пина User=), поэтому rw-конфиг — эскалация и держится ВНЕ operate (он живёт в edgex.admin) — это форма root-демона rsyslog/salt-minion, НЕ форма operate-под-не-root redis/telegraf. Запуск/остановка snap-сервиса исполняет только проверенную конфигурацию на диске; оператор не может внести новый код, потому что конфигурация остаётся ro. device-serial несёт группу dialout для последовательного доступа Modbus RTU, сам по себе contained leaf. Набор юнитов и путь конфигурации зависят от развёртывания (см. observe)."
+
+["edgex.admin"]
+title     = "EdgeX Foundry — администрирование"
+summary   = "Администрирование EdgeX Foundry (развёртывание snap): start/stop/restart snap-сервисов и правка дерева конфигурации snap под /var/snap/edgexfoundry/current (rw)."
+risk_note = "Escalation-capable: сервисы snap EdgeX работают ПОД ROOT (без пина User=). Конфигурация на сервис задаёт эндпоинты device-сервисов, настройки драйверов и адреса bind/реестра/хранилища секретов, которые загружают root-сервисы, поэтому rw на дереве конфигурации snap переконфигурирует то, к чему подключаются и что загружают root-сервисы, — путь к root-уровневой переконфигурации / влиянию на код. Это форма rsyslog/salt-minion (root-демон → rw-конфиг — эскалация, держится в admin)."
+
+["x11vnc.observe"]
+title     = "x11vnc — наблюдение"
+summary   = "Только чтение для x11vnc: запрос статуса сервиса x11vnc."
+risk_note = "Contained: только чтение статуса юнита. Файл пароля не выдаётся (у файла -rfbauth x11vnc нет фиксированного системного пути — обычно ~/.vnc/passwd или путь из флагов юнита). ВНИМАНИЕ: x11vnc экспортирует живую X-сессию (просмотр экрана плюс инъекция ввода клавиатуры/мыши), когда работает, поэтому это высокочувствительная возможность — само наблюдение даёт лишь статус."
+
+["x11vnc.operate"]
+title     = "x11vnc — управление"
+summary   = "Управление x11vnc: start/stop/restart сервиса x11vnc и подключение к локальной графической сессии (console-access)."
+risk_note = "Высокочувствительно даже будучи contained: x11vnc даёт полный контроль над живой сессией — содержимое экрана И инъекцию ввода клавиатуры/мыши (интерактивный удалённый контроль, не просмотр). Contained ТОЛЬКО для случая киоска / сессии гостевого пользователя (инъекция в не-root сессию киоска, а console-access — contained leaf). ОГОВОРКА ПРО ROOT-:0: если x11vnc вместо этого подключается к экрану входа / менеджеру дисплея на :0, он работает ПОД ROOT и инъектирует в root-сессию входа = эскалация, НЕ contained — такое развёртывание НЕ должно поставлять x11vnc.operate как contained и должно использовать отдельный root-уровень. Проверьте, к какому дисплею подключается x11vnc, прежде чем доверять метке contained."
+
+["chromium.observe"]
+title     = "Chromium-киоск — наблюдение"
+summary   = "Только чтение для Chromium-киоска: запрос статуса юнита сессии киоска и чтение корпоративного дерева управляемых политик /etc/chromium/policies/managed (только чтение)."
+risk_note = "Contained: только чтение статуса юнита плюс ACL ro на дереве управляемых политик, без изменений. Утверждение «без root-пути» верно для базовой линии, где сессия киоска запускает браузер как не-root гостевого пользователя (см. оговорку про run-as-user в operate/admin); наблюдение в любом случае только-чтение и остаётся contained. Chromium — не демон; привилегированные поверхности здесь это root-owned управляемая политика и юнит сессии киоска, а не сам браузер. Имя юнита сессии киоска ЗАВИСИТ ОТ РАЗВЁРТЫВАНИЯ (autologin lightdm / собственный kiosk.service / getty-autologin + .xinitrc); `kiosk` — это значение по умолчанию, которое роль переопределяет. Google Chrome читает политики из соседнего пути /etc/opt/chrome/policies/managed — это per-OS/variant дельта, которую слой добавляет после проверки, здесь НЕ поставляется."
+
+["chromium.operate"]
+title     = "Chromium-киоск — управление"
+summary   = "Управление Chromium-киоском: start/stop/restart юнита сессии киоска и чтение дерева управляемых политик /etc/chromium/policies/managed (только чтение)."
+risk_note = "Contained: ограниченное управление сессией плюс политика только для чтения — без rw. Перезапуск сессии исполняет только проверенную политику на диске; оператор не может ослабить блокировку, потому что политика остаётся только для чтения. rw на управляемой политике удерживается в chromium.admin (уровень авторинга блокировки), а не свёрнут в operate — это разделение как у pcscd/rsyslog, обусловленное поверхностью побега из киоска (целостность). ОГОВОРКА ПРО RUN-AS-USER: contained ПРЕДПОЛАГАЕТ, что юнит сессии `kiosk` запускает браузер под не-root пользователем — это свойство конкретного юнита, а не интринсик (та же зависимость от развёртывания, что User= у mosquitto и :0 у x11vnc). Per-OS слой / роль, чей юнит сессии запускает Chromium под root (без User=, либо подключение к `:0`/менеджеру дисплея), НЕ должны поставлять chromium.operate/admin как contained без проверки run-as-user юнита — браузер под root читает политику как root, поэтому rw-политика + перезапуск становятся root-путём исполнения кода. ЗАВИСЯЩИЕ ОТ РАЗВЁРТЫВАНИЯ юнит сессии киоска и вариант пути политик Google Chrome: см. chromium.observe."
+
+["chromium.admin"]
+title     = "Chromium-киоск — администрирование"
+summary   = "Администрирование блокировки Chromium-киоска: start/stop/restart юнита сессии киоска и правка корпоративного дерева управляемых политик /etc/chromium/policies/managed (rw)."
+risk_note = "Contained, НЕ эскалация НА БАЗОВОЙ ЛИНИИ: файлы управляемой политики принадлежат root, но Chromium ЧИТАЕТ их как непривилегированный гостевой пользователь браузера, поэтому rw НЕ исполняет код под root — максимум это контроль над браузером гостевого уровня. НО это критичная для безопасности поверхность ЦЕЛОСТНОСТИ (чувствительно-но-contained, как authn-bypass у mosquitto.admin): rw позволяет ОБНУЛИТЬ/ОСЛАБИТЬ политику → ПОБЕГ ИЗ КИОСКА с прохода (file://, произвольная навигация, DevTools), а также ПРИНУДИТЕЛЬНО УСТАНОВИТЬ расширения / задать хосты NATIVE-MESSAGING → исполнение кода гостевого уровня внутри пользователя браузера (всё равно не root). ОГОВОРКА ПРО RUN-AS-USER: факт «гостевой пользователь» — свойство конкретного юнита `kiosk`, а не интринсик (та же зависимость от развёртывания, что User= у mosquitto и :0 у x11vnc). Если сессия `kiosk` запускает Chromium под ROOT (без User=, либо подключение к `:0`/менеджеру дисплея), браузер под root читает переписанную политику как root → rw-политика + перезапуск принудительно устанавливают код ПОД ROOT = эскалация, НЕ contained — такое развёртывание НЕ должно поставлять chromium.admin как contained без проверки run-as-user юнита. Оставлено отдельным уровнем admin, потому что авторинг блокировки — это отдельное действие по целостности, а не рутинное управление. ЗАВИСЯЩИЕ ОТ РАЗВЁРТЫВАНИЯ юнит сессии киоска и вариант пути политик Google Chrome: см. chromium.observe."

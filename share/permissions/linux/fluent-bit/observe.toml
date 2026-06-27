@@ -1,0 +1,26 @@
+id       = "fluent-bit.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for Fluent Bit (the log/metric shipper). Pins
+# service-observe to the unit `fluent-bit` and binds the ro config-tree
+# convention component (config tree /etc/fluent-bit holds fluent-bit.conf,
+# parsers.conf, and plugin config — it follows the /etc/{app} convention).
+#
+# Contained: read-only status + ro ACL on the config tree, no mutation, no root
+# path. Fluent Bit runs as ROOT on the baseline (see below), so rw on this config
+# WOULD be a root code-exec path — but observe is ro only, so containment holds.
+#
+# DEPLOYMENT-SPECIFIC unit: legacy upstream packaging ships the daemon as
+# `td-agent-bit.service` rather than `fluent-bit.service`. On targets still using
+# that name the unit differs and lands in a per-OS layer (the openvpn legacy
+# `openvpn@` callout precedent).
+#
+# Values verified against fluent-bit on Debian 12 (unit fluent-bit, config
+# /etc/fluent-bit, daemon runs as root — the upstream/td-agent-bit systemd unit
+# sets no User=, so it stays root to tail system logs and bind inputs). Per-OS
+# unit/path deltas land in linux-<distro> layers once verified — unverified
+# values are not shipped.
+includes = [
+    { id = "service-observe", units = "fluent-bit" },
+    { id = "app-config-ro", app = "fluent-bit" },
+]

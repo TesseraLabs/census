@@ -1,0 +1,357 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PermissionDef",
+  "description": "A single catalog policy record, parsed strictly.\n\nOne `PermissionDef` is one *layer's* statement about an id. The cross-layer\nmerge (see [`resolve_leaf`]) combines several of these for the same id.",
+  "type": "object",
+  "properties": {
+    "category": {
+      "description": "Category tag (used by `include_categories` in slice 2; inert here).",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "file": {
+      "description": "File-access grants this permission carries (`[[file]]` sub-tables). Each\nis parsed strictly and its path validated at the read boundary.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/FileGrant"
+      }
+    },
+    "groups": {
+      "description": "Group memberships this permission grants.",
+      "$ref": "#/$defs/ListOverride"
+    },
+    "id": {
+      "description": "Permission id (top-level in slice 1; namespaced ids are slice 2).",
+      "type": "string"
+    },
+    "include_categories": {
+      "description": "Categories this permission aggregates. Inert in slice 1.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "includes": {
+      "description": "Explicit members this permission aggregates. Each entry is either a bare\nid string or a table binding the member's parameters to templates over\nthis bundle's own parameters (see [`Include`]). Inert in slice 1.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Include"
+      }
+    },
+    "limits": {
+      "description": "Resource limits this permission sets. A higher layer that sets `limits`\nreplaces wholesale (limits are a small fixed struct, not a list). Uses the\nstrict [`CatalogLimits`] so an unknown key (notably `mac_mask`) under\n`[limits]` is rejected rather than silently dropped.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CatalogLimits"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "params": {
+      "description": "Per-parameter constraints (`[params.<name>]` sub-tables) bounding the\nvalues a role may substitute into this record's `{placeholder}`s. Every\nplaceholder that appears in any template (sudo, groups, file path) MUST\nhave a matching entry here, and every entry MUST name a placeholder that\nthe record actually uses — both enforced at the read boundary\n(fail-closed). The constraint is applied to each substituted value at\nresolve time, before the static sudo/path gates.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ParamConstraint"
+      }
+    },
+    "replace": {
+      "description": "When `true`, this layer wipes everything accumulated from lower layers\nand takes its own statement wholesale (full override, not field-by-field).",
+      "type": "boolean",
+      "default": false
+    },
+    "risk": {
+      "description": "Risk class. Optional per-layer: a higher layer may override primitives\nwithout restating risk, in which case the lower layer's risk stands.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Risk"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "runas": {
+      "description": "The Unix account this permission's `sudo` commands run *as*, or `None`\nfor the default `(ALL)` (root) run-spec.\n\nA service utility must often be launched under a non-root service account\n(`sudo -u app_svc ./MyApp`), never as root. Setting `runas` to\nthat account narrows the grant: every command this permission contributes\nrenders under `(<runas>)` instead of `(ALL)`, so the privilege handed out\nis \"be that service account for these commands\", not a root-equivalent.\nOverrides across layers exactly like `risk`: the topmost layer that sets\n`runas` wins; a higher layer that restates `sudo` without `runas` leaves\nthe lower layer's run-spec standing. Validated at the read boundary.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "sudo": {
+      "description": "Sudo commands this permission grants.",
+      "$ref": "#/$defs/ListOverride"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id"
+  ],
+  "$defs": {
+    "Access": {
+      "description": "A set of file-access bits. Either a compact perm string (letters r/w/x plus the legacy aliases \"ro\"/\"rw\") or an array of bit names drawn from read/write/execute/traverse.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "ro",
+            "rw",
+            "r",
+            "w",
+            "x",
+            "rx",
+            "wx",
+            "rwx"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write",
+              "execute",
+              "traverse"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      ]
+    },
+    "CatalogLimits": {
+      "description": "The `[limits]` sub-table as written in a catalog record, parsed *strictly*.\n\n`rolestore::Limits` is intentionally tolerant (no `deny_unknown_fields`)\nbecause Tessera owns the role schema and Census must ignore role fields it\ndoes not consume. The catalog is the opposite: Census owns it and expands it\nas root, so an unknown key under `[limits]` is a typo or a smuggled field and\nmust be rejected — most importantly `mac_mask`, which is a Tessera\nenforcement primitive and MUST NOT appear in a catalog expansion. Hiding it\nunder `[limits]` (where the tolerant role type would silently drop it) would\notherwise be worse than the correctly-rejected top-level form. This local\nstrict type closes that gap without touching the tolerant role-slice parse.",
+      "type": "object",
+      "properties": {
+        "nofile": {
+          "description": "`RLIMIT_NOFILE`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "nproc": {
+          "description": "`RLIMIT_NPROC`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileGrant": {
+      "description": "A single file-access grant as written in a catalog record, parsed *strictly*.\n\nStrict (`deny_unknown_fields`) for the same reason the whole catalog is: Census\nowns this format and materializes it as root (setfacl). An unrecognised key is a\ntypo or a smuggled field, not something to silently ignore.\n\nThe `path` is validated (absolute, no control chars, no `..` component) at the\nread boundary. `{param}` placeholders here are filled and re-validated at\nresolve time, mirroring the parametrized-sudo path exactly — but this\nsubstitution path applies ONLY to a catalog permission grant, which has a\nparam source (the referencing role's `PermissionRef` params). A raw role\n`[payload].files` grant has no param source, so `crate::model` forbids\nplaceholders there entirely and validates the literal path in full; this type\nis shared by both, but only the catalog side ever substitutes.",
+      "type": "object",
+      "properties": {
+        "access": {
+          "description": "The set of access bits this grant requests (read/write/execute/traverse).",
+          "$ref": "#/$defs/Access"
+        },
+        "path": {
+          "description": "Absolute path to a directory, file, or glob pattern.",
+          "type": "string"
+        },
+        "recursive": {
+          "description": "For directories: apply recursively and set a default-ACL so new files in\nthe tree inherit the access. Absent defaults to `false`.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "access"
+      ]
+    },
+    "Include": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": {
+            "type": "string"
+          },
+          "required": [
+            "id"
+          ]
+        }
+      ]
+    },
+    "ListOverride": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "append": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "append"
+          ]
+        }
+      ]
+    },
+    "ParamConstraint": {
+      "description": "A per-parameter constraint a catalog record places on the value a role may\nsubstitute into one of its `{placeholder}`s.\n\nTemplating fills `{name}` in a sudo command, group name, or file-grant path\nwith a role-supplied value; without a constraint that value is unbounded, so\na role could point a parametrized file permission at `/etc/shadow` or splice\nan unexpected unit into a `systemctl` rule. Every placeholder in a record\nMUST carry a matching `[params.<name>]` (enforced at parse, fail-closed), and\nthe substituted value is checked against it at resolve time, *before* the\nexisting sudo/path static gates — defence in depth, not instead of them.\n\nTagged on the TOML `kind` key (externally distinct kinds, one set of\nper-kind fields each), so a record writes e.g. `kind = \"token\"` /\n`kind = \"path\"` / `kind = \"enum\"` and only that kind's fields are accepted\n(`deny_unknown_fields`, like the rest of the catalog).\n\n# Examples\n\n```toml\n[params.units]\nkind = \"token\"          # systemd unit name; safe charset, bounded length\n\n[params.path]\nkind = \"path\"\nallow_prefix = [\"/etc/app/\"]   # substituted path must sit under one of these\n\n[params.verb]\nkind = \"enum\"\nvalues = [\"start\", \"stop\"]     # substituted value must be one of these\n```",
+      "oneOf": [
+        {
+          "description": "A portable identifier (a systemd unit, an interface, a login name). The\nsubstituted value must be non-empty, within the length bound, and drawn\nfrom a safe identifier charset (ASCII alphanumerics plus the documented\n`-_.@:\\/` set systemd unit names use). Sudoers/path/shell metacharacters\nare rejected — the param-value gate already blocks the worst of them, and\nthis narrows further to a real identifier shape.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "token"
+            },
+            "max_len": {
+              "description": "Maximum accepted length; defaults to [`PARAM_DEFAULT_MAX_LEN`].",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "default": null,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "A filesystem path. The substituted value must sit under one of\n`allow_prefix` (so a parametrized file grant cannot be steered outside its\nintended trees), pass the existing post-substitution path gate (absolute,\nno `..`, no control char), stay within the length bound, and — unless\n`deny_glob = false` — contain no glob metacharacter (`*?[`).",
+          "type": "object",
+          "properties": {
+            "allow_prefix": {
+              "description": "Allowed path prefixes; the substituted path must be at, or under, one\nof them on a `/`-component boundary (so `/etc/app/` admits\n`/etc/app/x` but never the sibling `/etc/apparmor.d`). Each prefix\nmust be an absolute directory ending in `/`; at least one is required\n(an empty list would allow any absolute path) — both enforced at parse.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "deny_glob": {
+              "description": "Reject glob metacharacters (`*?[`) in the substituted path unless set\nto `false`. Defaults to [`PARAM_PATH_DENY_GLOB_DEFAULT`] (true).",
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "default": null
+            },
+            "kind": {
+              "type": "string",
+              "const": "path"
+            },
+            "max_len": {
+              "description": "Maximum accepted length; defaults to [`PARAM_DEFAULT_MAX_LEN`].",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "default": null,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "allow_prefix"
+          ]
+        },
+        {
+          "description": "A closed set of allowed values. The substituted value must equal one of\n`values` exactly.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "enum"
+            },
+            "values": {
+              "description": "The exact set of accepted values; must be non-empty (enforced at\nparse — an empty set would reject every value).",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "values"
+          ]
+        },
+        {
+          "description": "A single safe path segment that doubles as a plain name. The substituted\nvalue must be non-empty, within the length bound, and drawn from a\ndeliberately narrow charset — ASCII alphanumerics plus `.`, `_`, `-`\nonly — with the bare `.` and `..` components rejected outright. Because it\ncannot contain `/`, `\\`, `:`, `@`, or any control character, one value is\nsafe to drop into both a single path component (`/etc/{seg}`) and a token\nposition (a unit name, a login), without risking traversal, an absolute\npath, or a sudoers/shell metacharacter.\n\nThis is strictly narrower than [`ParamConstraint::Token`]: `token` admits\n`/`, `\\`, `:`, and `@` (needed for path-like and instance/slice unit\nnames) and so is *not* safe as a path segment. The exclusion of `@` and\n`:` here is the known limitation — `segment` cannot express a systemd\ninstance or slice unit name (`wg-quick@wg0`, `system.slice`); those still\nrequire `token`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "segment"
+            },
+            "max_len": {
+              "description": "Maximum accepted length; defaults to [`PARAM_DEFAULT_MAX_LEN`].",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "default": null,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "Risk": {
+      "description": "Risk class of a permission. Advisory only (honest labelling, not\nenforcement): it never blocks expansion or apply.",
+      "oneOf": [
+        {
+          "description": "Capability stays within its intended scope.",
+          "type": "string",
+          "const": "contained"
+        },
+        {
+          "description": "Capability can be a path to root (e.g. membership in `docker`).",
+          "type": "string",
+          "const": "escalation-capable"
+        }
+      ]
+    }
+  }
+}

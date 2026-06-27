@@ -1,0 +1,11 @@
+id       = "ssh-admin"
+risk     = "escalation-capable"
+category = "identity"
+sudo     = ["/usr/sbin/sshd", "/usr/bin/systemctl restart ssh", "/usr/bin/systemctl restart sshd"]
+
+# Editing sshd_config, the sshd_config.d drop-ins and host keys is the natural
+# capability here; the whole /etc/ssh tree is the rewrite-proof directory unit.
+[[file]]
+path      = "/etc/ssh"
+access    = "rw"
+recursive = true

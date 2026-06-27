@@ -1,0 +1,19 @@
+id       = "nginx.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for nginx: service-control on the `nginx` unit plus the
+# rw config convention component (config tree /etc/nginx follows /etc/{app}).
+#
+# This is escalation-capable, NOT a contained operate: the nginx master process
+# runs as root, and the `load_module` directive in /etc/nginx loads an arbitrary
+# shared object into that root master process — a direct root code-load path. The
+# file access is contained ACL, but the content it grants write to is a
+# root-equivalent control surface.
+#
+# Values verified against nginx on Debian 12 (unit nginx, config /etc/nginx).
+# Per-OS unit/path deltas land in linux-<distro> layers once verified —
+# unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "nginx" },
+    { id = "app-config-rw", app = "nginx" },
+]

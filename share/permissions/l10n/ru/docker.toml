@@ -1,0 +1,24 @@
+["docker.observe"]
+title     = "Docker — наблюдение"
+summary   = "Только чтение для движка Docker: запрос статуса сервиса docker и чтение /etc/docker (daemon.json)."
+risk_note = "Contained: только статус и конфиг демона в режиме чтения. Намеренно БЕЗ сокета и БЕЗ группы docker — нет contained-способа перечислить контейнеры (docker ps требует root-эквивалентного сокета демона), поэтому наблюдение ограничено статусом и ro-конфигом. Всё, что требует сокет, — это эскалация и живёт в docker.operate."
+
+["docker.operate"]
+title     = "Docker — управление"
+summary   = "Управление движком Docker: start/stop/restart сервиса docker, запуск docker-compose и работа с демоном через группу docker."
+risk_note = "Escalation-capable: группа docker даёт доступ к сокету демона, а сокет — root-эквивалент: он может смонтировать корневую ФС хоста в контейнер и запустить --privileged, выполнив код под root на хосте. Сам демон docker работает под root. Contained-режима operate для docker НЕТ; сокет — это и есть смысл, а сокет — это root."
+
+["docker.admin"]
+title     = "Docker — администрирование"
+summary   = "Администрирование движка Docker: всё из operate (группа docker, сокет, compose) плюс перезапуск демона docker."
+risk_note = "Escalation-capable, как и docker.operate: группа docker / сокет демона — root-эквивалент (монтирование корня хоста, --privileged), а демон работает под root. Перезапуск добавляет управление демоном на уровне root поверх уже root-эквивалентного доступа к сокету."
+
+["portainer-edge.observe"]
+title     = "Portainer Edge Agent — наблюдение"
+summary   = "Только чтение для агента Portainer Edge: запрос статуса сервиса PortainerEdgeAgent."
+risk_note = "Contained: только статус юнита в режиме чтения. Файл логов не выдаётся (агент пишет в рантайм контейнеров / журнал, без стабильного пути на хосте). Имя юнита PortainerEdgeAgent — соглашение community-обёртки systemd и зависит от развёртывания (роль переопределяет); агент обычно — голый контейнер без хост-юнита, и тогда этот пакет неприменим."
+
+["portainer-edge.admin"]
+title     = "Portainer Edge Agent — администрирование"
+summary   = "Администрирование агента Portainer Edge: start/stop/restart сервиса PortainerEdgeAgent плюс docker.operate (сокет docker хоста, которым управляет агент)."
+risk_note = "Escalation-capable, и contained-уровня operate НЕТ: агент Edge управляет стеками контейнеров через сокет docker хоста, а сокет — root-эквивалент (монтирование корня хоста, --privileged). portainer-edge.admin ПО ЗАМЫСЛУ и есть доступ к сокету docker — он включает docker.operate и потому пересекается с docker.admin; единственное, что он добавляет поверх docker.operate, — управление жизненным циклом самого юнита агента."

@@ -1,0 +1,39 @@
+[apparmor-admin]
+title     = "AppArmor administration"
+summary   = "Load and toggle AppArmor profiles (aa-enforce, aa-complain, apparmor_parser)."
+risk_note = "Setting a profile to complain/disabled removes a confinement barrier around a service."
+
+[ca-trust-admin]
+title     = "CA trust administration"
+summary   = "Update the system trusted-CA store (update-ca-certificates)."
+risk_note = "Adding a CA can make forged TLS certificates trusted host-wide — a MITM enabler."
+
+[udev-config]
+title     = "udev configuration"
+summary   = "Manage device rules and reload udev (udevadm)."
+risk_note = "A udev rule can run a command as root on device events — a persistence/escalation vector."
+
+[selinux-admin]
+title     = "SELinux administration"
+summary   = "Manage SELinux mode and policy (setenforce, semanage, setsebool)."
+risk_note = "setenforce 0 disables mandatory access control host-wide."
+
+[firmware-secureboot]
+title     = "Secure Boot key management"
+summary   = "Manage Secure Boot MOK enrollment (mokutil)."
+risk_note = "Enrolling a key lets unsigned/attacker code pass Secure Boot verification."
+
+[sandbox-operate]
+title     = "Sandbox operation"
+summary   = "Launch the firejail SUID sandbox to confine processes (firejail group)."
+risk_note = "Contained: confines processes rather than expanding host privilege."
+
+[astra-mac-control]
+title     = "Astra MAC control"
+summary   = "Toggle Astra SE hardening switches: interpreter-macro lock, security monitor, ptrace lock."
+risk_note = "Flips mandatory-protection switches host-wide; loosening any removes a confinement barrier."
+
+[astra-digsig-control]
+title     = "Astra ЗПС (digsig) control"
+summary   = "Manage the ELF integrity-control mode and the digsig trust tree (astra-digsig-control, /etc/digsig)."
+risk_note = "Adding a key to /etc/digsig/keys or flipping the mode decides what may run under ЗПС at all — root-equivalent."

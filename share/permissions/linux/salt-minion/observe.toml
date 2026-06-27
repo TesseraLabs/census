@@ -1,0 +1,17 @@
+id       = "salt-minion.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for the Salt minion (config-management agent). Pins
+# service-observe to the unit `salt-minion` and binds the ro config + ro logs
+# convention components (config tree /etc/salt and logs /var/log/salt both follow
+# the convention). Contained: read-only status + ro ACL on config and logs, no
+# root path.
+#
+# Values verified against salt-minion on Debian 12 (unit salt-minion, config
+# /etc/salt, logs /var/log/salt, runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "salt-minion" },
+    { id = "app-config-ro", app = "salt" },
+    { id = "app-logs-ro", app = "salt" },
+]

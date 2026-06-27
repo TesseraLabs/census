@@ -1,0 +1,35 @@
+id       = "openvpn.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for OpenVPN: service-control on the instance unit
+# openvpn-server@server plus READ-WRITE config (the rw /etc/openvpn convention
+# component).
+#
+# This is escalation-capable, NOT a contained operate: OpenVPN creates the tun
+# device and runs its up/down/route-up/learn-address scripts as ROOT under
+# `script-security 2`, and the `plugin` directive loads a shared object into the
+# root openvpn process. The daemon can `user nobody`/`group` self-drop AFTER init,
+# but those scripts and the plugin .so run as root, so rw on /etc/openvpn points
+# the root process at attacker-supplied scripts/code — a direct root code-exec
+# path. The file access is contained ACL, but the content it grants write to is a
+# root code-exec surface.
+#
+# DEPLOYMENT-SPECIFIC unit: openvpn-server@server is the default instance; a role
+# overrides `units` to its actual tunnel instance(s) (openvpn-client@<name> for a
+# client, legacy openvpn@<name> on older targets).
+#
+# This admin tier deliberately does NOT reuse the generic `vpn-admin` leaf:
+# vpn-admin grants the nm-openvpn group plus sudo for wg/wg-quick/resolvectl (a
+# NetworkManager / WireGuard-oriented bundle), which neither matches OpenVPN's
+# instance-unit lifecycle nor its /etc/openvpn config tree. Composing the
+# convention components (service-control + app-config-rw on app="openvpn") models
+# the actual OpenVPN admin surface precisely, mirroring the rsyslog/postgresql
+# package precedent, so this package does NOT include vpn-admin.
+#
+# Values verified against openvpn on Debian 12 (template unit openvpn-server@,
+# config /etc/openvpn). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "openvpn-server@server" },
+    { id = "app-config-rw", app = "openvpn" },
+]

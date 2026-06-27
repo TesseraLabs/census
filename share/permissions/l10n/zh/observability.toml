@@ -1,0 +1,49 @@
+[log-read]
+title     = "日志读取"
+summary   = "读取 /var/log 和日志（adm、systemd-journal 组）。"
+risk_note = "日志可能泄露服务输出中记录的机密（令牌、密码）。"
+
+[log-admin]
+title     = "日志管理"
+summary   = "轮转和清理日志（logrotate、journalctl）。"
+risk_note = "清理或轮转日志可抹除审计痕迹——掩盖行踪。"
+
+[journald-config]
+title     = "journald 配置"
+summary   = "重启 systemd-journald 以应用日志设置。"
+risk_note = "受限：重启日志服务。"
+
+[coredump-config]
+title     = "核心转储配置"
+summary   = "查看并管理核心转储（coredumpctl）。"
+risk_note = "受限，但特权进程的核心转储可能包含内存中的机密。"
+
+[audit-config]
+title     = "审计配置"
+summary   = "管理内核审计规则（auditctl、augenrules）。"
+risk_note = "禁用审计规则会破坏问责性——使安全监控失明。"
+
+[syslog-admin]
+title     = "Syslog 管理"
+summary   = "重启 syslog 守护进程以应用日志配置（rsyslog）。"
+risk_note = "受限：重启 rsyslog；配置编辑在别处。"
+
+[process-inspect]
+title     = "进程查看"
+summary   = "查看所有用户的进程（ps、top、lsof）。"
+risk_note = "受限，但会暴露其他用户的命令行和打开的文件。"
+
+[process-control]
+title     = "进程控制"
+summary   = "向任意进程发信号并调整优先级（kill、renice、pkill）。"
+risk_note = "可向任意 uid 的进程发信号——针对系统服务的拒绝服务。"
+
+[perf-trace]
+title     = "性能追踪"
+summary   = "追踪系统调用并分析进程（strace、perf、bpftrace、ltrace）。"
+risk_note = "strace 通过 ptrace 附加到任意进程——可窃取凭据和注入代码。"
+
+[metrics-export]
+title     = "指标导出"
+summary   = "运行 node exporter（prometheus 组，重启 node-exporter）。"
+risk_note = "受限：向监控栈暴露主机指标。"

@@ -1,0 +1,4 @@
+id       = "peripheral-operator"
+risk     = "contained"
+category = "peripheral"
+includes = ["print-admin", "audio-access", "display-config", "ups-admin", "atm-peripheral"]

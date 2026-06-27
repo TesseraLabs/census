@@ -1,0 +1,16 @@
+id       = "haproxy.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for HAProxy. Pins service-observe to the unit
+# `haproxy` and binds the ro config convention component (config tree
+# /etc/haproxy follows /etc/{app}). No logs component: HAProxy logs to journald,
+# not /var/log/haproxy. Contained: read-only status + ro ACL on /etc/haproxy, no
+# root path.
+#
+# Values verified against haproxy on Debian 12 (unit haproxy, config
+# /etc/haproxy). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "haproxy" },
+    { id = "app-config-ro", app = "haproxy" },
+]

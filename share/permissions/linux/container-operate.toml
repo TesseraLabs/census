@@ -1,0 +1,4 @@
+id       = "container-operate"
+risk     = "contained"
+category = "virt"
+sudo     = ["/usr/bin/podman"]

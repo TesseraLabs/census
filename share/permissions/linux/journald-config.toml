@@ -1,0 +1,13 @@
+id       = "journald-config"
+risk     = "contained"
+category = "observability"
+sudo     = ["/usr/bin/systemctl restart systemd-journald"]
+
+# Narrow drop-in directory for journald.conf overrides (the bare
+# /etc/systemd/journald.conf is a single file, which the free ACL backend would
+# refuse — the .conf.d drop-in dir is the rewrite-proof, narrow unit). Editing
+# journald retention/forwarding is not root-equivalent, so risk stays contained.
+[[file]]
+path      = "/etc/systemd/journald.conf.d"
+access    = "rw"
+recursive = true

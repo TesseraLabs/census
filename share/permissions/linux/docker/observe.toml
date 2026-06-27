@@ -1,0 +1,18 @@
+id       = "docker.observe"
+risk     = "contained"
+category = "container"
+# Curated read-only package for the Docker engine: service-observe on the `docker`
+# unit plus ro on the daemon config tree /etc/docker (daemon.json). NO socket, NO
+# docker group — deliberately. There is no contained way to LIST containers:
+# `docker ps` talks to /var/run/docker.sock, and socket access is root-equivalent
+# (it can mount the host filesystem and start --privileged containers). So observe
+# is status + read-only daemon config only; anything that needs the socket is
+# escalation and lives in docker.operate.
+#
+# Values verified against docker on Debian 12 (unit docker, daemon config
+# /etc/docker, daemon runs as root). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "docker" },
+    { id = "app-config-ro", app = "docker" },
+]

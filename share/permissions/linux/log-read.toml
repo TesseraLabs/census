@@ -1,0 +1,11 @@
+id       = "log-read"
+risk     = "contained"
+category = "observability"
+groups   = ["adm", "systemd-journal"]
+
+# Read-only access to the system log tree. ro keeps this contained — no config
+# is mutated, the role only reads /var/log.
+[[file]]
+path      = "/var/log"
+access    = "ro"
+recursive = true

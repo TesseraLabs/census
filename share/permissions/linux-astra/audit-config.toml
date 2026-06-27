@@ -1,0 +1,5 @@
+id = "audit-config"
+# Astra ships a dedicated astra-audit group for the Special Edition audit
+# subsystem; membership lets a role manage Astra audit alongside the family
+# auditctl/augenrules tools.
+groups.append = ["astra-audit"]

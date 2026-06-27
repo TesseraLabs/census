@@ -1,0 +1,15 @@
+role    = "hostadmin"
+version = 1
+os      = "linux"
+name    = "Host hardening admin"
+level   = 8
+
+[payload]
+# Heavy escalation-capable bundles spanning security + boot + storage domains.
+permissions = [
+    "host-hardening",
+    "boot-admin",
+    "storage-admin",
+    "power-control",
+    { id = "service-restart", units = ["auditd"] },
+]

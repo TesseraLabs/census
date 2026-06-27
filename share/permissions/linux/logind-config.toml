@@ -1,0 +1,13 @@
+id       = "logind-config"
+risk     = "contained"
+category = "os-config"
+sudo     = ["/usr/bin/systemctl restart systemd-logind"]
+
+# logind drop-in directory ONLY (not all of /etc/systemd, which holds
+# system.conf/user.conf). These drop-ins reconfigure the login manager's
+# session/seat policy — no ExecStart, no arbitrary code — so the grant stays
+# contained, matching this permission's risk.
+[[file]]
+path      = "/etc/systemd/logind.conf.d"
+access    = "rw"
+recursive = true

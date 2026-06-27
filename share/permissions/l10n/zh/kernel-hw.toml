@@ -1,0 +1,49 @@
+[driver-config]
+title     = "内核模块／驱动配置"
+summary   = "加载、卸载和查看内核模块（modprobe、rmmod、modinfo）。"
+risk_note = "加载模块即在内核中运行代码——完全等同 root。"
+
+[firmware-update]
+title     = "固件更新"
+summary   = "通过系统更新器刷写设备固件（fwupdmgr）。"
+risk_note = "持久于操作系统之下：有缺陷或恶意的固件可在重装后存活。"
+
+[kernel-tune]
+title     = "内核参数调优"
+summary   = "读取并设置运行时内核参数（sysctl）。"
+risk_note = "控制 ASLR、ptrace_scope 和网络加固——可削弱主机防护。"
+
+[device-serial]
+title     = "串口设备访问"
+summary   = "通过 dialout 组访问串口（/dev/ttyS*、/dev/ttyUSB*）。"
+risk_note = "受限：直连 ATM/PLC 外设，不提升主机权限。"
+
+[device-usb]
+title     = "USB／可移动设备访问"
+summary   = "访问可插拔存储并通过 udisksctl 挂载（plugdev 组）。"
+risk_note = "受限，但挂载不可信介质是恶意文件的入口。"
+
+[device-bus]
+title     = "嵌入式总线访问"
+summary   = "访问 I2C、GPIO 和 SPI 总线（i2c、gpio、spi 组）。"
+risk_note = "受限：与嵌入式控制器通信；普通主机上不构成提权。"
+
+[device-video]
+title     = "视频／GPU 设备访问"
+summary   = "访问 GPU、摄像头和显示设备（video、render 组）。"
+risk_note = "受限：仅设备访问，不提升主机权限。"
+
+[hardware-inventory]
+title     = "硬件清单"
+summary   = "读取主板和设备标识、DMI/SMBIOS 数据（lshw、dmidecode）。"
+risk_note = "读取序列号和硬件信息——清单数据，不改变状态。"
+
+[capability-admin]
+title     = "文件 capability 管理"
+summary   = "为二进制设置和读取文件 capability（setcap、getcap）。"
+risk_note = "setcap 可赋予二进制等同 root 的能力（如 cap_setuid）——一条提权途径。"
+
+[tpm-admin]
+title     = "TPM 管理"
+summary   = "登记密钥并读取 TPM 状态（systemd-cryptenroll、tpm2_*）。"
+risk_note = "控制磁盘解锁登记——可重新绑定解封加密卷的密钥。"

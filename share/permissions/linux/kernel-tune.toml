@@ -1,0 +1,11 @@
+id       = "kernel-tune"
+risk     = "escalation-capable"
+category = "kernel-hw"
+sudo     = ["/usr/sbin/sysctl"]
+
+# Persistent sysctl drop-ins. Kernel tunables affect the whole host
+# (escalation-capable).
+[[file]]
+path      = "/etc/sysctl.d"
+access    = "rw"
+recursive = true

@@ -1,0 +1,39 @@
+[apparmor-admin]
+title     = "AppArmor 管理"
+summary   = "加载并切换 AppArmor 配置文件（aa-enforce、aa-complain、apparmor_parser）。"
+risk_note = "将配置文件设为 complain/disabled 会移除服务周围的限制屏障。"
+
+[ca-trust-admin]
+title     = "CA 信任管理"
+summary   = "更新系统受信任 CA 存储（update-ca-certificates）。"
+risk_note = "添加 CA 可使伪造的 TLS 证书在全主机受信任——中间人攻击的助推器。"
+
+[udev-config]
+title     = "udev 配置"
+summary   = "管理设备规则并重载 udev（udevadm）。"
+risk_note = "udev 规则可在设备事件时以 root 运行命令——一种持久化/提权向量。"
+
+[selinux-admin]
+title     = "SELinux 管理"
+summary   = "管理 SELinux 模式和策略（setenforce、semanage、setsebool）。"
+risk_note = "setenforce 0 会在全主机禁用强制访问控制。"
+
+[firmware-secureboot]
+title     = "Secure Boot 密钥管理"
+summary   = "管理 Secure Boot MOK 登记（mokutil）。"
+risk_note = "登记密钥可使未签名/攻击者的代码通过 Secure Boot 校验。"
+
+[sandbox-operate]
+title     = "沙箱操作"
+summary   = "启动 firejail SUID 沙箱以限制进程（firejail 组）。"
+risk_note = "受限：限制进程而非扩大主机权限。"
+
+[astra-mac-control]
+title     = "Astra 强制访问控制"
+summary   = "切换 Astra SE 加固开关：解释器宏锁、安全监视器、ptrace 锁。"
+risk_note = "在全主机切换强制保护开关；放松任一项都会移除限制屏障。"
+
+[astra-digsig-control]
+title     = "Astra 封闭软件环境（digsig）控制"
+summary   = "管理 ELF 完整性控制模式与 digsig 信任树（astra-digsig-control、/etc/digsig）。"
+risk_note = "向 /etc/digsig/keys 添加密钥或切换模式即决定封闭环境下可执行的内容——等同 root 权限。"

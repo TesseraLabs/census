@@ -1,0 +1,15 @@
+id       = "usbguard.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for USBGuard — the USB device authorization daemon.
+# Pins service-observe to the unit `usbguard` and binds the ro config convention
+# component (config tree /etc/usbguard follows /etc/{app}). Contained: read-only
+# status + ro ACL on /etc/usbguard, no root path.
+#
+# Values verified against usbguard on Debian 12 (unit usbguard, config
+# /etc/usbguard). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "usbguard" },
+    { id = "app-config-ro", app = "usbguard" },
+]

@@ -1,0 +1,9 @@
+[container-operate]
+title     = "Container operation"
+summary   = "Run rootless containers and start/stop existing ones (podman)."
+risk_note = "Contained: rootless podman without the root socket — no host root."
+
+[vm-operate]
+title     = "VM operation"
+summary   = "Start and stop existing VMs (libvirt group, virsh)."
+risk_note = "Contained: manages VM lifecycle without editing definitions."

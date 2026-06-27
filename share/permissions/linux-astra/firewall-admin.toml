@@ -1,0 +1,4 @@
+id        = "firewall-admin"
+# Astra ships ufw as a supported firewall front-end (cf. astra-ufw-control); append
+# it to the family base (nft/iptables), which Astra still carries underneath.
+sudo.append = ["/usr/sbin/ufw"]

@@ -1,0 +1,49 @@
+[driver-config]
+title     = "Kernel module / driver configuration"
+summary   = "Load, unload and inspect kernel modules (modprobe, rmmod, modinfo)."
+risk_note = "Loading a module runs code in the kernel — fully root-equivalent."
+
+[firmware-update]
+title     = "Firmware update"
+summary   = "Flash device firmware via the system updater (fwupdmgr)."
+risk_note = "Persistent below the OS: flawed or malicious firmware survives reinstalls."
+
+[kernel-tune]
+title     = "Kernel parameter tuning"
+summary   = "Read and set runtime kernel parameters (sysctl)."
+risk_note = "Controls ASLR, ptrace_scope and network hardening — can weaken host defenses."
+
+[device-serial]
+title     = "Serial device access"
+summary   = "Access serial ports via the dialout group (/dev/ttyS*, /dev/ttyUSB*)."
+risk_note = "Contained: direct line to ATM/PLC peripherals, no host privilege gain."
+
+[device-usb]
+title     = "USB / removable device access"
+summary   = "Access pluggable storage and mount it via udisksctl (plugdev group)."
+risk_note = "Contained, but mounting untrusted media is an entry point for hostile files."
+
+[device-bus]
+title     = "Embedded bus access"
+summary   = "Access I2C, GPIO and SPI buses (i2c, gpio, spi groups)."
+risk_note = "Contained: talks to embedded controllers; no escalation on a normal host."
+
+[device-video]
+title     = "Video / GPU device access"
+summary   = "Access GPUs, cameras and display devices (video, render groups)."
+risk_note = "Contained: device access only, no host privilege gain."
+
+[hardware-inventory]
+title     = "Hardware inventory"
+summary   = "Read board and device identifiers, DMI/SMBIOS data (lshw, dmidecode)."
+risk_note = "Reads serials and hardware details — inventory data, no state change."
+
+[capability-admin]
+title     = "File capability administration"
+summary   = "Set and read file capabilities on binaries (setcap, getcap)."
+risk_note = "setcap can grant a binary root-equivalent powers (e.g. cap_setuid) — an escalation path."
+
+[tpm-admin]
+title     = "TPM administration"
+summary   = "Enroll keys and read TPM state (systemd-cryptenroll, tpm2_*)."
+risk_note = "Controls disk-unlock enrollment — can rebind which keys unseal encrypted volumes."

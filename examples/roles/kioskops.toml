@@ -1,0 +1,18 @@
+role    = "kioskops"
+version = 1
+os      = "linux"
+name    = "Kiosk technician"
+level   = 3
+
+[payload]
+# Kiosk technician built entirely from curated, all-contained app packages.
+# chromium.operate is a literal-bound bundle: it pins service-control to the
+# `kiosk` session unit and reads the managed-policy tree ro — so the technician
+# can restart the kiosk session and audit the active lockdown, but cannot rewrite
+# it (rw policy is chromium.admin). pcscd.observe adds read-only smartcard
+# resource-manager status for kiosks with a card reader. Both are contained: no
+# root path, no rw on the policy, no escalation.
+permissions = [
+    "chromium.operate",
+    "pcscd.observe",
+]

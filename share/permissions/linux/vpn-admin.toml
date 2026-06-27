@@ -1,0 +1,5 @@
+id       = "vpn-admin"
+risk     = "escalation-capable"
+category = "network"
+groups   = ["nm-openvpn"]
+sudo     = ["/usr/bin/wg", "/usr/bin/wg-quick", "/usr/bin/resolvectl"]

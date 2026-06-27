@@ -1,0 +1,39 @@
+[apparmor-admin]
+title     = "Администрирование AppArmor"
+summary   = "Загрузка и переключение профилей AppArmor (aa-enforce, aa-complain, apparmor_parser)."
+risk_note = "Перевод профиля в complain/disabled снимает барьер изоляции вокруг службы."
+
+[ca-trust-admin]
+title     = "Администрирование доверия CA"
+summary   = "Обновление системного хранилища доверенных CA (update-ca-certificates)."
+risk_note = "Добавление CA делает поддельные TLS-сертификаты доверенными на всём хосте — включатель MITM."
+
+[udev-config]
+title     = "Настройка udev"
+summary   = "Управление правилами устройств и перезагрузка udev (udevadm)."
+risk_note = "Правило udev может запускать команду от root по событиям устройства — вектор персистентности/эскалации."
+
+[selinux-admin]
+title     = "Администрирование SELinux"
+summary   = "Управление режимом и политикой SELinux (setenforce, semanage, setsebool)."
+risk_note = "setenforce 0 отключает мандатный контроль доступа на всём хосте."
+
+[firmware-secureboot]
+title     = "Управление ключами Secure Boot"
+summary   = "Управление привязкой MOK для Secure Boot (mokutil)."
+risk_note = "Привязка ключа позволяет неподписанному/вредоносному коду пройти проверку Secure Boot."
+
+[sandbox-operate]
+title     = "Работа с песочницей"
+summary   = "Запуск SUID-песочницы firejail для изоляции процессов (группа firejail)."
+risk_note = "Ограничено: изолирует процессы, не расширяя привилегии на хосте."
+
+[astra-mac-control]
+title     = "Управление МАК Astra"
+summary   = "Переключение защитных механизмов Astra SE: блокировка макросов интерпретаторов, монитор безопасности, блокировка ptrace."
+risk_note = "Переключает мандатные механизмы защиты на всём хосте; ослабление любого снимает барьер изоляции."
+
+[astra-digsig-control]
+title     = "Управление ЗПС (digsig) Astra"
+summary   = "Управление режимом контроля целостности ELF и деревом доверия digsig (astra-digsig-control, /etc/digsig)."
+risk_note = "Добавление ключа в /etc/digsig/keys или смена режима определяет, что вообще исполняется под ЗПС — root-эквивалент."

@@ -1,0 +1,16 @@
+id       = "redis.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for Redis. Pins service-observe to the Debian unit
+# name `redis-server` (NOT `redis` — the Debian package ships the unit, init
+# script, and config under the redis-server name) and binds the ro config
+# convention component (config tree /etc/redis follows /etc/{app}). Contained:
+# read-only status + ro ACL on /etc/redis, no root path.
+#
+# Values verified against redis on Debian 12 (unit redis-server, config
+# /etc/redis). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "redis-server" },
+    { id = "app-config-ro", app = "redis" },
+]

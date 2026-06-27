@@ -1,0 +1,10 @@
+id       = "selinux-admin"
+risk     = "escalation-capable"
+category = "security"
+sudo     = ["/usr/sbin/setenforce", "/usr/sbin/semanage", "/usr/sbin/setsebool"]
+
+# SELinux config/policy tree. Loosening the policy is root-equivalent.
+[[file]]
+path      = "/etc/selinux"
+access    = "rw"
+recursive = true

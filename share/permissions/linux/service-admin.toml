@@ -1,0 +1,11 @@
+id       = "service-admin"
+risk     = "escalation-capable"
+category = "os-config"
+sudo     = ["/usr/bin/systemctl"]
+
+# System unit directory. rw here installs or overrides any unit file, whose
+# ExecStart runs as root on next start/boot — root-equivalent (escalation-capable).
+[[file]]
+path      = "/etc/systemd/system"
+access    = "rw"
+recursive = true

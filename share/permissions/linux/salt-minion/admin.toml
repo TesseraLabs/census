@@ -1,0 +1,21 @@
+id       = "salt-minion.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for the Salt minion: service-control on the `salt-minion`
+# unit plus the rw config convention component (config tree /etc/salt follows
+# /etc/{app}).
+#
+# This is escalation-capable, NOT a contained operate: the salt-minion runs as
+# root, and /etc/salt/minion sets the `master:` address the minion obeys. Write to
+# /etc/salt repoints the minion at an attacker-controlled Salt master, which can
+# then push arbitrary states/modules that the minion executes AS ROOT — full host
+# takeover. The file access is contained ACL, but the content it grants write to
+# is a root-equivalent control surface.
+#
+# Values verified against salt-minion on Debian 12 (unit salt-minion, config
+# /etc/salt, runs as root). Per-OS unit/path deltas land in linux-<distro> layers
+# once verified — unverified values are not shipped.
+includes = [
+    { id = "service-control", units = "salt-minion" },
+    { id = "app-config-rw", app = "salt" },
+]

@@ -1,0 +1,17 @@
+role    = "sweep-astra"
+version = 1
+os      = "linux"
+name    = "Coverage sweep — Astra-only (lint exerciser)"
+level   = 9
+
+[payload]
+# Astra-only complement to coverage-sweep: the new Astra-layer permissions plus
+# the perms whose Astra deltas add groups/sudo. Resolve only on
+# --os-target linux-astra-1.8.
+permissions = [
+    "astra-mac-control",
+    "astra-ad-integration",
+    "polkit-config",
+    "console-access",
+    "audit-config",
+]

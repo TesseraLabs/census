@@ -1,0 +1,15 @@
+id       = "filebeat.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for Filebeat — the Elastic log shipper. Pins
+# service-observe to the unit `filebeat` and binds the ro config convention
+# component (config tree /etc/filebeat follows /etc/{app}). Contained: read-only
+# service status + ro ACL on the agent's own config tree, no root path.
+#
+# Values verified against filebeat on Debian 12 (unit filebeat, config
+# /etc/filebeat). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "filebeat" },
+    { id = "app-config-ro", app = "filebeat" },
+]

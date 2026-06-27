@@ -1,0 +1,74 @@
+[time-set]
+title     = "系统时间"
+summary   = "设置系统和硬件时钟（timedatectl、hwclock）。"
+risk_note = "时间影响吊销新鲜度和证书有效期——调整时间可使安全检查失效。"
+
+[locale-config]
+title     = "区域设置配置"
+summary   = "设置系统区域和键盘布局（localectl）。"
+risk_note = "受限：仅区域/布局等外观设置。"
+
+[hostname-config]
+title     = "主机名配置"
+summary   = "设置系统主机名（hostnamectl）。"
+risk_note = "受限：仅标识标签，无权限影响。"
+
+[service-observe]
+title     = "服务观察（限定范围）"
+summary   = "查询指定 systemd 单元的状态，只读（status、is-active；参数：units）。"
+risk_note = "受限：对指定单元的只读状态查询，不改变状态。"
+
+[service-control]
+title     = "服务控制（限定范围）"
+summary   = "启动/停止/重启/reset-failed 指定的 systemd 单元（参数：units）。"
+risk_note = "仅限于指定单元；sudoers 精确匹配参数，范围无法扩大。"
+
+[service-restart]
+title     = "服务重启（限定范围）"
+summary   = "观察并控制指定的 systemd 单元——捆绑 service-observe 与 service-control（参数：units）。"
+risk_note = "仅限于指定单元；sudoers 精确匹配参数，范围无法扩大。"
+
+[service-admin]
+title     = "服务管理"
+summary   = "完全控制 systemd 单元（systemctl）。"
+risk_note = "可定义或启动任意单元——实际等同以 root 运行任意代码。"
+
+[timer-admin]
+title     = "定时器管理"
+summary   = "启用、禁用、启动和停止 systemd 定时器（参数：timers）。"
+risk_note = "仅限指定定时器；要定义恶意单元仍需额外的 service-admin。"
+
+[power-control]
+title     = "电源控制"
+summary   = "重启、关机或下电主机（shutdown、reboot、poweroff）。"
+risk_note = "可在事务中途停止主机——影响可用性，不提升权限。"
+
+[session-terminate]
+title     = "会话终止"
+summary   = "终止用户会话和登录（loginctl，参数：user/session）。"
+risk_note = "可强制注销用户——针对活动会话的拒绝服务。"
+
+[boot-config]
+title     = "引导加载器配置"
+summary   = "重新生成并安装 GRUB 引导加载器（update-grub、grub-install）。"
+risk_note = "控制引导：下次重启时可设置内核参数或引导未签名代码。"
+
+[kernel-cmdline]
+title     = "内核命令行"
+summary   = "通过 GRUB 编辑内核启动参数（update-grub）。"
+risk_note = "cmdline 标志可在下次启动时禁用安全特性（如 lockdown、IOMMU）。"
+
+[initramfs-admin]
+title     = "initramfs 管理"
+summary   = "重建 initramfs 镜像（update-initramfs、mkinitramfs）。"
+risk_note = "initramfs 中的代码在操作系统之前运行——一种持久化和预启动篡改向量。"
+
+[cron-admin]
+title     = "Cron 管理"
+summary   = "管理计划任务（crontab、/etc/cron.d）。"
+risk_note = "以 root 运行的计划任务是经典的持久化向量。"
+
+[logind-config]
+title     = "logind 配置"
+summary   = "重启 systemd-logind 以应用登录管理器设置。"
+risk_note = "受限：重启登录管理器服务。"

@@ -1,0 +1,24 @@
+id       = "nut.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for NUT (Network UPS Tools): service-control on BOTH units
+# (nut-server, nut-monitor) plus READ-WRITE config via the convention component on
+# app="nut" (config tree /etc/nut follows /etc/{app}).
+#
+# This is escalation-capable, NOT a contained operate: upsmon keeps a privileged
+# parent running as root specifically to execute SHUTDOWNCMD (and NOTIFYCMD), and
+# upstream docs require upsmon.conf not be writable by the upsmon user precisely
+# because those directives run as root. rw on /etc/nut lets one set an arbitrary
+# SHUTDOWNCMD in upsmon.conf and trigger it (restart / FSD nut-monitor) → root
+# command exec — structurally identical to smartd's -M exec. The file access is
+# contained ACL, but the content it grants write to is a root-equivalent control
+# surface.
+#
+# Values verified against NUT on Debian 12 (units nut-server / nut-monitor,
+# config /etc/nut). Older/other distros name the units upsd / upsmon — that
+# delta is added as a linux-<distro> layer override only once verified.
+includes = [
+    { id = "service-control", units = "nut-server" },
+    { id = "service-control", units = "nut-monitor" },
+    { id = "app-config-rw", app = "nut" },
+]

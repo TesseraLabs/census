@@ -1,0 +1,25 @@
+# Structural list of CIS Control 6 Safeguards for the gap-oracle. This file carries
+# NO human-readable text: a Safeguard's title lives in the l10n tree
+# (l10n/<locale>/controls.toml, keyed by the same Safeguard number) so a translator
+# contributes wording without touching the compliance structure a reviewer signs off
+# on — and the structural file stays free of any copyrighted CIS wording.
+# owned=true — Census domain (role accounts/groups/sudo grants, RBAC); owned=false —
+# outside the domain (6.7 centralization via a directory = the opposite of Census's
+# offline model), NOT included in the gap.
+# Keys are quoted: a dot in TOML is a separator, so Safeguard "6.1" must be a string.
+
+["6.1"]
+domain = "grant"
+owned  = true
+
+["6.2"]
+domain = "revoke"
+owned  = true
+
+["6.7"]
+domain = "centralization"
+owned  = false
+
+["6.8"]
+domain = "rbac"
+owned  = true

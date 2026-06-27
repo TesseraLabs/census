@@ -1,0 +1,4 @@
+id       = "audio-access"
+risk     = "contained"
+category = "peripheral"
+groups   = ["audio", "pulse-access", "pulse"]

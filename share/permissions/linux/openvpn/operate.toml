@@ -1,0 +1,32 @@
+id       = "openvpn.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for OpenVPN: read-only observe (service-observe on the
+# instance unit openvpn-server@server) plus service-control on the same unit and
+# READ-ONLY config (the ro /etc/openvpn convention component). Lifecycle + read
+# only — NO rw config — so this stays contained.
+#
+# Containment rationale: starting/stopping the tunnel runs ONLY the vetted,
+# already-on-disk config and its existing hooks. The operator cannot introduce new
+# code because config stays read-only. rw on /etc/openvpn is escalation-capable
+# and lives in openvpn.admin (see that file): OpenVPN creates the tun device and
+# runs up/down/route-up/learn-address scripts as ROOT under `script-security 2`,
+# and the `plugin` directive loads a .so into the root process — it can `user
+# nobody`/`group` self-drop, but scripts and the plugin run as root BEFORE/at init,
+# so rw config is a root code-exec path. Keep rw out of operate.
+#
+# DEPLOYMENT-SPECIFIC unit: openvpn-server@server is the default instance; a role
+# overrides `units` to its actual tunnel instance(s) (openvpn-client@<name> for a
+# client, legacy openvpn@<name> on older targets).
+#
+# NOTE: /etc/openvpn holds the tunnel PRIVATE KEYS — even the ro grant bundled from
+# observe exposes secrets (credential exposure, not escalation).
+#
+# Values verified against openvpn on Debian 12 (template unit openvpn-server@,
+# config /etc/openvpn). Per-OS unit/path deltas land in linux-<distro> layers once
+# verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "openvpn-server@server" },
+    { id = "service-control", units = "openvpn-server@server" },
+    { id = "app-config-ro", app = "openvpn" },
+]

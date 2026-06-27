@@ -1,0 +1,29 @@
+id       = "wireguard.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for WireGuard: read-only observe (service-observe on the
+# instance unit wg-quick@wg0) plus service-control on the same unit and READ-ONLY
+# config (the ro /etc/wireguard convention component). Lifecycle + read only — NO
+# rw config — so this stays contained.
+#
+# Containment rationale: starting/stopping wg-quick@wg0 brings the interface up or
+# down using ONLY the vetted, already-on-disk config. The operator cannot
+# introduce new code because config stays read-only. rw on /etc/wireguard is
+# escalation-capable and lives in wireguard.admin (see that file): wg-quick runs
+# the config's PostUp/PostDown/PreUp/PreDown lines as ROOT, so rw config is a root
+# command-exec path. Keep rw out of operate.
+#
+# DEPLOYMENT-SPECIFIC unit: wg-quick@wg0 is the default interface; a role overrides
+# `units` to its actual interface(s).
+#
+# NOTE: /etc/wireguard holds the interface PRIVATE KEY — even the ro grant bundled
+# from observe exposes that key (credential exposure, not escalation).
+#
+# Values verified against wireguard-tools on Debian 12 (template unit wg-quick@,
+# config /etc/wireguard). Per-OS unit/path deltas land in linux-<distro> layers
+# once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "wg-quick@wg0" },
+    { id = "service-control", units = "wg-quick@wg0" },
+    { id = "app-config-ro", app = "wireguard" },
+]

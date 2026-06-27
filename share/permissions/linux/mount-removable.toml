@@ -1,0 +1,4 @@
+id       = "mount-removable"
+risk     = "escalation-capable"
+category = "storage"
+sudo     = ["/usr/bin/udisksctl", "/usr/bin/mount", "/usr/bin/umount"]

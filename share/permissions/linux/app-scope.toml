@@ -1,0 +1,27 @@
+id       = "app-scope"
+risk     = "contained"
+category = "app"
+# One app name -> per-app access: manage the unit (via service-control), edit its
+# config tree, read its logs. Contained — no editor-as-root; file access is ACL,
+# the service control is the scoped service-control permission. {app} is a single
+# path segment / unit name (kind=segment): no '/', no '..', so it cannot escape
+# the /etc and /var/log trees below.
+#
+# service-control's parameter is `units` (literal-name matching, no singular/plural
+# inference); the binding feeds it the bundle's `{app}`. The member's own `units`
+# token constraint re-validates the bound value (guard 2), the bundle's `segment`
+# constraint validates the role-supplied app name (guard 1).
+includes = [ { id = "service-control", units = "{app}" } ]
+
+[[file]]
+path      = "/etc/{app}"
+access    = "rw"
+recursive = true
+
+[[file]]
+path      = "/var/log/{app}"
+access    = "ro"
+recursive = true
+
+[params.app]
+kind = "segment"

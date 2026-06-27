@@ -1,0 +1,11 @@
+id       = "polkit-config"
+risk     = "escalation-capable"
+category = "identity"
+sudo     = ["/usr/bin/pkaction", "/usr/bin/systemctl restart polkit"]
+
+# polkit rules/policy tree. Authorization rules are root-equivalent (a rule can
+# grant any action to any user).
+[[file]]
+path      = "/etc/polkit-1"
+access    = "rw"
+recursive = true

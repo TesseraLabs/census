@@ -1,0 +1,29 @@
+role    = "sweep-fa"
+version = 1
+os      = "linux"
+name    = "Coverage sweep — file-access grants (lint exerciser)"
+level   = 9
+
+[payload]
+# Not a realistic role — it references every cross-distro permission that now
+# carries a `[[file]]` directory grant so `compile --lint` exercises the
+# AclBackend dir-grant path (recursive default-ACL) on every target. Astra-only
+# file grants (astra-mac-control → /etc/parsec) live in sweep-fa-astra (they do
+# not resolve on debian/ubuntu).
+permissions = [
+    "ssh-admin",
+    "pam-config",
+    "audit-config",
+    "log-read",
+    "ca-trust-admin",
+    "journald-config",
+    "kernel-tune",
+    "polkit-config",
+    "apparmor-admin",
+    "nss-config",
+    "sudo-config",
+    "selinux-admin",
+    "udev-config",
+    "cron-admin",
+    "repo-config",
+]

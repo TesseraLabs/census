@@ -1,0 +1,4 @@
+id          = "console-access"
+# Astra-specific local-console groups: the generic console group plus the
+# Fly display-manager group (fly-dm) used for the graphical login session.
+groups.append = ["astra-console", "fly-dm"]

@@ -1,0 +1,54 @@
+id       = "edgex.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for EdgeX Foundry. Pins service-observe to a
+# REPRESENTATIVE set of snap service units and grants an inline ro [[file]] on the
+# snap config/state tree under /var/snap/edgexfoundry.
+#
+# SNAP DEPLOYMENT — the only EdgeX deployment that installs systemd units. EdgeX's
+# other shipping form is docker-compose, which is containers with NO systemd units
+# at all (service-observe/control would match nothing there, and touching that
+# stack goes through the docker socket = docker.admin). So this package targets the
+# snap: its units are named `snap.edgexfoundry.<service>` (e.g.
+# snap.edgexfoundry.core-data, snap.edgexfoundry.device-modbus), and the snap
+# services run AS ROOT — there is no User= pin. Unlike redis/telegraf (which pin
+# User= IN THE PACKAGED UNIT, a structural non-root guarantee), EdgeX snap is a root
+# daemon, so rw config is escalation (see edgex.admin), not a contained operate.
+#
+# DEPLOYMENT-SPECIFIC unit set: EdgeX is a microservice platform — a running stack
+# is many snap services. This package defaults to a representative pair
+# (snap.edgexfoundry.core-data + snap.edgexfoundry.device-modbus, the latter being
+# the device service that needs host serial — see edgex.operate). A role overrides
+# `units` to the actual snap service set it runs, exactly like openvpn's
+# instance-unit note. The `snap.edgexfoundry.` prefix is a valid service-observe
+# `{units}` token (the token kind admits `.` and `-`).
+#
+# CONFIG PATH: the snap stores per-service config/state under
+# /var/snap/edgexfoundry/current (the snap's "current" data dir), NOT /etc/edgex —
+# /etc/edgex was a wrong assumption taken from the docker-compose image layout.
+# This is the documented snap-data layout; the exact subpath under it is pinned per
+# deployment / snap revision by a per-OS layer / role. Because it is a snap-data
+# tree off the /etc/{app} convention, it is an inline literal-path [[file]]
+# (postgresql precedent), not the app-config-ro component.
+#
+# Contained: read-only status + ro ACL on the snap config tree, no mutation. Even
+# though the snap services run as root, OBSERVE is read-only, so it is contained —
+# the root-daemon fact is what makes rw escalation (edgex.admin), not what makes
+# read-only status/config unsafe.
+#
+# Values verified against the EdgeX snap (snap.edgexfoundry.<service> units,
+# services run as root, snap data under /var/snap/edgexfoundry). The exact config
+# subpath is the snap-data layout and is pinned per deployment — unverified precise
+# subpaths are not shipped as fact.
+includes = [
+    { id = "service-observe", units = "snap.edgexfoundry.core-data" },
+    { id = "service-observe", units = "snap.edgexfoundry.device-modbus" },
+]
+
+# Inline literal-path grant on the EdgeX snap config/state tree — the snap stores
+# config under /var/snap/edgexfoundry/current, off the /etc/{app} convention, so it
+# is granted inline. The exact subpath is the snap-data layout; a layer/role pins it.
+[[file]]
+path      = "/var/snap/edgexfoundry/current"
+access    = "ro"
+recursive = true

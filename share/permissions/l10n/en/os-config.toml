@@ -1,0 +1,74 @@
+[time-set]
+title     = "System time"
+summary   = "Set system and hardware clock (timedatectl, hwclock)."
+risk_note = "Time affects revocation freshness and cert validity — moving it can defeat security checks."
+
+[locale-config]
+title     = "Locale configuration"
+summary   = "Set system locale and keymap (localectl)."
+risk_note = "Contained: cosmetic locale/keymap settings."
+
+[hostname-config]
+title     = "Hostname configuration"
+summary   = "Set the system hostname (hostnamectl)."
+risk_note = "Contained: identity label only, no privilege impact."
+
+[service-observe]
+title     = "Service observe (scoped)"
+summary   = "Query status of named systemd units, read-only (status, is-active; parameter: units)."
+risk_note = "Contained: read-only status queries on the named units, no state change."
+
+[service-control]
+title     = "Service control (scoped)"
+summary   = "Start/stop/restart/reset-failed named systemd units (parameter: units)."
+risk_note = "Contained to the named units only; sudoers matches argv exactly, so scope cannot widen."
+
+[service-restart]
+title     = "Service restart (scoped)"
+summary   = "Observe and control named systemd units — bundles service-observe and service-control (parameter: units)."
+risk_note = "Contained to the named units only; sudoers matches argv exactly, so scope cannot widen."
+
+[service-admin]
+title     = "Service administration"
+summary   = "Full control of systemd units (systemctl)."
+risk_note = "Any unit can be defined or started — effectively running arbitrary code as root."
+
+[timer-admin]
+title     = "Timer administration"
+summary   = "Enable, disable, start and stop systemd timers (parameter: timers)."
+risk_note = "Contained to named timers; a hostile timer unit would need separate service-admin to define."
+
+[power-control]
+title     = "Power control"
+summary   = "Reboot, shut down or power off the host (shutdown, reboot, poweroff)."
+risk_note = "Can halt the host mid-transaction — availability impact, no privilege gain."
+
+[session-terminate]
+title     = "Session termination"
+summary   = "Terminate user sessions and logins (loginctl, parameters: user/session)."
+risk_note = "Can forcibly log out users — denial of service against active sessions."
+
+[boot-config]
+title     = "Bootloader configuration"
+summary   = "Regenerate and install the GRUB bootloader (update-grub, grub-install)."
+risk_note = "Controls boot: can set kernel parameters or boot unsigned code on next reboot."
+
+[kernel-cmdline]
+title     = "Kernel command line"
+summary   = "Edit kernel boot parameters via GRUB (update-grub)."
+risk_note = "cmdline flags can disable security features (e.g. lockdown, IOMMU) at next boot."
+
+[initramfs-admin]
+title     = "Initramfs administration"
+summary   = "Rebuild the initramfs image (update-initramfs, mkinitramfs)."
+risk_note = "Code in the initramfs runs before the OS — a persistence and pre-boot tamper vector."
+
+[cron-admin]
+title     = "Cron administration"
+summary   = "Manage scheduled jobs (crontab, /etc/cron.d)."
+risk_note = "A scheduled root job is a classic persistence vector."
+
+[logind-config]
+title     = "logind configuration"
+summary   = "Restart systemd-logind to apply login-manager settings."
+risk_note = "Contained: restarts the login manager service."

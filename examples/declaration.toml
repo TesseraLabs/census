@@ -1,0 +1,90 @@
+# Example Census declaration for the starter permission catalog.
+#
+# It binds one role-account per example role. Run compile/show against it with
+# the in-repo catalog, e.g.:
+#
+#   census compile netops \
+#     --declaration examples/declaration.toml \
+#     --additional-catalog-dir share/permissions \
+#     --os-target linux-debian-12 --lint
+#
+# `--additional-catalog-dir` appends to the built-in catalog roots
+# (/usr/share/census/permissions, /etc/census/permissions.d). To run against
+# only your own roots, add `--no-default-catalog-dirs` (which drops the
+# built-ins; it errors if given without any --additional-catalog-dir).
+#
+# `role_store` is relative to the working directory (run from the census/ repo
+# root). Override the OS target with --os-target to see per-distro deltas
+# (linux-debian-12, linux-ubuntu-22.04, linux-astra-1.8).
+schema     = 1
+version    = 1
+role_store = "examples/roles"
+
+[defaults]
+uid_range = [9000, 9999]
+shell     = "/bin/bash"
+home_base = "/var/lib/census/home"
+
+[[role_account]]
+role = "netops"
+uid  = 9001
+
+[[role_account]]
+role = "hostadmin"
+uid  = 9002
+
+[[role_account]]
+role = "deviceop"
+uid  = 9003
+
+[[role_account]]
+role = "dockerop"
+uid  = 9004
+
+[[role_account]]
+role = "sweep-base"
+uid  = 9005
+
+[[role_account]]
+role = "sweep-astra"
+uid  = 9006
+
+[[role_account]]
+role = "sweep-fa"
+uid  = 9007
+
+[[role_account]]
+role = "sweep-fa-astra"
+uid  = 9008
+
+[[role_account]]
+role = "appops"
+uid  = 9009
+
+[[role_account]]
+role = "monops"
+uid  = 9010
+
+[[role_account]]
+role = "baseops"
+uid  = 9011
+
+[[role_account]]
+role = "webops"
+uid  = 9012
+
+[[role_account]]
+role = "edgeops"
+uid  = 9013
+
+[[role_account]]
+role = "logops"
+uid  = 9014
+
+[[role_account]]
+role = "iotedgeops"
+uid  = 9015
+
+[[role_account]]
+role = "kioskops"
+uid  = 9016

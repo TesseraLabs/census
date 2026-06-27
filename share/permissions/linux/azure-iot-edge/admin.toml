@@ -1,0 +1,42 @@
+id       = "azure-iot-edge.admin"
+risk     = "escalation-capable"
+category = "app"
+# Curated admin package for Azure IoT Edge: service-control on the `aziot-edged`
+# security daemon, membership of the `docker` group, and READ-WRITE config (inline,
+# recursive on /etc/aziot).
+#
+# This is escalation-capable, and there is DELIBERATELY NO contained operate tier
+# for IoT Edge: every admin lever here is root-equivalent.
+#   1. docker group — edgeAgent lifecycles the workload modules through the Moby /
+#      Docker socket (unix:///var/run/docker.sock). The docker group is the socket,
+#      and the socket is root-equivalent (bind-mount host root, run --privileged) —
+#      the same root-equivalence that makes docker.operate/admin escalation.
+#   2. aziot-edged is a privileged system security daemon (it brokers the device
+#      identity / Trusted Platform Module / key handles to the modules).
+#   3. /etc/aziot holds the provisioning identity and keys. rw on it repoints the
+#      device at attacker-controlled provisioning / certificates and changes which
+#      modules and module options (incl. CreateOptions / Binds) the privileged
+#      daemon launches via the root docker socket — a root code-exec path.
+# So docker-socket access + privileged daemon control + rw provisioning config is a
+# root-equivalent surface; this is admin, never a contained operate.
+#
+# The package name (azure-iot-edge) differs from the config dir (aziot), so the
+# config grant is an inline literal-path [[file]] rather than the app-config-rw
+# component.
+#
+# Values verified against the aziot-edge package (unit aziot-edged, config
+# /etc/aziot, Moby/Docker socket driven via the docker group). Per-OS unit/path
+# deltas land in linux-<distro> layers once verified — unverified values are not
+# shipped.
+includes = [
+    { id = "service-control", units = "aziot-edged" },
+]
+groups = ["docker"]
+
+# Inline literal-path grant on the IoT Edge config tree, read-write — holds the
+# device provisioning identity/keys and the module set the privileged daemon
+# launches via the root docker socket. rw here is a root code-exec path.
+[[file]]
+path      = "/etc/aziot"
+access    = "rw"
+recursive = true

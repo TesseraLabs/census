@@ -1,0 +1,12 @@
+id       = "service-restart"
+risk     = "contained"
+category = "os-config"
+# Bundle of the two atomic service leaves. Splitting observe (read-only status
+# queries) from control (state-changing verbs) lets a role grant "watch only"
+# without granting "can restart". This bundle is the behavior-preserving union of
+# both: a role using `{ id = "service-restart", units = [...] }` expands to the
+# exact same Cmnd set as the former single leaf, because param substitution
+# flattens includes first, then fills `{units}` across every member template.
+# Both members are `contained`, so the bundle's max-over-members risk is
+# `contained` — equal to the declared value here, never below it.
+includes = ["service-control", "service-observe"]

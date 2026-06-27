@@ -1,0 +1,4 @@
+id       = "route-admin"
+risk     = "escalation-capable"
+category = "network"
+sudo     = ["/usr/sbin/ip", "/usr/bin/logger"]

@@ -1,0 +1,21 @@
+id       = "cups.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for CUPS: read-only observe (service-observe on the
+# `cups` unit) plus service-control on the same unit and READ-ONLY config (the ro
+# convention component, config tree /etc/cups follows /etc/{app}). Lifecycle +
+# read only — NO rw config, NO lpadmin group — so this stays contained.
+#
+# rw on /etc/cups and the lpadmin group are escalation-capable and live in
+# cups.admin: cupsd runs as root, and lpadmin lets one add a printer with a
+# malicious PPD / backend / filter that cupsd then runs as root (a historical
+# root RCE class), so granting them is a root path, not a contained operate.
+#
+# Values verified against cups on Debian 12 (unit cups, config /etc/cups). Per-OS
+# unit/path deltas land in linux-<distro> layers once verified — unverified
+# values are not shipped.
+includes = [
+    { id = "service-observe", units = "cups" },
+    { id = "service-control", units = "cups" },
+    { id = "app-config-ro", app = "cups" },
+]

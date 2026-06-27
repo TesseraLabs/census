@@ -1,0 +1,3 @@
+id        = "network-admin"
+# Ubuntu also defaults to netplan.
+sudo.append = ["/usr/sbin/netplan apply"]

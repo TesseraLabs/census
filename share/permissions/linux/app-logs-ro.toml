@@ -1,0 +1,24 @@
+id       = "app-logs-ro"
+risk     = "contained"
+category = "app"
+# Reusable convention component: read-only ACL on an application's own log tree
+# at /var/log/{app}. A LEAF (no includes → no bound members), so a curated
+# package may bind it (e.g. `{ id = "app-logs-ro", app = "zabbix" }`) without
+# tripping the nested-param-mapping guard.
+#
+# The `segment` param bounds {app} to a single subdir under /var/log — no `/`, no
+# `..`, so it cannot escape /var/log into another tree. It can still NAME a
+# sensitive directory. `risk = "contained"` reflects the INTENDED use — an
+# application's own log tree, which is not a root path. The safety of the concrete
+# bound value is a CURATION / review concern (supply-chain), exactly as it is for
+# an inline file grant: do not point this at a system directory. (A
+# service-control binding needs no such caveat — controlling any unit is uniformly
+# contained; file risk is path-dependent, which is why this component carries the
+# intended-use note.)
+[[file]]
+path      = "/var/log/{app}"
+access    = "ro"
+recursive = true
+
+[params.app]
+kind = "segment"

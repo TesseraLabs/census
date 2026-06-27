@@ -1,0 +1,5 @@
+id       = "metrics-export"
+risk     = "contained"
+category = "observability"
+groups   = ["prometheus"]
+sudo     = ["/usr/bin/systemctl restart prometheus-node-exporter"]

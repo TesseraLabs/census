@@ -1,0 +1,4 @@
+id       = "boot-admin"
+risk     = "escalation-capable"
+category = "boot"
+includes = ["boot-config", "kernel-cmdline", "initramfs-admin", "tpm-admin", "luks-admin"]

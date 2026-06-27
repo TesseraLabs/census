@@ -1,0 +1,61 @@
+id       = "node-red.operate"
+risk     = "contained"
+category = "app"
+# Curated operate package for Node-RED: read-only observe (service-observe on the
+# `nodered` unit) plus service-control on the same unit, an inline RW [[file]] on
+# the userDir, and contained GPIO access via the device-bus leaf.
+#
+# rw config is in operate (and there is deliberately NO node-red.admin tier)
+# because the upstream systemd install pins Node-RED non-root via the unit's User=
+# (the upstream installer pins User=<invoking-user>; a hardened system deployment
+# uses a dedicated service user). With that pin, rw on the userDir grants
+# command-exec only AS THAT SERVICE USER: the `exec` node and a function node's
+# child_process run commands, but as the non-root node-red user. That is
+# exec-as-app-user — contained, not escalation. This is the redis precedent
+# (non-root daemon → rw in operate, no admin tier).
+#
+# GPIO: the rpi-gpio nodes need digital-I/O access. device-bus carries the `gpio`
+# group, and on Debian/Raspberry Pi the `gpio` group owns the /dev/gpiomem and
+# /dev/gpiochip* device nodes — so group membership is what grants the access; no
+# separate inline device [[file]] is needed. device-bus is itself a contained leaf,
+# so it does not widen the package's risk.
+#
+# BREADTH CAVEAT: device-bus is broader than Node-RED's GPIO need — it ALSO grants
+# the `i2c` and `spi` groups, which Node-RED's rpi-gpio nodes do not use. The gpio
+# justification above does NOT extend to i2c/spi: on a board carrying an i2c/spi
+# EEPROM, TPM, or RTC, raw bus access is a potential hardware-tamper path. It stays
+# `contained` as a general default (no host privilege gain), but a deployment that
+# wants exactly gpio and not i2c/spi has no narrower leaf today — device-bus is the
+# only embedded-bus leaf, so it is used here with this breadth noted.
+#
+# DEPLOYMENT-SPECIFIC path: /var/lib/node-red is this package's hardened/systemd-
+# system default userDir; the UPSTREAM installer's userDir is /home/<user>/.node-red
+# (pinned by WorkingDirectory=$HOME), which cannot be expressed as a literal inline
+# path. Per-OS layers / roles adjust the path. flows_cred.json in the userDir holds
+# encrypted node credentials.
+#
+# CAVEAT for per-OS layers (the mosquitto/telegraf User= lesson): containment here
+# rests on the unit pinning Node-RED non-root via User=. The common hobby-Pi images
+# run Node-RED as root, or as `pi` with passwordless sudo — on any such deployment
+# rw flows/settings = ROOT code-exec (the exec node runs as root), so the layer
+# must re-evaluate and move rw config into a node-red.admin escalation tier before
+# shipping operate as contained.
+#
+# Risk label verified against the way Node-RED is run: the upstream systemd install
+# pins it non-root (User=<invoking-user>), which is what keeps rw config contained.
+# Per-OS unit/path deltas — including the upstream /home/<user>/.node-red userDir —
+# land in linux-<distro> layers once verified; unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "nodered" },
+    { id = "service-control", units = "nodered" },
+    "device-bus",
+]
+
+# Inline literal-path grant on the userDir, read-write — Node-RED's config is a
+# home-dir tree (settings.js + flows.json + flows_cred.json), not /etc/{app}, so it
+# cannot use the app-config-rw convention component. rw here is command-exec as the
+# non-root node-red user (exec node, function child_process), not root.
+[[file]]
+path      = "/var/lib/node-red"
+access    = "rw"
+recursive = true

@@ -1,0 +1,4 @@
+id       = "device-bus"
+risk     = "contained"
+category = "device"
+groups   = ["i2c", "gpio", "spi"]

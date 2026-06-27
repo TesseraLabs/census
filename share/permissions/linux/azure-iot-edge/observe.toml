@@ -1,0 +1,35 @@
+id       = "azure-iot-edge.observe"
+risk     = "contained"
+category = "app"
+# Curated read-only package for Azure IoT Edge. Pins service-observe to the unit
+# `aziot-edged` (the IoT Edge security daemon) and grants an inline ro [[file]] on
+# its config tree /etc/aziot.
+#
+# Config IS bundled read-only here (unlike Greengrass, whose ro config is held back)
+# but with an explicit caveat: /etc/aziot holds the device PROVISIONING identity —
+# the connection string / DPS enrolment and the keys/certificates the daemon uses
+# to authenticate to the IoT Hub. A ro grant therefore exposes that credential
+# material (credential exposure, not privilege escalation), which is why ro here is
+# still sensitive.
+#
+# /etc/aziot is a single tree directly under /etc but holds multiple aziot-*
+# component subdirs, so it is granted as an inline literal-path [[file]] rather than
+# the app-config-ro convention component (the package name is azure-iot-edge, the
+# config tree is aziot — they differ, like zabbix-agent's unit vs zabbix config).
+#
+# Contained: read-only status + ro ACL on the config tree, no mutation, no root path.
+#
+# Values verified against the aziot-edge package (unit aziot-edged, config
+# /etc/aziot). Per-OS unit/path deltas land in linux-<distro> layers once verified
+# — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "aziot-edged" },
+]
+
+# Inline literal-path grant on the IoT Edge config tree — the package name
+# (azure-iot-edge) differs from the config dir (aziot), so it does not fit the
+# app-config-ro component; granted inline. Holds the device provisioning keys.
+[[file]]
+path      = "/etc/aziot"
+access    = "ro"
+recursive = true

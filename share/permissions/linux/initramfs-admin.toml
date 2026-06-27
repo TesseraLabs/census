@@ -1,0 +1,4 @@
+id       = "initramfs-admin"
+risk     = "escalation-capable"
+category = "boot"
+sudo     = ["/usr/sbin/update-initramfs", "/usr/sbin/mkinitramfs"]

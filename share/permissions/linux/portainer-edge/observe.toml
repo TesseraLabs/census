@@ -1,0 +1,26 @@
+id       = "portainer-edge.observe"
+risk     = "contained"
+category = "container"
+# Curated read-only package for the Portainer Edge Agent. Pins service-observe to
+# the unit `PortainerEdgeAgent` (the community-standard systemd-wrapper unit name,
+# PortainerEdgeAgent.service).
+#
+# DEPLOYMENT-SPECIFIC unit: the Edge Agent is usually run as a bare Docker container
+# with NO host systemd unit at all — only a deployment that wraps it in a systemd
+# service has a unit, and the community-standard name for that wrapper is
+# PortainerEdgeAgent. A role overrides `units` to the actual wrapper name its
+# deployment uses (exactly like edgex/openvpn's deployment-specific unit note); on a
+# pure-container deployment there is no unit and this package does not apply.
+#
+# Status only — NO log [[file]]: the Edge Agent has no stable host-side log path
+# (it logs to the container runtime / journald, reachable via the journal, not a
+# fixed file tree), so there is nothing contained to grant beyond unit status.
+#
+# Contained: read-only status on the agent unit, no mutation, no root path.
+#
+# Values verified against the community systemd-wrapper deployment of the Portainer
+# Edge Agent (unit PortainerEdgeAgent). Per-OS unit/path deltas land in
+# linux-<distro> layers once verified — unverified values are not shipped.
+includes = [
+    { id = "service-observe", units = "PortainerEdgeAgent" },
+]

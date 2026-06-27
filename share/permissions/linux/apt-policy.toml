@@ -1,0 +1,4 @@
+id       = "apt-policy"
+risk     = "contained"
+category = "packages"
+sudo     = ["/usr/bin/apt-config", "/usr/bin/unattended-upgrade"]
