@@ -73,5 +73,5 @@ master-code-reviewer, фикс CRITICAL/HIGH.
       4 MiB на root-чтения, `fsutil::read_capped`); фикс верифицирован повторным ревью. Follow-up
       (accepted): M2 sudo-команда risk-метка review-only, L1 пост-подстановочный гейт имени группы.
 - [x] 7.3 `openspec validate permission-catalog --strict`.
-- [x] 7.4 Угроза-дельта компиляции в root → threat-model §5.14 (tessera-ws): CN19 (`{param}`/`allow_prefix`
+- [x] 7.4 Угроза-дельта компиляции в root → threat-model §5.14 (internal): CN19 (`{param}`/`allow_prefix`
       инъекция), CN20 (каталог как доверенный root-вход: oversize-кап + risk-мислейбл).

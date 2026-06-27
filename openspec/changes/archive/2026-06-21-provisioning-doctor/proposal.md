@@ -8,7 +8,7 @@ managed сходится с фактом (§4), остался путь вход
 косвенно. Нужны read-only диагностики `census doctor` (проверки + ненулевой код при проблеме,
 для мониторинга/CI) и `census status` (что под управлением, версия, drift).
 
-Канон: `tessera-ws/specs/2026-06-18-census-core-spec.md` §4, §7, §8, §14.
+Канон: `internal/specs/2026-06-18-census-core-spec.md` §4, §7, §8, §14.
 
 ## What Changes
 

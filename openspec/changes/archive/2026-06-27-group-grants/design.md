@@ -1,7 +1,7 @@
 # Design: group-grants
 
 Полный дизайн (ход обсуждения, инвариант A, adoption-семантика, граница LDAP-вложенности) —
-tessera-ws `specs/2026-06-22-group-grants-adoption-design.md`. Здесь — привязка к коду
+internal `specs/2026-06-22-group-grants-adoption-design.md`. Здесь — привязка к коду
 (public-safe).
 
 ## Декларация

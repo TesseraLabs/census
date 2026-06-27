@@ -4,7 +4,7 @@
 
 Coverage-скан боевой Astra показал `config 0/2657 (0%)`: каталог не умеет явно выдать «читать/
 редактировать вот эти файлы/папки». Нужен явный примитив файлового доступа — ro/rw на файлы и
-папки. Полный дизайн и обоснование выбора: tessera-ws `specs/2026-06-22-file-access-primitive-design.md`.
+папки. Полный дизайн и обоснование выбора: internal `specs/2026-06-22-file-access-primitive-design.md`.
 
 Ключевые решения: декларативный интент + сменный бэкенд enforcement'а (SPI, как ParsecBackend для
 МКЦ); free `AclBackend` держит только ПАПОЧНЫЕ гранты (POSIX ACL + default-ACL — rewrite-proof,

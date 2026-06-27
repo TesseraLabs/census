@@ -55,7 +55,7 @@
 
 ## 8. Документация и threat-model
 
-- [x] 8.1 Аддендум в `tessera-ws/specs/threat-model.md` §5.14: framework-слой read-only, риск = искажение compliance-заявления, контроль = подпись пакета + штамп версии
+- [x] 8.1 Аддендум в `internal/specs/threat-model.md` §5.14: framework-слой read-only, риск = искажение compliance-заявления, контроль = подпись пакета + штамп версии
 - [x] 8.2 README/доки: команды `show --framework`, `framework list/coverage/show`, формат дерева фреймворка
 - [x] 8.3 Лиценз-нота в репо про заголовки контролей своими словами
 - [x] 8.4 `openspec validate framework-crossref --strict` зелёный; ревью master-code-reviewer перед коммитом
