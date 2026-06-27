@@ -1003,6 +1003,111 @@ fn group_lint_clean_group_has_no_finding() {
     assert!(group_grant_risk_findings(&groups).is_empty());
 }
 
+// ---- sudo escalation-vs-risk-label lint (curated GTFOBins denylist) ----
+
+/// A compiled role with one permission of the given risk label that grants one
+/// sudo command. The minimal shape the sudo-escalation lint inspects (per-perm
+/// risk label + the perm's sudo commands).
+fn compiled_role_one_sudo(risk: Option<Risk>, cmd: &str) -> CompiledRole {
+    CompiledRole {
+        role: "oper".to_owned(),
+        permissions: vec![compiled_perm(
+            "svc-ctl",
+            risk,
+            vec![],
+            vec![sourced(cmd, "linux", None)],
+        )],
+        raw_groups: vec![],
+        raw_sudo_role: None,
+        raw_sudo: Vec::new(),
+        raw_limits: Limits::default(),
+    }
+}
+
+#[test]
+fn sudo_risk_lint_flags_contained_shell_spawner() {
+    // A `contained` permission granting sudo on an editor that can spawn a root
+    // shell (GTFOBins-class) understates its risk — flag it (advisory WARNING).
+    let compiled = compiled_role_one_sudo(Some(Risk::Contained), "/usr/bin/vim");
+    let findings = sudo_escalation_risk_findings(&compiled);
+    let f = findings
+        .iter()
+        .find(|f| f.code == "sudo-risk-understated")
+        .expect("contained permission granting sudo vim must be flagged");
+    assert_eq!(f.severity, LintSeverity::Warning);
+    assert!(f.message.contains("vim"), "{}", f.message);
+    assert!(f.message.contains("svc-ctl"), "{}", f.message);
+}
+
+#[test]
+fn sudo_risk_lint_flags_contained_literal_shell_and_su() {
+    // The headline mislabel: a `contained` permission handing out a direct root
+    // shell (`/bin/bash`, `sh`) or `su` must be flagged — the textbook case this
+    // lint exists for.
+    for cmd in ["/bin/bash", "sh", "su", "/usr/bin/su -"] {
+        let compiled = compiled_role_one_sudo(Some(Risk::Contained), cmd);
+        assert!(
+            sudo_escalation_risk_findings(&compiled)
+                .iter()
+                .any(|f| f.code == "sudo-risk-understated"),
+            "a contained permission granting sudo `{cmd}` must be flagged"
+        );
+    }
+}
+
+#[test]
+fn sudo_risk_lint_ignores_non_denylisted_binary() {
+    // `ip` is a real privileged tool but not a curated shell-spawner; a
+    // `contained` permission granting it must NOT be flagged by this lint.
+    let compiled = compiled_role_one_sudo(Some(Risk::Contained), "/usr/sbin/ip route add x");
+    assert!(
+        sudo_escalation_risk_findings(&compiled).is_empty(),
+        "a non-denylisted binary must not trip the sudo-escalation lint"
+    );
+}
+
+#[test]
+fn sudo_risk_lint_ignores_honest_escalation_label() {
+    // An `escalation-capable` permission granting sudo vim is honestly labelled;
+    // the lint must stay silent (it only flags an UNDERSTATED label).
+    let compiled = compiled_role_one_sudo(Some(Risk::EscalationCapable), "/usr/bin/vim");
+    assert!(
+        sudo_escalation_risk_findings(&compiled).is_empty(),
+        "an honest escalation-capable label must not be flagged"
+    );
+}
+
+#[test]
+fn sudo_risk_lint_unlabelled_permission_not_flagged() {
+    // No risk label is no CLAIM to understate; the lint targets a mislabel
+    // (an explicit non-escalation label), not the absence of one.
+    let compiled = compiled_role_one_sudo(None, "/usr/bin/vim");
+    assert!(
+        sudo_escalation_risk_findings(&compiled).is_empty(),
+        "an unlabelled permission must not be flagged by the mislabel lint"
+    );
+}
+
+#[test]
+fn sudo_risk_lint_matches_on_basename() {
+    // Basename resolution: an absolute path and a bare command for the same
+    // binary both hit the denylist (`/bin/find` and `find`).
+    let abs = compiled_role_one_sudo(Some(Risk::Contained), "/bin/find . -exec sh ;");
+    assert!(
+        sudo_escalation_risk_findings(&abs)
+            .iter()
+            .any(|f| f.code == "sudo-risk-understated"),
+        "an absolute-path denylisted binary must hit by basename"
+    );
+    let bare = compiled_role_one_sudo(Some(Risk::Contained), "find");
+    assert!(
+        sudo_escalation_risk_findings(&bare)
+            .iter()
+            .any(|f| f.code == "sudo-risk-understated"),
+        "a bare denylisted command must hit by basename"
+    );
+}
+
 /// Write a role-store slice + declaration referencing it, plus a catalog
 /// layer dir. Returns the declaration path and the catalog root.
 fn compile_fixture(
