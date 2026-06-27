@@ -29,10 +29,11 @@
 - [x] 3.3 Unit: рендер human/json; exit-код `--min-coverage`.
 
 ## Срез 4. Контейнер
-- [~] 4.1 rust:bookworm с известным набором sbin/conffiles/units → детерминированный отчёт +
-      exit-код `--min-coverage`; кросс-аудит `--os-target`.
-      ОТЛОЖЕНО — нужен docker (недоступен в текущей среде). Логика exit-кода/рендера/правил покрыта
-      unit-тестами (FakeSurface+FakeCatalog); E2E на живом наборе бинарей — отдельный контейнер-прогон.
+- [x] 4.1 rust:bookworm с известным набором sbin/conffiles/units → детерминированный отчёт +
+      exit-код `--min-coverage`. ПРОГНАНО 2026-06-27 в docker (rust:bookworm, живая поверхность)
+      через `tests/integration/container-apply.sh` sc.25–27 (122/0): read-only summary; `--min-coverage 100`
+      → exit 4 (не error 1); `--json` (`overall_pct`+`by_class`); unknown class → non-zero; `--min-coverage 0`
+      → exit 0. Нюанс: кросс-аудит `--os-target` — флаг есть + unit-тесты, в контейнере отдельно не ассертился.
 
 ## Проверки
 - [x] 5.1 `cargo test` зелёные (837, 0 failed); `cargo clippy --all-targets --locked` deny-tier чист
