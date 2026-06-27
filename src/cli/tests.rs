@@ -830,6 +830,35 @@ fn risk_lint_flags_ssh_host_key_read() {
 }
 
 #[test]
+fn risk_lint_flags_recursive_ssh_dir_as_secret() {
+    use crate::catalog::Access;
+    // A recursive `ro` grant on /etc/ssh contains the `ssh_host_*` PRIVATE keys,
+    // so it leaks them even read-only. The host keys are not a SECRET_PATH_PREFIXES
+    // entry (they share their directory with the public sshd_config), so this is
+    // caught by the host-key-directory containment rule, not the prefix match. A
+    // recursive grant on a parent (`/etc`, `/`) reaches them the same way.
+    let compiled = CompiledRole {
+        role: "oper".to_owned(),
+        permissions: vec![compiled_perm_with_file(
+            "ssh-dir-read",
+            "/etc/ssh",
+            Access::RO,
+            true,
+            None,
+        )],
+        raw_groups: vec![],
+        raw_sudo_role: None,
+        raw_sudo: Vec::new(),
+        raw_limits: Limits::default(),
+    };
+    let findings = file_grant_risk_findings(&compiled);
+    assert!(
+        findings.iter().any(|f| f.code == "secret-path-access"),
+        "recursive ro grant on /etc/ssh must flag the contained host keys: {findings:?}"
+    );
+}
+
+#[test]
 fn risk_lint_clean_grant_no_finding() {
     use crate::catalog::Access;
     // rw on an app config dir that is neither root-equivalent nor a secret.

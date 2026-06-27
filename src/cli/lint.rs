@@ -86,9 +86,11 @@ const ROOT_EQUIVALENT_RW_PREFIXES: &[&str] = &[
 /// exact file (`/etc/shadow`, `/etc/krb5.keytab`) or a real directory
 /// (`/etc/ssl/private`), so the component-boundary matcher [`path_boundary_overlaps`]
 /// classifies it correctly. SSH host keys live as a FILENAME family
-/// (`/etc/ssh/ssh_host_*`), not a directory, so they are matched separately by
-/// [`path_is_secret`] (a basename prefix), NOT listed here — a component-boundary
-/// test would miss a grant directly on `/etc/ssh/ssh_host_rsa_key`.
+/// (`/etc/ssh/ssh_host_*`) inside the otherwise-public `/etc/ssh`, so they cannot
+/// be a component-boundary prefix here (that would also flag the public
+/// `sshd_config`); they are matched separately by [`path_is_secret`] — by
+/// host-key-directory containment for a grant on `/etc/ssh` or an ancestor, and by
+/// basename for a grant directly on `/etc/ssh/ssh_host_rsa_key`.
 const SECRET_PATH_PREFIXES: &[&str] = &[
     "/etc/shadow",
     "/etc/gshadow",
@@ -101,7 +103,9 @@ const SECRET_PATH_PREFIXES: &[&str] = &[
 /// prefix that marks one. The host keys are a filename family (`ssh_host_rsa_key`,
 /// `ssh_host_ed25519_key`, …) under a shared, non-secret directory (`/etc/ssh`
 /// also holds the public `sshd_config`), so they cannot be a component-boundary
-/// prefix in [`SECRET_PATH_PREFIXES`]; [`path_is_secret`] matches them by basename.
+/// prefix in [`SECRET_PATH_PREFIXES`]. [`path_is_secret`] reaches them two ways: a
+/// grant on `/etc/ssh` or an ancestor CONTAINS the keys (directory containment),
+/// and a grant directly on `/etc/ssh/ssh_host_*` matches by basename.
 const SSH_HOST_KEY_DIR: &str = "/etc/ssh";
 const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
 
@@ -122,11 +126,12 @@ fn path_boundary_overlaps(base: &str, candidate: &str) -> bool {
 ///
 /// - it overlaps a curated secret file/dir on a `/`-component boundary (`/etc/shadow`,
 ///   `/etc/ssl/private`, …) — including a recursive grant on a parent that CONTAINS one; or
-/// - it is, or lies under, an SSH host private key — a basename family (`ssh_host_*`) directly in
-///   `/etc/ssh`. The component-boundary matcher cannot express this (the key shares its directory
-///   with the non-secret `sshd_config`), so it is checked explicitly: a recursive grant on
-///   `/etc/ssh` already matches via the boundary rule, and a grant directly on
-///   `/etc/ssh/ssh_host_rsa_key` matches here by basename prefix.
+/// - its grant tree CONTAINS the SSH host private keys — the `ssh_host_*` family lives directly in
+///   `/etc/ssh`, so any grant on `/etc/ssh` or an ancestor (`/etc`, `/`) reaches them. This is
+///   matched by asking whether the host-key directory is at or under the grant path; or
+/// - it is a grant directly on a host-key file (`/etc/ssh/ssh_host_rsa_key`) — matched by basename,
+///   since the key shares its directory with the non-secret `sshd_config` and so cannot be a
+///   component-boundary prefix.
 fn path_is_secret(path: &str) -> bool {
     if SECRET_PATH_PREFIXES
         .iter()
@@ -134,10 +139,19 @@ fn path_is_secret(path: &str) -> bool {
     {
         return true;
     }
-    // SSH host key: a file named `ssh_host_*` whose parent directory is `/etc/ssh`
-    // (or a path at/under such a key). `parent_dir`/`basename` over the candidate
-    // catch the exact-file case; the recursive-parent case (`/etc/ssh`) is already
-    // covered by the boundary rule against a host-key path below.
+    // A grant whose tree CONTAINS the SSH host keys leaks them even read-only: the
+    // private keys are `ssh_host_*` files inside `/etc/ssh`, so a grant on
+    // `/etc/ssh` or any ancestor (`/etc`, `/`) reaches them. Flag when the host-key
+    // directory is at or under the grant path. The reverse direction is
+    // deliberately NOT used here: a grant on a sibling file under `/etc/ssh` (the
+    // public `sshd_config`) does not expose the private keys, and a bidirectional
+    // overlap would over-warn on it as a "secret" leak.
+    if catalog::path_at_or_under(path, SSH_HOST_KEY_DIR) {
+        return true;
+    }
+    // A grant directly on a host-key file: the exact-file case the directory
+    // containment above does not reach (the key is under, not at-or-above,
+    // `/etc/ssh`). Matched by basename.
     if let Some((parent, name)) = path.rsplit_once('/') {
         if parent == SSH_HOST_KEY_DIR && name.starts_with(SSH_HOST_KEY_PREFIX) {
             return true;

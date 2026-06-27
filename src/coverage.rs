@@ -933,24 +933,7 @@ fn config_in_scope(path: &str, grants: &[ResolvedFileGrant]) -> bool {
 fn is_security_relevant_config(path: &str) -> bool {
     SECURITY_RELEVANT_CONFIG_PREFIXES
         .iter()
-        .any(|prefix| path_at_or_under(prefix, path))
-}
-
-/// Whether `path` equals `base` or lies strictly under it on a `/`-component
-/// boundary. `path_at_or_under("/etc/ssh", "/etc/ssh")` and `.../sshd_config` are
-/// true; `path_at_or_under("/etc/ssh", "/etc/sshd_other")` is false. This is the
-/// boundary rule the whole config-coverage match relies on — a plain
-/// `str::starts_with` would wrongly treat `/etc/sshd_other` as under `/etc/ssh`.
-fn path_at_or_under(base: &str, path: &str) -> bool {
-    if path == base {
-        return true;
-    }
-    // Strictly-under requires the next char after `base` to be the separator, so
-    // the match lands on a component boundary (and a trailing slash on `base`,
-    // should one appear, is tolerated by trimming it first).
-    let base = base.strip_suffix('/').unwrap_or(base);
-    path.strip_prefix(base)
-        .is_some_and(|rest| rest.starts_with('/'))
+        .any(|prefix| catalog::path_at_or_under(prefix, path))
 }
 
 /// Whether a config `path` is covered by a file grant, and if so the verdict's
@@ -992,7 +975,7 @@ fn grant_covers_path<'a>(
     if grant.path == path {
         return Some(grant);
     }
-    if grant.recursive && path_at_or_under(&grant.path, path) {
+    if grant.recursive && catalog::path_at_or_under(&grant.path, path) {
         return Some(grant);
     }
     None

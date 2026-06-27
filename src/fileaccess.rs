@@ -305,11 +305,17 @@ pub fn revoke_args(principal: &Principal, grant: &ResolvedFileGrant) -> Vec<Vec<
 
 /// Build the `getfacl` argv vector that snapshots one path for rollback.
 /// `--absolute-names` keeps the paths in the dump absolute (so `setfacl --restore`
-/// targets the right files regardless of cwd); `-R` walks the tree. Pure.
+/// targets the right files regardless of cwd); `-R` walks the tree; `--physical`
+/// refuses to follow symlinks out of the tree so the snapshot walk matches the
+/// mutation walk (every `setfacl` pass is `-R --physical`). Without it, a symlinked
+/// subdir would dump an out-of-tree target's ACLs that `setfacl --restore` would
+/// replay out of tree. A symlinked ROOT is guarded separately by `snapshot`
+/// (`--physical` resolves a symlinked root before walking). Pure.
 pub fn getfacl_args(path: impl AsRef<str>) -> Vec<String> {
     vec![
         "--absolute-names".to_owned(),
         "-R".to_owned(),
+        "--physical".to_owned(),
         path.as_ref().to_owned(),
     ]
 }
@@ -318,6 +324,27 @@ pub fn getfacl_args(path: impl AsRef<str>) -> Vec<String> {
 /// Pure.
 pub fn restore_args(rollback_file: impl AsRef<Path>) -> Vec<String> {
     vec![format!("--restore={}", rollback_file.as_ref().display())]
+}
+
+/// Whether the grant root at `path` is a symlink, by `lstat` (which does not
+/// follow the final component).
+///
+/// This is the one guard shared by `materialize`, `revoke`, and `snapshot`: every
+/// recursive `setfacl`/`getfacl` pass runs with `--physical`, but `--physical`
+/// only refuses symlinks ENCOUNTERED DURING the in-tree walk — it still resolves a
+/// symlinked ROOT before walking. A planted symlink at the grant path would
+/// therefore redirect the recursive ACL mutation (or the snapshot dump) onto an
+/// arbitrary out-of-tree target as root. Refusing a symlinked root before any
+/// command runs closes that hole on the apply, teardown, and rollback paths alike.
+///
+/// A path that does not exist (or cannot be `lstat`ed) is reported as "not a
+/// symlink": it is not a symlink finding, and the subsequent `setfacl`/`getfacl`
+/// call surfaces a missing/unreadable path as its own error. Only a confirmed
+/// symlink is rejected here.
+fn grant_root_is_symlink(path: &str) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// Why a [`CommandRunner`] invocation failed: the binary could not be spawned, or
@@ -486,17 +513,10 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
                     reason: "AclBackend enforces directory grants only".to_owned(),
                 });
             }
-            // Lstat the grant ROOT before any setfacl. `--physical` only protects
-            // the in-tree walk; a symlinked root is resolved before the walk, so a
-            // planted symlink at the grant path would redirect the recursive ACL
-            // mutation onto an arbitrary tree. We refuse a symlink root fail-closed.
-            // A path that does not exist (or is unreadable) is NOT a symlink finding
-            // — the setfacl call below surfaces that as its own error — so only a
-            // confirmed symlink is rejected here.
-            if std::fs::symlink_metadata(&grant.path)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-            {
+            // Refuse a symlinked grant ROOT before any setfacl: `--physical` only
+            // protects the in-tree walk, and a symlinked root is resolved before
+            // the walk (see `grant_root_is_symlink`).
+            if grant_root_is_symlink(&grant.path) {
                 tracing::warn!(
                     path = %grant.path,
                     principal = %principal.name(),
@@ -528,6 +548,21 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
         principal: &Principal,
         grant: &ResolvedFileGrant,
     ) -> Result<(), FileAccessError> {
+        // The same symlink guard materialize uses, on the teardown path: the grant
+        // path comes from the managed registry and could have been swapped for a
+        // symlink (TOCTOU) since it was applied. `setfacl -R --physical -x` would
+        // still resolve a symlinked root before walking, redirecting the recursive
+        // removal out of tree. Refuse fail-closed before any setfacl runs.
+        if grant_root_is_symlink(&grant.path) {
+            tracing::warn!(
+                path = %grant.path,
+                principal = %principal.name(),
+                "refusing to revoke ACLs through a symlinked grant root"
+            );
+            return Err(FileAccessError::Symlink {
+                path: grant.path.clone(),
+            });
+        }
         for args in revoke_args(principal, grant) {
             self.runner
                 .run(&self.setfacl_bin, &args)
@@ -546,6 +581,19 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
         let mut dump: Vec<u8> = Vec::new();
         for path in paths {
             let path_str = path.to_string_lossy().into_owned();
+            // Refuse a symlinked snapshot ROOT before dumping: `getfacl -R
+            // --physical` still resolves a symlinked root before walking, so a
+            // symlinked root would capture an out-of-tree target's ACLs that a
+            // later `setfacl --restore` would replay out of tree. Fail closed,
+            // mirroring the materialize/revoke guards, so no out-of-tree entry is
+            // ever captured.
+            if grant_root_is_symlink(&path_str) {
+                tracing::warn!(
+                    path = %path_str,
+                    "refusing to snapshot ACLs through a symlinked root"
+                );
+                return Err(FileAccessError::Symlink { path: path_str });
+            }
             let out = self
                 .runner
                 .run(&self.getfacl_bin, &getfacl_args(&path_str))
@@ -1050,7 +1098,7 @@ mod tests {
     fn getfacl_and_restore_args() {
         assert_eq!(
             getfacl_args("/etc/ssh"),
-            vec!["--absolute-names", "-R", "/etc/ssh"]
+            vec!["--absolute-names", "-R", "--physical", "/etc/ssh"]
         );
         let f = Path::new("/var/lib/census/rollback/x.snapshot");
         assert_eq!(
@@ -1138,6 +1186,61 @@ mod tests {
         assert!(
             b.runner.calls.is_empty(),
             "no command must run for a symlink root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_revoke_refuses_symlinked_grant_root() {
+        // A grant root swapped for a symlink (TOCTOU between applies) would let
+        // `setfacl -R -x` resolve the root and walk the link target, removing the
+        // entry out of the intended tree. revoke must lstat the root and refuse —
+        // the same guard materialize uses — before running any command. The path
+        // comes straight from the managed registry, so this is the teardown-side
+        // counterpart of the materialize symlink guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-tree");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("grant-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant(&link.to_string_lossy(), Access::RW, true, Shape::Dir);
+        let err = b
+            .revoke(&Principal::User("alice".to_owned()), &g)
+            .unwrap_err();
+        assert!(
+            matches!(err, FileAccessError::Symlink { .. }),
+            "symlinked grant root must be refused on revoke: {err:?}"
+        );
+        assert!(
+            b.runner.calls.is_empty(),
+            "no setfacl must run for a symlinked revoke root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_snapshot_refuses_symlinked_root() {
+        // A symlinked snapshot root would dump an out-of-tree target's ACLs (the
+        // getfacl root is resolved before the walk), which `setfacl --restore`
+        // would later replay out of tree. snapshot must refuse it before running
+        // getfacl, mirroring the materialize/revoke guards.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-tree");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("snap-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut b = acl_with(RecordingRunner::default());
+        let err = b.snapshot(&[&link]).unwrap_err();
+        assert!(
+            matches!(err, FileAccessError::Symlink { .. }),
+            "symlinked snapshot root must be refused: {err:?}"
+        );
+        assert!(
+            b.runner.calls.is_empty(),
+            "no getfacl must run for a symlinked snapshot root"
         );
     }
 
