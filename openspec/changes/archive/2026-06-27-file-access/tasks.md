@@ -42,8 +42,14 @@
       rw, audit-config→`/etc/audit` rw, log-read→`/var/log` ro recursive, ca-trust-admin→
       `/usr/local/share/ca-certificates` rw, journald-config→`/etc/systemd` rw (узко), и т.п.
 - [x] 6.2 l10n en/ru/zh (тексты не меняются — гранты структурны; новых id, скорее всего, нет).
-- [~] 6.3 Re-scan Astra: config-coverage > 0; убедиться в честном отчёте (dir-гранты покрывают).
-      ОТЛОЖЕНО — нужен прогон на Astra VM (стартовый каталог file-грантов 6.1 готов; верификация на живой ФС — отдельный VM-проход).
+- [x] 6.3 Re-scan Astra: config-coverage > 0; честный отчёт (dir-гранты покрывают).
+      ПРОГНАНО 2026-06-27 на живом Astra Linux SE 1.8 (x86_64, musl static-pie бинарь, OS-target
+      авто-резолв `linux-astra-1.8_x86-64`): `census catalog coverage --class config` → **config 127/135
+      (94.1%)**, read-only. Честность подтверждена: covered = dir-гранты каталога (`/etc/pam.d`,
+      `/etc/sudoers.d`, `/etc/ssh/sshd_config.d`, `/etc/security/limits.d`, `/etc/sysctl.d`); uncovered =
+      `/etc/systemd/*.conf` с suggest (file grant rw `/etc/systemd` recursive); backend-limited =
+      single-file в non-grantable parent (`/etc/sudoers`, `/etc/login.defs`, `openssl.cnf`…) — НЕ фальшиво
+      covered (живое подтверждение MEDIUM-1 фикса catalog-coverage).
 
 ## Срез 7. Контейнер
 ПРОГНАНО 2026-06-27 в docker (rust:bookworm, реальные setfacl/getfacl/visudo) через
