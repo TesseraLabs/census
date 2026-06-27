@@ -255,7 +255,7 @@
           "type": "object",
           "properties": {
             "allow_prefix": {
-              "description": "Allowed path prefixes; the substituted path must start with one of\nthem. At least one prefix is required (an empty list would allow any\nabsolute path, defeating the constraint) — enforced at parse.",
+              "description": "Allowed path prefixes; the substituted path must be at, or under, one\nof them on a `/`-component boundary (so `/etc/app/` admits\n`/etc/app/x` but never the sibling `/etc/apparmor.d`). Each prefix\nmust be an absolute directory ending in `/`; at least one is required\n(an empty list would allow any absolute path) — both enforced at parse.",
               "type": "array",
               "items": {
                 "type": "string"
