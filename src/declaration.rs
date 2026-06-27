@@ -267,7 +267,12 @@ pub enum DeclarationError {
 /// 1-32 chars, first char a lowercase letter or `_`, rest `a-z`/`0-9`/`_`/`-`.
 /// Deliberately stricter than the full POSIX-portable set (rejects upper-case
 /// and leading digits) so created group names stay predictable across the fleet.
-fn is_valid_group_name(name: &str) -> bool {
+///
+/// `pub(crate)` so the catalog's post-substitution group-name gate reuses the one
+/// definition rather than re-deriving the charset: a `{param}` that renders a
+/// `:`/`/`/`@` into a group name (all admitted by the token charset) is rejected
+/// fail-closed before it reaches `%<group>` sudoers subjects or `groupadd`.
+pub(crate) fn is_valid_group_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.len() > 32 {
         return false;

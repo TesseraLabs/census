@@ -308,6 +308,29 @@ pub fn run_doctor(
         }
     }
 
+    // Symmetric group-grant drift: a managed group's file grants materialize as
+    // `group:<group>` ACL entries (what `setfacl -m g:<group>:…` set), so a
+    // missing/altered one is the same drift the account (`u:<acct>`) path catches.
+    // Same best-effort, READ-ONLY contract: the inspector shells out to `getfacl`
+    // (argv-only, no mutation) and an indeterminate result (`None`) is NOT a
+    // finding. A Warn, never an Error — repaired by a re-apply.
+    for (name, record) in &managed.managed_groups() {
+        for grant in &record.file_grants {
+            if inspector.group_file_access_present(&grant.path, name) == Some(false) {
+                findings.push(Finding {
+                    severity: Severity::Warn,
+                    check: CHECK_FILE_ACCESS_DRIFT,
+                    target: name.clone(),
+                    message: format!(
+                        "managed group file grant on {} has no live ACL entry for the group \
+                         (drift; re-apply to repair)",
+                        grant.path
+                    ),
+                });
+            }
+        }
+    }
+
     // The whole shadow database was unreadable (non-root). Emit ONE advisory and
     // skip every per-account password verdict below: a degraded read is "cannot
     // evaluate", not a fleet of false "shadow entry absent" Errors. The §7
@@ -1112,6 +1135,89 @@ mod tests {
         assert!(
             !report.has_errors(),
             "file-access drift is a warning, never an error"
+        );
+    }
+
+    fn managed_group_with_grant(name: &str, gid: u32, path: &str) -> ManagedGroup {
+        ManagedGroup {
+            file_grants: vec![ManagedFileGrant {
+                path: path.to_owned(),
+                access: crate::catalog::Access::RW,
+                recursive: true,
+            }],
+            ..mgroup(name, gid)
+        }
+    }
+
+    #[test]
+    fn group_file_access_grant_missing_is_warn() {
+        // A managed group records a `g:<group>` file grant whose live ACL entry is
+        // gone → drift, symmetric with the account path.
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![managed_group_with_grant("tellers", 8011, "/srv/vault")],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups
+            .insert("tellers".into(), GroupFacts { gid: 8011 });
+        // Path readable but the group's ACL entry is absent → drift.
+        insp.group_file_acls
+            .insert(("/srv/vault".into(), "tellers".into()), false);
+        let report = run_doctor(&st, &insp, None);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_FILE_ACCESS_DRIFT && f.target == "tellers")
+            .expect("group file-access drift warning");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.message.contains("/srv/vault"));
+        assert!(f.message.contains("group"));
+        assert!(
+            !report.has_errors(),
+            "group file-access drift is a warning, never an error"
+        );
+    }
+
+    #[test]
+    fn group_file_access_present_no_finding() {
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![managed_group_with_grant("tellers", 8011, "/srv/vault")],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups
+            .insert("tellers".into(), GroupFacts { gid: 8011 });
+        insp.group_file_acls
+            .insert(("/srv/vault".into(), "tellers".into()), true);
+        let report = run_doctor(&st, &insp, None);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_FILE_ACCESS_DRIFT),
+            "present group ACL must not drift: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn group_file_access_indeterminate_is_not_a_finding() {
+        // No `group_file_acls` entry → inspector returns None (cannot verify).
+        let st = state_with_group(
+            vec![managed_acct("oper", 9010, "/bin/bash", &["wheel"])],
+            vec![managed_group_with_grant("tellers", 8011, "/srv/vault")],
+        );
+        let mut insp = healthy_inspector();
+        insp.groups
+            .insert("tellers".into(), GroupFacts { gid: 8011 });
+        let report = run_doctor(&st, &insp, None);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == CHECK_FILE_ACCESS_DRIFT),
+            "indeterminate group ACL must not be a finding: {:?}",
+            report.findings
         );
     }
 

@@ -2282,6 +2282,23 @@ pub enum CatalogError {
         /// Why it was rejected.
         reason: &'static str,
     },
+    /// A rendered GROUP name (after `{param}` substitution) is not a valid Unix
+    /// group name. The group subject is interpolated raw into `%<group>` sudoers
+    /// subjects and handed to `groupadd`, and the token param charset admits
+    /// `:`/`/`/`@` — so a token-constrained `{param}` can render a separator into
+    /// the name that only `groupadd`/`visudo` would reject downstream. It is caught
+    /// here instead, at the read boundary — fail-closed, symmetric with the
+    /// post-substitution sudo-command ([`InvalidSudoCommand`](Self::InvalidSudoCommand))
+    /// and file-path ([`InvalidFilePath`](Self::InvalidFilePath)) gates.
+    #[error("invalid group name {value:?} in permission {id}: {reason}")]
+    InvalidGroupName {
+        /// The permission id carrying the bad group name.
+        id: String,
+        /// The rejected group name.
+        value: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
     /// A permission template carries a `{placeholder}` for which the referencing
     /// role supplied no matching parameter. Fail-closed: an unfilled placeholder
     /// must NOT render literally into a sudoers rule (a literal `{unit}` Cmnd is
@@ -3786,7 +3803,12 @@ fn substitute_primitives(
             // re-validate against the SAME sudo-command gate applied at catalog
             // parse so a substitution that produced a non-absolute or
             // control-bearing Cmnd (despite the param-value gate) fails closed
-            // before root.
+            // before root. For a group, re-validate the rendered name against the
+            // Unix group-name charset: the token param charset admits `:`/`/`/`@`,
+            // so a token-constrained `{param}` can render a separator into a group
+            // name that the upstream value gate accepts but `%<group>` sudoers
+            // subjects / `groupadd` would only reject downstream. Authoritative
+            // post-substitution gate, symmetric with the sudo and file-path paths.
             if is_sudo {
                 if let Some(reason) = sudo_command_defect(&value) {
                     return Err(CatalogError::InvalidSudoCommand {
@@ -3795,6 +3817,14 @@ fn substitute_primitives(
                         reason,
                     });
                 }
+            } else if !crate::declaration::is_valid_group_name(&value) {
+                return Err(CatalogError::InvalidGroupName {
+                    id: permission.to_owned(),
+                    value,
+                    reason: "rendered group name is not a valid Unix group name \
+                             (1-32 chars, a lowercase letter or '_' first, then \
+                             lowercase/digit/'_'/'-')",
+                });
             }
             out.push(SourcedPrimitive {
                 value,
@@ -6194,6 +6224,31 @@ include_categories = ["network"]
         let p = params(vec![("unit", arr(&["nginx", "redis"]))]);
         let (r, _) = resolve_with_params("svc", &p, &os, &cat, &ctx()).unwrap();
         assert_eq!(values(&r.groups), vec!["svc-nginx", "svc-redis"]);
+    }
+
+    #[test]
+    fn group_name_with_separator_rejected_post_substitution() {
+        // The token param charset admits `:`/`/`/`@`, so a token-constrained
+        // `{param}` can render a separator into a group name. The post-substitution
+        // group-name gate must reject it fail-closed, before it reaches a `%<group>`
+        // sudoers subject or `groupadd` — symmetric with the sudo/path gates.
+        let cat = FakeCatalog::new().with(
+            "linux",
+            PermissionDef {
+                groups: ListOverride::Replace(vec!["{grp}".to_owned()]),
+                params: token_param("grp"),
+                ..def("svc")
+            },
+        );
+        let os = OsTarget::new("linux", "debian", None).unwrap();
+        for bad in ["foo:bar", "foo/bar", "foo@bar"] {
+            let p = params(vec![("grp", toml::Value::String(bad.to_owned()))]);
+            let err = resolve_with_params("svc", &p, &os, &cat, &ctx()).unwrap_err();
+            assert!(
+                matches!(err, CatalogError::InvalidGroupName { ref value, .. } if value == bad),
+                "group name {bad:?} must be rejected post-substitution, got {err:?}"
+            );
+        }
     }
 
     #[test]
