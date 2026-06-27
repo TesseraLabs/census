@@ -1,0 +1,34 @@
+CENSUS COMMERCIAL LICENSE
+=========================
+
+Copyright (c) 2024-2026 Mikhail Yurievich Korolev. All rights reserved.
+
+Census is dual-licensed:
+
+  1. GNU Affero General Public License v3.0 (see LICENSE) — free of
+     charge, with all AGPL obligations including source disclosure of
+     derivative works; or
+
+  2. A commercial license — for organizations that cannot or do not
+     wish to accept the terms of the AGPL.
+
+A commercial license grants, by individual agreement:
+
+  * use, deployment and modification of Census without AGPL
+    obligations, scoped per device fleet and term;
+  * access to the commercial edition (declaration delivery via a
+    control plane, fleet inventory and aggregated drift, staged
+    rollout / canary, permission-catalog curation subscription and
+    per-fleet conformance reports);
+  * support and SLA options.
+
+Pricing and terms depend on fleet size and required components — there
+is no fixed price list. Get in touch and I will walk you through the
+options:
+
+    Mikhail Korolev
+    mikhail@robonet.me
+    https://github.com/TesseraLabs/census
+
+This file is an informational notice, not an offer. Commercial terms
+are established solely by a signed license agreement.
