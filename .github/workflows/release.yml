@@ -60,10 +60,58 @@ jobs:
           sha256sum "$out" > "$out.sha256"
           echo "ASSET=$out" >> "$GITHUB_ENV"
 
+      # Pinned nfpm binary, verified against the release's signed checksums.txt
+      # (this is the release pipeline producing trusted artifacts, so a
+      # version pin alone is not enough — release assets are mutable).
+      - name: Install nfpm
+        run: |
+          ver=2.47.0
+          base="https://github.com/goreleaser/nfpm/releases/download/v${ver}"
+          curl -fsSLO "$base/nfpm_${ver}_Linux_x86_64.tar.gz"
+          curl -fsSLO "$base/checksums.txt"
+          sha256sum --ignore-missing -c checksums.txt
+          sudo tar -xzf "nfpm_${ver}_Linux_x86_64.tar.gz" -C /usr/local/bin nfpm
+          nfpm --version
+
+      # Build the .deb and .rpm from the same stripped musl binary (already
+      # stripped in place by the Package step above) and checksum each. The
+      # nfpm config resolves source paths relative to the repo root.
+      #
+      # Names are NOT predicted: nfpm normalizes versions (e.g. a `-rc.1`
+      # prerelease tag becomes `~rc.1` in the filename), so we let nfpm name the
+      # files and glob them — correct for every version shape.
+      #
+      # NOTE: this runs before "Publish release" in the same job, so a packaging
+      # failure also blocks publishing the musl binary. Accepted: nfpm download
+      # is checksum-verified and the package build is deterministic, so the added
+      # failure surface is small relative to splitting into artifact-passing jobs.
+      - name: Build deb and rpm
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          : "${VERSION:?}"
+          export VERSION="${VERSION#v}"
+          mkdir -p dist
+          nfpm package -f packaging/nfpm.yaml -p deb -t dist
+          nfpm package -f packaging/nfpm.yaml -p rpm -t dist
+          deb="$(ls dist/*.deb)"
+          rpm="$(ls dist/*.rpm)"
+          sha256sum "$deb" > "$deb.sha256"
+          sha256sum "$rpm" > "$rpm.sha256"
+          {
+            echo "DEB=$deb"; echo "DEB_SHA=$deb.sha256"
+            echo "RPM=$rpm"; echo "RPM_SHA=$rpm.sha256"
+          } >> "$GITHUB_ENV"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
+            ${{ env.DEB }}
+            ${{ env.DEB_SHA }}
+            ${{ env.RPM }}
+            ${{ env.RPM_SHA }}

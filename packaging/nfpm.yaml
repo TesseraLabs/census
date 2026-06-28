@@ -1,0 +1,65 @@
+# nfpm config: build the census .deb and .rpm from the release musl binary.
+#
+# One source of truth for both formats. `VERSION` is injected by the release
+# workflow (`${GITHUB_REF_NAME#v}`); the tag-vs-Cargo.toml guard in release.yml
+# already prevents a version mismatch. `arch: amd64` is the deb arch; nfpm
+# automatically emits `x86_64` for the rpm.
+#
+# The destination paths below MUST match the FHS roots the census binary bakes
+# in at runtime — change one only if the other changes:
+#   /usr/share/census/permissions  -> src/cli/mod.rs::default_catalog_roots
+#   /usr/share/census/frameworks   -> src/framework.rs
+#   permissions/l10n subtree       -> src/l10n.rs
+# The binary is static musl, so the packages declare no runtime dependencies.
+
+name: census
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: admin
+priority: optional
+maintainer: TesseraLabs <census@tessera-access.com>
+description: Declarative provisioner of Unix access objects from a Tessera role-store
+vendor: TesseraLabs
+homepage: https://github.com/TesseraLabs/census
+license: AGPL-3.0-only
+
+contents:
+  # The release binary (static-pie, stripped, musl). Built by release.yml before
+  # nfpm runs; this path matches that job's output.
+  - src: target/x86_64-unknown-linux-musl/release/census
+    dst: /usr/bin/census
+    file_info:
+      mode: 0755
+
+  # Curated permission catalog (TOML) + its l10n subtree. Recursive tree copy.
+  - src: share/permissions
+    dst: /usr/share/census/permissions
+
+  # Framework cross-reference data. Recursive tree copy.
+  - src: share/frameworks
+    dst: /usr/share/census/frameworks
+
+  # Reference example declarations/roles — documentation only, never active config.
+  - src: examples
+    dst: /usr/share/doc/census/examples
+
+  # Top-level docs and license.
+  - src: README.md
+    dst: /usr/share/doc/census/README.md
+  - src: CHANGELOG.md
+    dst: /usr/share/doc/census/CHANGELOG.md
+  - src: LICENSE
+    dst: /usr/share/doc/census/LICENSE
+
+  # Empty drop-in override directories, so operators see where overrides go. The
+  # binary treats their absence as "no overrides", so shipping them empty is
+  # non-behavioral.
+  - dst: /etc/census/permissions.d
+    type: dir
+    file_info:
+      mode: 0755
+  - dst: /etc/census/frameworks.d
+    type: dir
+    file_info:
+      mode: 0755
