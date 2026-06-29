@@ -4,12 +4,12 @@
 
 Read-only аудит фактического состояния прав файловой системы. Отвечает на обратный к provisioning
 вопрос: что принципал РЕАЛЬНО достижимо читает/пишет — сверх least-privilege замысла, — и какие
-opasные классы прав (world-writable, setuid, world-readable секреты, broad-group-writable) лежат в
+опасные классы прав (world-writable, setuid, world-readable секреты, broad-group-writable) лежат в
 системе. Один permission-индекс, два режима: глобальная posture-карта (`audit fs`) и экспозиция под
 принципал (`audit expose`). Слой ничего не мутирует; находки классифицируются по риску и пути
 ремедиации (ambient / in-model).
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Read-only инвариант и код возврата
 
