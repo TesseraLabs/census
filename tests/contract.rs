@@ -38,6 +38,8 @@ use census::cli_def::Cli;
 #[cfg(feature = "schema")]
 use census::declaration::Declaration;
 #[cfg(feature = "schema")]
+use census::exposure::ExposureReport;
+#[cfg(feature = "schema")]
 use census::framework::{ControlDef, FrameworkManifest};
 #[cfg(feature = "schema")]
 use census::rolestore::Slice as RoleSlice;
@@ -129,6 +131,18 @@ fn managed_registry_schema_matches_golden() {
     assert_or_update(
         "managed-registry.schema.json",
         &schema_json::<RegistryFile>(),
+    );
+}
+
+#[cfg(feature = "schema")]
+#[test]
+fn exposure_report_schema_matches_golden() {
+    // The `census audit expose --format json` output. `ExposureReport` transitively
+    // covers `Finding` and the risk/severity/class/remediation/via/access shapes, so a
+    // change to any of them surfaces as drift here.
+    assert_or_update(
+        "exposure-report.schema.json",
+        &schema_json::<ExposureReport>(),
     );
 }
 

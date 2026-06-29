@@ -15,6 +15,7 @@
 //! the shared input helpers (`detect_os_target`, `default_catalog_roots`,
 //! `read_declaration`, `resolve_targets`) and the pure exit-code mappers.
 
+mod audit;
 mod compile;
 mod coverage;
 mod framework;
@@ -33,6 +34,10 @@ mod tests;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+pub use audit::{
+    render_expose_json, render_expose_text, render_fs_json, render_fs_text, run_audit_expose,
+    run_audit_fs, AuditExposeOpts, AuditFsOpts,
+};
 pub use compile::{
     compile_role, render_compile_human, render_compile_json, render_show_framework_human,
     render_show_framework_json, render_show_permissions_json, render_show_tree, run_compile,

@@ -1,0 +1,30 @@
+# Example `exposure.toml` — read-only exposure-audit configuration for
+# `census audit fs` / `census audit expose`.
+#
+# All three keys are optional; an omitted key (or an absent file) uses the
+# built-in default. The file is strict-parsed: an unknown key is rejected.
+# Install at /etc/census/exposure.toml, or point at it with `--config`.
+
+# Roots scanned when no `--root`/`--full` is given on the CLI.
+# Default: the security-relevant trees below.
+scan_roots = ["/etc", "/var", "/opt", "/usr/local", "/srv", "/home", "/root"]
+
+# Globs that classify an inode as a `secret` (a world-readable one is a leak).
+# `**` matches any run of path segments; `*` matches within a single segment.
+# Each glob may contain at most ONE `**` (more is rejected at load: the matcher
+# backtracks across `**` and could blow up exponentially on a full scan).
+# Default: the set below.
+secret_globs = [
+  "/etc/shadow*",
+  "**/*.key",
+  "**/*.pem",
+  "**/id_rsa*",
+  "**/.env*",
+  "**/*credentials*",
+]
+
+# Wide group NAMES whose group-write access is a posture concern. The owning
+# group's name is resolved from the host's real /etc/group by gid, then matched
+# by name here — so a host that renumbered a group is still caught.
+# Default: adm, wheel, sudo, staff, users.
+broad_groups = ["adm", "wheel", "sudo", "staff", "users"]

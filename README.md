@@ -100,10 +100,81 @@ census framework show     <fw>                                       # a framewo
 census framework coverage <fw>                                       # gap-oracle: owned controls with no mapping
 census framework risk     <fw>                                       # controls a mapping undermines (risk links) + threatening permissions
 census framework lint     [--additional-catalog-dir D]                          # validate mappings against the catalog
+census audit fs      [--root P]... [--full] [--format text|json] [--config P]   # read-only filesystem posture map
+census audit expose  --principal <name|uid> [--root P]... [--full] [--format text|json]   # read-only per-principal exposure
 ```
 
 (`census catalog coverage` — auditing which privileged surface is not covered by
 the catalog — is designed and planned.)
+
+## Exposure audit (`census audit`)
+
+Census provisions access *forward* (grants, groups, sudoers); `census audit`
+answers the *reverse*, read-only question — **what can actually be read/written on
+this filesystem?** — so an ambient over-permission (a world-writable
+`/var/spool/cron`, a world-readable secret) that undermines a least-privilege
+role cannot hide. It never mutates anything; it walks and `stat`s the filesystem
+and reads POSIX ACLs via `getfacl`. Two modes share one scan:
+
+- **`census audit fs`** — a global, principal-independent **posture map**:
+  world-writable objects in sensitive trees, the setuid/setgid inventory (a
+  *writable* setuid binary is critical), world-readable secrets, and
+  broad-group-writable objects.
+- **`census audit expose --principal <name|uid>`** — what one principal can
+  actually **reach** (effective access + ancestor `x`-traversal). For a
+  Census-managed role-account the *intended baseline* (its home and granted
+  paths) is subtracted, so only the **excess** access beyond the declared intent
+  remains; for an arbitrary uid the raw reachability is shown.
+
+Each finding carries the path, effective access, object class, risk
+(escalation / leak / tamper), severity, the `via` reason, and a remediation hint
+classed `ambient` (a foreign object — manual `chmod`/`setfacl`) or `in-model` (a
+Census-owned group or grant — narrow the declaration). A finding at or above
+**High** severity makes the process exit non-zero (for CI/monitoring, like
+`doctor`).
+
+> **Caveats (read these):**
+>
+> - **DAC-only — the verdict is an upper bound.** The audit considers only
+>   discretionary access (mode, owner, POSIX ACL). A MAC layer (SELinux,
+>   AppArmor, PARSEC) may restrict actual access *further*; every `expose` report
+>   states this.
+> - **Local passwd/group only (NSS advisory).** Principal resolution and group
+>   membership read the local `/etc/passwd` and `/etc/group`. NSS/LDAP sources are
+>   not consulted, so an account whose membership lives only in a directory
+>   service is under-reported.
+> - **The report is itself a sensitive artifact.** It is a map of the system's
+>   weak spots. The output carries only metadata (paths, modes, classes) and never
+>   secret *content*, but do not log it or share it carelessly.
+
+Scan scope and the classifiers are configurable in `exposure.toml`
+(`--config`, default `/etc/census/exposure.toml`; an absent file uses the
+built-in defaults). Comments are English; the file is strict-parsed
+(`deny_unknown_fields`):
+
+```toml
+# /etc/census/exposure.toml — read-only exposure-audit configuration.
+
+# Roots scanned when no --root/--full is given. Default: the security-relevant
+# trees (/etc /var /opt /usr/local /srv /home /root).
+scan_roots = ["/etc", "/var", "/opt", "/usr/local", "/srv", "/home", "/root"]
+
+# Globs that classify an inode as a `secret`. Default: shadow, keys, PEM,
+# id_rsa*, .env*, *credentials*. `**` spans path segments; `*` is within a segment.
+# At most one `**` per glob (more is rejected at load — it risks exponential blowup).
+secret_globs = [
+  "/etc/shadow*",
+  "**/*.key",
+  "**/*.pem",
+  "**/id_rsa*",
+  "**/.env*",
+  "**/*credentials*",
+]
+
+# Wide group NAMES whose group-write access is a posture concern. Matched by
+# name against the host's real /etc/group, so a renumbered group is still caught.
+broad_groups = ["adm", "wheel", "sudo", "staff", "users"]
+```
 
 ## Compliance frameworks
 

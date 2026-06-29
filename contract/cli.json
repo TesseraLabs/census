@@ -82,6 +82,126 @@
       ]
     },
     {
+      "name": "audit",
+      "about_present": true,
+      "subcommands": [
+        {
+          "name": "expose",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "config",
+              "long": "config",
+              "takes_value": true,
+              "required": false,
+              "default": "/etc/census/exposure.toml",
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "format",
+              "long": "format",
+              "takes_value": true,
+              "required": false,
+              "default": "text",
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "full",
+              "long": "full",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "managed",
+              "long": "managed",
+              "takes_value": true,
+              "required": false,
+              "default": "/var/lib/census/managed.toml",
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "principal",
+              "long": "principal",
+              "takes_value": true,
+              "required": true,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "root",
+              "long": "root",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            }
+          ]
+        },
+        {
+          "name": "fs",
+          "about_present": true,
+          "subcommands": [],
+          "args": [
+            {
+              "id": "config",
+              "long": "config",
+              "takes_value": true,
+              "required": false,
+              "default": "/etc/census/exposure.toml",
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "format",
+              "long": "format",
+              "takes_value": true,
+              "required": false,
+              "default": "text",
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "full",
+              "long": "full",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "managed",
+              "long": "managed",
+              "takes_value": true,
+              "required": false,
+              "default": "/var/lib/census/managed.toml",
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "root",
+              "long": "root",
+              "takes_value": true,
+              "required": false,
+              "default": null,
+              "repeatable": true,
+              "num_args": null
+            }
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "catalog",
       "about_present": true,
       "subcommands": [

@@ -15,6 +15,9 @@ Languages: **English** · [Русский](../ru/index.md) · [中文](../zh/ind
    and operate (scheduled reconcile, drift checks, teardown). Start here.
 2. [toml-reference.md](toml-reference.md) — the complete TOML format: every field
    of the declaration and role slice, plus the `plan --diff` preview mode.
+3. [audit.md](audit.md) — the read-only **exposure audit**: scan the device's
+   *actual* filesystem permissions and find what a principal can already reach
+   beyond least-privilege (`census audit fs` / `census audit expose`).
 
 ### Catalog / package author — extending the permission catalog
 

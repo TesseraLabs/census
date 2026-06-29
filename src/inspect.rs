@@ -49,6 +49,21 @@ pub trait SystemInspector {
     /// free. Used to detect a GID-pin conflict against a DIFFERENT existing
     /// group (the pinned GID is already taken). Read-only.
     fn group_name_by_gid(&self, gid: u32) -> Option<String>;
+    /// The primary group id of account `name` (passwd field 4), or `None` if the
+    /// account is absent. Used by the exposure audit's principal resolution to
+    /// reconstruct `getgrouplist` semantics (primary gid + supplementary groups);
+    /// the doctor path does not need it, so a default impl returns `None` to keep
+    /// pre-existing inspectors compiling.
+    fn primary_gid(&self, _name: &str) -> Option<u32> {
+        None
+    }
+    /// The account name owning numeric `uid`, or `None` if `uid` is free. Lets the
+    /// exposure audit resolve a principal given as a bare numeric uid back to its
+    /// passwd name (needed to enumerate supplementary group membership). A default
+    /// impl returns `None` so pre-existing inspectors keep compiling.
+    fn account_name_by_uid(&self, _uid: u32) -> Option<String> {
+        None
+    }
     /// The members of group `name` as the OS currently lists them (the
     /// comma-separated member field of `getent group`). Empty when the group is
     /// absent or has no members. Read-only — used at adopt time to snapshot the
@@ -330,6 +345,24 @@ impl SystemInspector for LiveInspector {
         Some(name)
     }
 
+    fn primary_gid(&self, name: &str) -> Option<u32> {
+        // passwd is `name:passwd:uid:gid:gecos:home:shell`; field 4 (index 3) is the
+        // primary gid. Read-only `getent` lookup keyed by name.
+        let text = Self::getent("passwd", Some(name))?;
+        let line = text.lines().next()?;
+        let fields: Vec<&str> = line.split(':').collect();
+        fields.get(3)?.parse::<u32>().ok()
+    }
+
+    fn account_name_by_uid(&self, uid: u32) -> Option<String> {
+        // `getent passwd <uid>` resolves the account owning a numeric uid; field 1
+        // (index 0) is its name.
+        let text = Self::getent("passwd", Some(&uid.to_string()))?;
+        let line = text.lines().next()?;
+        let fields: Vec<&str> = line.split(':').collect();
+        fields.first().map(|s| (*s).to_owned())
+    }
+
     fn group_members(&self, name: &str) -> Vec<String> {
         // `getent group <name>` → `name:passwd:gid:member1,member2`. Field 3 is
         // the comma-separated member list (empty when none). Absent group → none.
@@ -496,6 +529,9 @@ pub struct FakeInspector {
     pub accounts: std::collections::BTreeMap<String, AccountFacts>,
     /// Live groups keyed by name.
     pub groups: std::collections::BTreeMap<String, GroupFacts>,
+    /// Primary gid per account name (passwd field 4), for the exposure audit's
+    /// principal resolution. An absent key maps to `None`.
+    pub primary_gids: std::collections::BTreeMap<String, u32>,
     /// Live group members keyed by group name (the OS member list). Used to
     /// snapshot an adopted group's baseline members.
     pub group_members: std::collections::BTreeMap<String, Vec<String>>,
@@ -542,6 +578,17 @@ impl SystemInspector for FakeInspector {
         self.groups
             .iter()
             .find(|(_, f)| f.gid == gid)
+            .map(|(n, _)| n.clone())
+    }
+
+    fn primary_gid(&self, name: &str) -> Option<u32> {
+        self.primary_gids.get(name).copied()
+    }
+
+    fn account_name_by_uid(&self, uid: u32) -> Option<String> {
+        self.accounts
+            .iter()
+            .find(|(_, f)| f.uid == uid)
             .map(|(n, _)| n.clone())
     }
 
