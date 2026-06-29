@@ -427,6 +427,22 @@ census doctor   --declaration declaration.toml   # read-only integrity/readiness
 `doctor` is the one to wire into monitoring — it exits non-zero when an invariant
 is violated.
 
+### 4.2.1 Audit the device's actual permissions
+
+`doctor` checks Census's *own* invariants; the **exposure audit** checks the
+device's *ambient* filesystem permissions — what a principal can already read and
+write, regardless of what Census provisioned. It is read-only and also exits
+non-zero on a high-severity finding, so it wires into monitoring the same way:
+
+```sh
+sudo census audit fs                       # device posture map (world-writable, setuid, readable secrets, …)
+sudo census audit expose --principal oper  # what the `oper` account can actually reach, beyond its grants
+```
+
+Run `audit expose` whenever you create or tighten a restricted account, to confirm
+the ambient filesystem isn't handing it more than you intended. See
+[audit.md](audit.md) for the full guide.
+
 ### 4.3 Change a role
 
 Edit the role-store (or the declaration), preview, then apply:

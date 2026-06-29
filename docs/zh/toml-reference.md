@@ -13,6 +13,7 @@ Census 读取以下几类文件：
 | **目录权限**（`share/permissions/**/*.toml`） | 目录作者 | 严格 | §3（概要 + 链接） |
 | **Framework**（`frameworks/<fw>/*.toml`） | 合规作者 | 严格 | §4（概要 + 链接） |
 | **受管注册表**（`/var/lib/census/managed.toml`） | **仅 Census** | — | §5（请勿编辑） |
+| **审计配置**（`/etc/census/exposure.toml`） | 运维 | 严格 | §6（可选） |
 
 权威的、机器可读的 schema 位于 `contract/*.schema.json`（由解析器生成，golden 锁定）。
 本文是其散文镜像；如有不一致，以 schema 为准。
@@ -345,7 +346,33 @@ sudo = ["/usr/sbin/reboot", "/usr/bin/systemctl"]
 
 ---
 
-## 6. 预览变更 —— diff 模式
+## 6. 审计配置 —— `/etc/census/exposure.toml`
+
+只读[暴露审计](audit.md)（`census audit fs` / `census audit expose`）的可选配置。被**严格**
+解析（`deny_unknown_fields`）。该文件可选，且每个键都可选：文件不存在、或某个键缺失，会回退
+到内置默认值。一个**存在却格式错误**的文件是一个硬错误——绝不是无声的默认（一个配置错误的
+安全工具必须大声失败，而不是看似健康却在扫描错误的目标）。用 `--config` 传入非默认路径。
+
+| 键 | 类型 | 必填 | 默认 | 含义 |
+|---|---|---|---|---|
+| `scan_roots` | 路径数组 | 否 | `["/etc","/var","/opt","/usr/local","/srv","/home","/root"]` | 默认扫描覆盖的目录树。每一项**必须是绝对路径**；**空列表会被拒绝**（一次什么都不扫却报告「一切正常」的扫描是个陷阱）。可由每次运行的 `--root`/`--full` 覆盖。 |
+| `secret_globs` | 字符串数组 | 否 | `["/etc/shadow*","**/*.key","**/*.pem","**/id_rsa*","**/.env*","**/*credentials*"]` | 把对象标记为 **secret 类**的 glob（因此一个被 `other` 可读的匹配项即为 `leak`）。每个模式至多包含**一个 `**`**（匹配器会在 `**` 处回溯；两个会在 `--full` 扫描上呈指数级）——含更多的模式在加载时被拒绝。 |
+| `broad_groups` | 字符串数组 | 否 | `["adm","wheel","sudo","staff","users"]` | 在「宽组可写」这一维度上被视为「宽」的组**名**。按从 `/etc/group` 解析出的组真实名匹配，因此一台重新编号 gid 的主机仍会被捕获。 |
+
+```toml
+# /etc/census/exposure.toml
+scan_roots   = ["/etc", "/var", "/opt", "/usr/local", "/srv", "/home", "/root"]
+secret_globs = ["/etc/shadow*", "**/*.key", "**/*.pem", "**/id_rsa*", "**/.env*", "**/*credentials*"]
+broad_groups = ["adm", "wheel", "sudo", "staff", "users"]
+```
+
+> 默认的 `**/*.pem` glob 也会匹配公开证书（如 `/etc/ssl/certs`），它们按设计就是全局可读的，
+> 会以低信号的 `secret` 发现浮现——若不需要这种噪声，可收窄 `secret_globs`。见
+> [audit.md §6](audit.md#6-配置--exposuretoml)。
+
+---
+
+## 7. 预览变更 —— diff 模式
 
 `census plan` 打印高层的 create/update/delete 动作。加上 `--diff` 即可看到每个变更将写入
 的**具体产物**，以统一 diff 呈现——当前受管状态对已解析目标：

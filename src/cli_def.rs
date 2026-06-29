@@ -182,6 +182,76 @@ pub enum Command {
         #[command(subcommand)]
         sub: FrameworkSub,
     },
+    /// Read-only exposure audit: report the actual filesystem permission posture
+    /// (`fs`) or what a principal can reach (`expose`). Never mutates. Non-zero
+    /// exit on any high-severity finding.
+    Audit {
+        /// The audit subcommand.
+        #[command(subcommand)]
+        sub: AuditSub,
+    },
+}
+
+/// Output format for the `audit` subcommands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AuditFormat {
+    /// Human-readable lines.
+    Text,
+    /// Machine-readable JSON.
+    Json,
+}
+
+/// Read-only exposure-audit subcommands.
+#[derive(Debug, Subcommand)]
+pub enum AuditSub {
+    /// Global, principal-independent posture map: world-writable objects in
+    /// sensitive trees, the setuid/setgid inventory, world-readable secrets, and
+    /// broad-group-writable objects.
+    Fs {
+        /// Scan root (repeatable). Without any `--root`/`--full`, the configured roots
+        /// are used (or an interactive choice on a TTY). Conflicts with `--full`.
+        #[arg(long, conflicts_with = "full")]
+        root: Vec<std::path::PathBuf>,
+        /// Scan the whole filesystem from `/` (still skips pseudo/network mounts).
+        #[arg(long)]
+        full: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = AuditFormat::Text)]
+        format: AuditFormat,
+        /// Path to the managed registry (used only to mark broad-group-writable
+        /// findings on a Census-managed group as in-model).
+        #[arg(long, default_value = "/var/lib/census/managed.toml")]
+        managed: std::path::PathBuf,
+        /// Path to the exposure config (scan roots, secret globs, broad groups). An
+        /// absent file uses the built-in defaults.
+        #[arg(long, default_value = "/etc/census/exposure.toml")]
+        config: std::path::PathBuf,
+    },
+    /// Per-principal exposure: what the principal can actually reach, with the
+    /// intended baseline subtracted for a Census-managed account.
+    Expose {
+        /// The principal to audit: a login name or a numeric uid.
+        #[arg(long)]
+        principal: String,
+        /// Scan root (repeatable). Without any `--root`/`--full`, the configured roots
+        /// are used (or an interactive choice on a TTY). Conflicts with `--full`.
+        #[arg(long, conflicts_with = "full")]
+        root: Vec<std::path::PathBuf>,
+        /// Scan the whole filesystem from `/` (still skips pseudo/network mounts).
+        #[arg(long)]
+        full: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = AuditFormat::Text)]
+        format: AuditFormat,
+        /// Path to the managed registry (for the intended-baseline subtraction and
+        /// managed-group attribution).
+        #[arg(long, default_value = "/var/lib/census/managed.toml")]
+        managed: std::path::PathBuf,
+        /// Path to the exposure config (scan roots, secret globs). An absent file uses
+        /// the built-in defaults.
+        #[arg(long, default_value = "/etc/census/exposure.toml")]
+        config: std::path::PathBuf,
+    },
 }
 
 /// Framework cross-reference subcommands.

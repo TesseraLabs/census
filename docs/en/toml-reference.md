@@ -14,6 +14,7 @@ Census reads these file kinds:
 | **Catalog permission** (`share/permissions/**/*.toml`) | catalog author | strict | §3 (summary + links) |
 | **Framework** (`frameworks/<fw>/*.toml`) | compliance author | strict | §4 (summary + links) |
 | **Managed registry** (`/var/lib/census/managed.toml`) | **Census only** | — | §5 (do not edit) |
+| **Audit config** (`/etc/census/exposure.toml`) | operator | strict | §6 (optional) |
 
 The authoritative, machine-readable schemas live in `contract/*.schema.json`
 (generated from the parsers, golden-locked). This document is the prose mirror;
@@ -379,7 +380,37 @@ Authoritative schema: `contract/managed-registry.schema.json`.
 
 ---
 
-## 6. Previewing changes — the diff mode
+## 6. Audit config — `/etc/census/exposure.toml`
+
+Optional configuration for the read-only [exposure audit](audit.md)
+(`census audit fs` / `census audit expose`). Parsed **strictly**
+(`deny_unknown_fields`). The file is optional and every key is optional: an absent
+file, or an absent key, falls back to the built-in default. A **present but
+malformed** file is a hard error — never a silent default (a misconfigured
+security tool must fail loudly, not scan the wrong thing while looking healthy).
+Pass a non-default path with `--config`.
+
+| Key | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `scan_roots` | array of path | no | `["/etc","/var","/opt","/usr/local","/srv","/home","/root"]` | Trees the default scan covers. Every entry **must be absolute**; an **empty list is rejected** (a scan of nothing that reports "all clear" is a trap). Overridden per-run by `--root`/`--full`. |
+| `secret_globs` | array of string | no | `["/etc/shadow*","**/*.key","**/*.pem","**/id_rsa*","**/.env*","**/*credentials*"]` | Globs that mark an object **secret-class** (so an `other`-readable match is a `leak`). Each pattern may contain **at most one `**`** (the matcher backtracks across `**`; two would be exponential on a `--full` scan) — a pattern with more is rejected at load. |
+| `broad_groups` | array of string | no | `["adm","wheel","sudo","staff","users"]` | Group **names** treated as "broad" for the broad-group-writable axis. Matched against the group's real name resolved from `/etc/group`, so a host that renumbered the gid is still caught. |
+
+```toml
+# /etc/census/exposure.toml
+scan_roots   = ["/etc", "/var", "/opt", "/usr/local", "/srv", "/home", "/root"]
+secret_globs = ["/etc/shadow*", "**/*.key", "**/*.pem", "**/id_rsa*", "**/.env*", "**/*credentials*"]
+broad_groups = ["adm", "wheel", "sudo", "staff", "users"]
+```
+
+> The default `**/*.pem` glob also matches public certificates (e.g.
+> `/etc/ssl/certs`), which are world-readable by design and surface as low-signal
+> `secret` findings — narrow `secret_globs` if that noise is unwanted. See
+> [audit.md §6](audit.md#6-configuration--exposuretoml).
+
+---
+
+## 7. Previewing changes — the diff mode
 
 `census plan` prints the high-level create/update/delete actions. Add `--diff`
 to see the **concrete artifacts** each change would write, as a unified diff —

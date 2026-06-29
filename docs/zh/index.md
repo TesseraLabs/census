@@ -13,6 +13,8 @@
    （计划性 reconcile、漂移检查、teardown）。从这里开始。
 2. [toml-reference.md](toml-reference.md) —— 完整的 TOML 格式：声明与角色切片的每个
    字段，以及 `plan --diff` 预览模式。
+3. [audit.md](audit.md) —— 只读的**暴露审计**：扫描设备*实际*的文件系统权限，找出某个
+   主体已能触及、超出最小权限的部分（`census audit fs` / `census audit expose`）。
 
 ### 目录 / 包作者 —— 扩展权限目录
 

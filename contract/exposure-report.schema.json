@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExposureReport",
+  "description": "A per-principal exposure report for the JSON / text output.\n\nCarries the (baseline-subtracted) findings plus the managed flag, the DAC-only\ncaveat, and the mounts the walk skipped. Its serialized shape is the locked\n`exposure-report.schema.json` contract.",
+  "type": "object",
+  "properties": {
+    "dac_only_note": {
+      "description": "The DAC-only upper-bound caveat ([`DAC_ONLY_NOTE`]).",
+      "type": "string"
+    },
+    "findings": {
+      "description": "The findings: excess access for a managed principal, raw reachability for a\nnon-managed uid.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Finding"
+      }
+    },
+    "managed": {
+      "description": "Whether the principal is Census-managed (baseline subtraction applied).",
+      "type": "boolean"
+    },
+    "principal": {
+      "description": "The principal the report is for.",
+      "type": "string"
+    },
+    "skipped_mounts": {
+      "description": "Mounts the walk did not descend (network/pseudo), so the reader knows coverage\nwas trimmed.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkippedMount"
+      }
+    }
+  },
+  "required": [
+    "principal",
+    "managed",
+    "findings",
+    "dac_only_note",
+    "skipped_mounts"
+  ],
+  "$defs": {
+    "AclPerms": {
+      "description": "The three POSIX permission bits of one ACL entry.",
+      "type": "object",
+      "properties": {
+        "execute": {
+          "description": "Execute / directory-search permission (`x`).",
+          "type": "boolean"
+        },
+        "read": {
+          "description": "Read permission (`r`).",
+          "type": "boolean"
+        },
+        "write": {
+          "description": "Write permission (`w`).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "read",
+        "write",
+        "execute"
+      ]
+    },
+    "Finding": {
+      "description": "One exposure finding: a reachable access classified, scored, and given a\nremediation path. Serializable for the JSON output (its shape is part of the locked\n`exposure-report.schema.json` contract).",
+      "type": "object",
+      "properties": {
+        "access": {
+          "description": "The principal's effective `read`/`write`/`execute` on the inode.",
+          "$ref": "#/$defs/AclPerms"
+        },
+        "class": {
+          "description": "The inode's object class.",
+          "$ref": "#/$defs/ObjectClass"
+        },
+        "hint": {
+          "description": "The concrete remediation hint.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The exposed inode's absolute path.",
+          "type": "string"
+        },
+        "principal": {
+          "description": "The principal the exposure is under, or `None` in the global posture map.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remediation_class": {
+          "description": "Whether the fix is ambient (manual) or in-model (narrow a declaration).",
+          "$ref": "#/$defs/RemediationClass"
+        },
+        "risk": {
+          "description": "The kind of harm enabled.",
+          "$ref": "#/$defs/Risk"
+        },
+        "severity": {
+          "description": "How urgent the finding is.",
+          "$ref": "#/$defs/Severity"
+        },
+        "via": {
+          "description": "The precedence class that granted the access. Serializes (and is schematized) as\nits single `via` token string (e.g. `acl_user:role-x`), matching the custom\n`Serialize`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "access",
+        "via",
+        "class",
+        "risk",
+        "severity",
+        "remediation_class",
+        "hint"
+      ]
+    },
+    "ObjectClass": {
+      "description": "The security class of an indexed inode, used to derive a finding's risk and\nseverity.\n\nAssigned by [`classify_object`](crate::exposure::classify_object) from a path-glob\ntable plus the setuid/setgid mode bits. The token (`as_str`) is the stable form\nused in JSON output and filters.",
+      "oneOf": [
+        {
+          "description": "A cron job or spool entry (scheduled execution as another user).",
+          "type": "string",
+          "const": "cron"
+        },
+        {
+          "description": "A systemd unit file (defines a privileged service).",
+          "type": "string",
+          "const": "systemd-unit"
+        },
+        {
+          "description": "A binary on a system `PATH` directory (run by other users/services).",
+          "type": "string",
+          "const": "path-binary"
+        },
+        {
+          "description": "The sudoers policy (`/etc/sudoers` and drop-ins).",
+          "type": "string",
+          "const": "sudoers"
+        },
+        {
+          "description": "A security-relevant configuration file.",
+          "type": "string",
+          "const": "config"
+        },
+        {
+          "description": "A secret-bearing object (key, credential, shadow).",
+          "type": "string",
+          "const": "secret"
+        },
+        {
+          "description": "A setuid/setgid binary (runs with elevated identity).",
+          "type": "string",
+          "const": "setuid-binary"
+        },
+        {
+          "description": "Anything not matched by a more specific class.",
+          "type": "string",
+          "const": "generic"
+        }
+      ]
+    },
+    "RemediationClass": {
+      "description": "How a finding should be remediated.",
+      "oneOf": [
+        {
+          "description": "The access comes from a foreign object Census does not own (its mode / owner /\nACL). Census cannot fix it by changing a declaration; the hint is a manual\n`chmod` / `setfacl`.",
+          "type": "string",
+          "const": "ambient"
+        },
+        {
+          "description": "The access comes from an object Census owns (a managed group, or a path under a\nCensus file-access grant). The hint is to narrow the declaration.",
+          "type": "string",
+          "const": "in-model"
+        }
+      ]
+    },
+    "Risk": {
+      "description": "The kind of harm an exposure enables.",
+      "oneOf": [
+        {
+          "description": "Write access that lets the principal gain higher privilege (run code as\nanother user / root: cron, sudoers, units, path binaries, setuid, secrets).",
+          "type": "string",
+          "const": "escalation"
+        },
+        {
+          "description": "Read access to a secret-bearing object (credential disclosure).",
+          "type": "string",
+          "const": "leak"
+        },
+        {
+          "description": "Write access that lets the principal corrupt configuration or data without a\ndirect privilege gain.",
+          "type": "string",
+          "const": "tamper"
+        }
+      ]
+    },
+    "Severity": {
+      "description": "How urgently a finding warrants attention.",
+      "oneOf": [
+        {
+          "description": "Direct, high-impact exposure (escalation on a privileged class, secret leak).",
+          "type": "string",
+          "const": "high"
+        },
+        {
+          "description": "Meaningful but bounded (tamper of a security-relevant config).",
+          "type": "string",
+          "const": "medium"
+        },
+        {
+          "description": "Low-impact (world-writable generic / scratch object).",
+          "type": "string",
+          "const": "low"
+        }
+      ]
+    },
+    "SkippedMount": {
+      "description": "A mount point the walk did not descend, recorded so the operator knows coverage\nwas trimmed (a silent blind spot is unacceptable in a security audit).",
+      "type": "object",
+      "properties": {
+        "fstype": {
+          "description": "The filesystem type that caused the skip (a network or pseudo type).",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute mount-point path that was not descended.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "fstype"
+      ]
+    }
+  }
+}

@@ -45,6 +45,8 @@ pub mod coverage;
 pub mod declaration;
 /// Doctor (drift) report types surfaced by `cli`.
 pub mod doctor;
+/// Read-only exposure audit: permission index of actual filesystem rights.
+pub mod exposure;
 /// File-access enforcement SPI + the open ACL backend.
 pub mod fileaccess;
 /// Compliance-framework manifests and control cross-reference.

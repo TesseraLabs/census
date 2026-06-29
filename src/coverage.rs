@@ -1013,7 +1013,7 @@ fn config_in_scope(path: &str, grants: &[ResolvedFileGrant]) -> bool {
 /// matches `/etc/ssh` and `/etc/ssh/sshd_config` but NOT `/etc/sshd_other`
 /// (which merely shares a textual prefix). The bare `/etc/sudoers` file and the
 /// `/etc/sudoers.d` directory are distinct entries so both are covered.
-fn is_security_relevant_config(path: &str) -> bool {
+pub(crate) fn is_security_relevant_config(path: &str) -> bool {
     SECURITY_RELEVANT_CONFIG_PREFIXES
         .iter()
         .any(|prefix| catalog::path_at_or_under(prefix, path))

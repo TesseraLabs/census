@@ -17,7 +17,7 @@
 
 use std::io::IsTerminal;
 
-use census::cli_def::{CatalogSub, Cli, Command, FrameworkSub};
+use census::cli_def::{AuditSub, CatalogSub, Cli, Command, FrameworkSub};
 use census::coverage::SurfaceClass;
 use clap::Parser;
 
@@ -372,13 +372,81 @@ fn main() -> std::process::ExitCode {
                 )
             }
         },
+        Command::Audit { sub } => match sub {
+            AuditSub::Fs {
+                root,
+                full,
+                format,
+                managed,
+                config,
+            } => census::cli::run_audit_fs(census::cli::AuditFsOpts {
+                roots: root,
+                full,
+                format,
+                managed,
+                config,
+            }),
+            AuditSub::Expose {
+                principal,
+                root,
+                full,
+                format,
+                managed,
+                config,
+            } => census::cli::run_audit_expose(census::cli::AuditExposeOpts {
+                principal,
+                roots: root,
+                full,
+                format,
+                managed,
+                config,
+            }),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::catalog_roots_with_overrides;
+    use census::cli_def::Cli;
+    use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn audit_root_and_full_conflict() {
+        // `--root` and `--full` are mutually exclusive (clap `conflicts_with`), so
+        // giving both is a parse error rather than `--full` being silently ignored.
+        let err = Cli::try_parse_from(["census", "audit", "fs", "--root", "/etc", "--full"])
+            .expect_err("--root with --full must be a conflict error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        // Each alone parses fine.
+        assert!(Cli::try_parse_from(["census", "audit", "fs", "--root", "/etc"]).is_ok());
+        assert!(Cli::try_parse_from(["census", "audit", "fs", "--full"]).is_ok());
+        // The conflict also holds for `expose`.
+        assert!(Cli::try_parse_from([
+            "census",
+            "audit",
+            "expose",
+            "--principal",
+            "svc",
+            "--root",
+            "/etc",
+            "--full",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn audit_format_defaults_to_text() {
+        // `--format` is a ValueEnum defaulting to `text`.
+        let cli = Cli::try_parse_from(["census", "audit", "fs"]).expect("parses with defaults");
+        match cli.command {
+            census::cli_def::Command::Audit {
+                sub: census::cli_def::AuditSub::Fs { format, .. },
+            } => assert_eq!(format, census::cli_def::AuditFormat::Text),
+            _ => panic!("expected audit fs"),
+        }
+    }
 
     #[test]
     fn defaults_used_when_no_flags() {
