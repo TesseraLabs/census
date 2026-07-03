@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub use audit::{
-    render_expose_json, render_expose_text, render_fs_json, render_fs_text, run_audit_expose,
-    run_audit_fs, AuditExposeOpts, AuditFsOpts,
+    render_expose_json, render_expose_text, render_fs_json, render_fs_text, resolve_mac_provider,
+    run_audit_expose, run_audit_fs, AuditError, AuditExposeOpts, AuditFsOpts,
 };
 pub use compile::{
     compile_role, render_compile_human, render_compile_json, render_show_framework_human,

