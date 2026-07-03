@@ -9,7 +9,7 @@
 //! reachability — so every [`Finding`] carries `principal = None`:
 //!
 //! 1. **world-writable** in a sensitive tree (a classified, non-generic, non-setuid
-//!    object with the other-write bit) — risk/severity from the Срез-3 tables.
+//!    object with the other-write bit) — risk/severity from the taxonomy tables.
 //! 2. **setuid/setgid inventory** — every `SetuidBinary`, reported as an escalation
 //!    surface; one that is ALSO world-writable is critical (High vs Medium).
 //! 3. **world-readable secret** — a `Secret` with the other-read bit — a leak.
@@ -42,6 +42,7 @@ use crate::inspect::SystemInspector;
 use super::access::AccessVia;
 use super::acl::{AclPerms, AclTag};
 use super::index::{InodeRecord, PermissionIndex};
+use super::mac::{MacFinding, MacProvider};
 use super::taxonomy::{
     derive_risk, derive_severity, remediation, Finding, RemediationClass, RemediationContext, Risk,
     Severity,
@@ -66,12 +67,19 @@ pub const DEFAULT_BROAD_GROUPS: &[&str] = &["adm", "wheel", "sudo", "staff", "us
 /// `broad_groups` is the set of wide group NAMES to flag; the owning group's name is
 /// resolved from the real `/etc/group` via `inspector` (best-effort — a gid with no
 /// group entry is skipped), so the match is by name and survives a renumbered group.
+///
+/// `mac` is the MAC-provider seam. This map is principal-independent, so — unlike the
+/// per-principal expose engine — the provider never suppresses a finding (there is no
+/// principal to evaluate `permits` for): it only **annotates** each labeled object with
+/// its rendered label. Under the null provider (open-build default) nothing is
+/// annotated and the output is unchanged.
 #[must_use]
 pub fn audit_fs(
     index: &PermissionIndex,
     ctx: &dyn RemediationContext,
     broad_groups: &[String],
     inspector: &dyn SystemInspector,
+    mac: &dyn MacProvider,
 ) -> Vec<Finding> {
     let mut candidates: Vec<Finding> = Vec::new();
     for record in index.records() {
@@ -81,7 +89,32 @@ pub fn audit_fs(
         collect_world_readable_secret(record, class, ctx, &mut candidates);
         collect_broad_group_writable(record, class, ctx, broad_groups, inspector, &mut candidates);
     }
-    dedup_keep_severest(candidates)
+    annotate_posture(dedup_keep_severest(candidates), mac)
+}
+
+/// Annotate each finding whose object the provider labels with the object's rendered
+/// label (posture mode: no principal, so no permit check and no suppression).
+///
+/// Under an inactive provider (the null default) this is a no-op — every finding keeps
+/// `mac = None`, so the output is identical to a build with no MAC provider. When active,
+/// a labeled object gains a [`MacFinding`] carrying the system and the rendered label with
+/// an empty `reachable_in` (the posture shape); an unlabeled object stays `mac = None`.
+fn annotate_posture(mut findings: Vec<Finding>, mac: &dyn MacProvider) -> Vec<Finding> {
+    if !mac.is_active() {
+        return findings;
+    }
+    let system = mac.system();
+    for finding in &mut findings {
+        if let Some(label) = mac.object_label(&finding.path) {
+            finding.mac = Some(MacFinding {
+                system,
+                object_label: Some(mac.render_label(label)),
+                // Principal-independent posture: no context to evaluate, so empty.
+                reachable_in: Vec::new(),
+            });
+        }
+    }
+    findings
 }
 
 /// World-writable in a sensitive tree: a classified, non-generic, non-setuid object
@@ -118,17 +151,16 @@ fn collect_setuid(record: &InodeRecord, class: ObjectClass, out: &mut Vec<Findin
     };
     // The setuid bit is a property of the foreign object; Census never sets it, so the
     // fix is always a manual investigation/chmod — never in-model.
+    // Single-quote the scanned path for the pasteable `chmod` command: it comes from
+    // an attacker-influenced tree and must not carry a live shell metacharacter.
+    let quoted = super::shell_quote(&record.path);
     let hint = if writable {
         format!(
             "writable setuid/setgid binary — remove world write manually \
-             (`chmod o-w {path}`) and investigate why it is writable",
-            path = record.path
+             (`chmod o-w {quoted}`) and investigate why it is writable"
         )
     } else {
-        format!(
-            "setuid/setgid binary — verify it is expected and package-owned: `{path}`",
-            path = record.path
-        )
+        format!("setuid/setgid binary — verify it is expected and package-owned: `{quoted}`")
     };
     out.push(Finding {
         principal: None,
@@ -140,6 +172,8 @@ fn collect_setuid(record: &InodeRecord, class: ObjectClass, out: &mut Vec<Findin
         severity,
         remediation_class: RemediationClass::Ambient,
         hint,
+        // Principal-independent posture map: no MAC refinement here.
+        mac: None,
     });
 }
 
@@ -222,7 +256,7 @@ fn owning_group_perms(record: &InodeRecord) -> AclPerms {
     group_obj.masked(mask)
 }
 
-/// Build a finding whose risk/severity come from the Срез-3 tables and whose
+/// Build a finding whose risk/severity come from the taxonomy tables and whose
 /// remediation comes from [`remediation`], pushing it only if the access is a
 /// reportable risk.
 fn push_table_finding(
@@ -248,6 +282,8 @@ fn push_table_finding(
         severity,
         remediation_class,
         hint,
+        // Principal-independent posture map: no MAC refinement here.
+        mac: None,
     });
 }
 
@@ -316,7 +352,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::exposure::index::{FakeWalker, InodeStat};
-    use crate::exposure::{AclEntries, AclEntry, FakeAclSource, NoManagedContext};
+    use crate::exposure::{
+        AclEntries, AclEntry, FakeAclSource, FakeMacProvider, MacLabelId, MacSystem,
+        NoManagedContext, NullMacProvider,
+    };
     use crate::inspect::{FakeInspector, GroupFacts};
 
     /// A managed-context fake: the named groups are Census-managed.
@@ -401,9 +440,10 @@ mod tests {
         insp
     }
 
-    /// Run the posture map with the default broad groups and the fake group database.
+    /// Run the posture map with the default broad groups and the fake group database,
+    /// under the null MAC provider (open-build default).
     fn run(index: &PermissionIndex, ctx: &dyn RemediationContext) -> Vec<Finding> {
-        audit_fs(index, ctx, &broad_groups(), &inspector())
+        audit_fs(index, ctx, &broad_groups(), &inspector(), &NullMacProvider)
     }
 
     /// Run with a custom group database (for the renumbered-group test).
@@ -416,7 +456,7 @@ mod tests {
             groups,
             ..FakeInspector::default()
         };
-        audit_fs(index, ctx, &broad_groups(), &insp)
+        audit_fs(index, ctx, &broad_groups(), &insp, &NullMacProvider)
     }
 
     #[test]
@@ -654,5 +694,75 @@ mod tests {
         assert!(vias.contains("other_bits"), "world-writable axis fired");
         assert!(vias.contains("group:staff"), "broad-group axis fired");
         assert_eq!(vias.len(), 2, "two distinct sources, no extra dups");
+    }
+
+    // --- posture MAC annotation (no suppression) ---
+
+    #[test]
+    fn posture_annotates_labeled_object_without_suppression() {
+        // A world-writable cron object is a real posture finding. An active provider that
+        // labels it annotates the finding with the rendered label and an EMPTY
+        // reachable_in (posture mode has no principal), and never suppresses it.
+        let index = index_of(vec![stat("/var/spool/cron", 0, 0o040_777)]);
+        let label = MacLabelId::new(1);
+        let mut mac = FakeMacProvider::new(MacSystem::Parsec);
+        mac.with_label("/var/spool/cron", label, "cron_spool_t");
+        let findings = audit_fs(
+            &index,
+            &NoManagedContext,
+            &broad_groups(),
+            &inspector(),
+            &mac,
+        );
+        let f =
+            find(&findings, "/var/spool/cron").expect("posture finding present (not suppressed)");
+        let ann = f.mac.as_ref().expect("labeled object is annotated");
+        assert_eq!(ann.system, MacSystem::Parsec);
+        assert_eq!(ann.object_label.as_deref(), Some("cron_spool_t"));
+        assert!(
+            ann.reachable_in.is_empty(),
+            "posture mode carries no reachability contexts"
+        );
+    }
+
+    #[test]
+    fn posture_leaves_unlabeled_object_unannotated() {
+        // An active provider that labels nothing leaves the finding intact and
+        // unannotated — posture never suppresses, and there is no label to attach.
+        let index = index_of(vec![stat("/var/spool/cron", 0, 0o040_777)]);
+        let mac = FakeMacProvider::new(MacSystem::Selinux);
+        let findings = audit_fs(
+            &index,
+            &NoManagedContext,
+            &broad_groups(),
+            &inspector(),
+            &mac,
+        );
+        let f = find(&findings, "/var/spool/cron").expect("finding present");
+        assert!(
+            f.mac.is_none(),
+            "an unlabeled object carries no MAC annotation"
+        );
+    }
+
+    #[test]
+    fn posture_null_provider_annotates_nothing() {
+        // Snapshot parity: the null provider annotates nothing and the serialized finding
+        // omits the `mac` key entirely.
+        let index = index_of(vec![stat("/var/spool/cron", 0, 0o040_777)]);
+        let findings = audit_fs(
+            &index,
+            &NoManagedContext,
+            &broad_groups(),
+            &inspector(),
+            &NullMacProvider,
+        );
+        let f = find(&findings, "/var/spool/cron").expect("finding present");
+        assert!(f.mac.is_none(), "null provider annotates nothing");
+        let json = serde_json::to_string(f).expect("serialize finding");
+        assert!(
+            !json.contains("\"mac\""),
+            "mac key omitted under the null provider: {json}"
+        );
     }
 }

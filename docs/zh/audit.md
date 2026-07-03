@@ -77,9 +77,10 @@ sudo census audit expose --principal daemon --root /etc --root /var/spool
 
 ### 2.2 裁决仅基于 DAC —— 一个诚实的上界
 
-`audit` 只求值**自主**访问控制（DAC）：模式位、属主与 POSIX ACL。它**不**建模强制访问控制
-（SELinux、AppArmor，或 Astra 的 PARSEC 强制完整性）。MAC 层可能进一步限制访问，因此裁决
-是一个**上界**——「在 DAC 下可达」。每份 `expose` 报告都会声明这一点。
+在开源版本（open build）中，`audit` 只求值**自主**访问控制（DAC）：模式位、属主与
+POSIX ACL。它**不**建模强制访问控制（SELinux、AppArmor，或 Astra 的 PARSEC 强制完整性）。
+MAC 层可能进一步限制访问，因此裁决是一个**上界**——「在 DAC 下可达」。每份 `expose` 报告
+都会声明这一点。若要针对主机的 MAC 细化裁决，见 §2.4。
 
 ### 2.3 关键过滤器 —— 对受管账户只显示*超额*部分
 
@@ -90,6 +91,26 @@ sudo census audit expose --principal daemon --root /etc --root /var/spool
 
 这正是 `expose` 之所以是 Census 特有、而非通用权限扫描器的原因：它知道账户*本应*拥有什么，
 并把差额展示给你。
+
+### 2.4 MAC 感知的裁决（企业版）
+
+开源版本仅基于 DAC（§2.2）。一个**商业 MAC 提供方**可以针对主机的强制访问控制细化裁决——
+目前是 Astra PARSEC，之后是 SELinux——通过一个与 MAC 系统无关的接缝（seam），因此同一套审计
+可跨 MAC 系统工作。当某个提供方处于激活状态时：
+
+- 一条 DAC 可达的发现，若 MAC **在主体可能承担的每一个安全上下文中都将其阻断**，则会被
+  **抑制**——它是可证明不可达的，而不只是一个上界。一条在某个上下文中仍可达的发现会被保留，
+  并以那些上下文标注。
+- 每条发现都会获得一个 `mac` 字段：`{ system, object_label, reachable_in }`（当没有提供方或
+  对象无标签时则为 `null`）。在 `audit fs`（态势）模式下没有主体，因此提供方只**标注**每个
+  对象的标签——它绝不抑制。
+- 报告的说明从仅基于 DAC 的告诫变为 `DAC + <system>`。
+
+强制规则（PARSEC 完整性/机密性、SELinux 类型强制）完全存在于商业提供方之中——开源核心不
+携带任何 MAC 逻辑，也不依赖 `libpdp`/`libselinux`。在**开源版本**中，`--mac` 会带着
+「no MAC backend in this build」失败关闭（fail closed），而不是无声地什么都不做；在没有所
+请求的 MAC 系统的主机上，提供方是一个 no-op，裁决保持仅基于 DAC。审计保持**只读**——它检视
+标签，绝不设置标签。
 
 ---
 
@@ -162,6 +183,7 @@ census audit expose  --principal <name|uid>
 | `--format text\|json` | 输出格式。`text`（默认）人类可读；`json` 是输出到 stdout 的稳定、schema 锁定的契约。 |
 | `--config <PATH>` | 审计配置（默认 `/etc/census/exposure.toml`）；文件不存在 ⇒ 使用内置默认值。 |
 | `--managed <PATH>` | 受管注册表（默认 `/var/lib/census/managed.toml`），用于受管账户基线。 |
+| `--mac` | 针对主机的 MAC 细化裁决（§2.4）。需要一个商业 MAC 提供方；在开源版本中会带着「no MAC backend in this build」失败关闭。 |
 
 **默认范围**是一组精选的安全相关目录树（`/etc`、`/var`、`/opt`、`/usr/local`、`/srv`、
 `/home`、`/root`）。伪文件系统（`/proc`、`/sys`、`/dev`、`/run`）与**网络挂载**始终被跳过

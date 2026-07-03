@@ -21,7 +21,8 @@ use std::process::ExitCode;
 use crate::cli_def::AuditFormat;
 use crate::exposure::{
     audit_fs, exposure_report, resolve_principal, ExposureConfig, ExposureReport, Finding,
-    ManagedContext, PermissionIndex, Reachability, Severity, SkippedMount,
+    MacProvider, ManagedContext, NullMacProvider, PermissionIndex, Reachability, Severity,
+    SkippedMount,
 };
 use crate::inspect::LiveInspector;
 use crate::state::RegistryState;
@@ -39,6 +40,9 @@ pub struct AuditFsOpts {
     pub managed: PathBuf,
     /// `exposure.toml` config path (scan scope, secret globs, broad groups).
     pub config: PathBuf,
+    /// `--mac`: refine against mandatory access control (fails closed in the open
+    /// build, which links no MAC backend).
+    pub mac: bool,
 }
 
 /// Options for `census audit expose` (CLI-derived).
@@ -56,6 +60,43 @@ pub struct AuditExposeOpts {
     pub managed: PathBuf,
     /// `exposure.toml` config path (scan scope, secret globs).
     pub config: PathBuf,
+    /// `--mac`: refine against mandatory access control (fails closed in the open
+    /// build, which links no MAC backend).
+    pub mac: bool,
+}
+
+/// Why selecting a MAC provider for an audit run failed.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AuditError {
+    /// `--mac` was requested but this build links no MAC backend.
+    #[error("no MAC backend in this build")]
+    NoMacBackend,
+}
+
+/// Select the MAC provider for an audit run — the overlay injection point.
+///
+/// The open build links no MAC backend, so this has exactly two outcomes: `--mac`
+/// requested fails closed with [`AuditError::NoMacBackend`] (an honest error rather than
+/// silently doing nothing), and `--mac` absent yields the neutral [`NullMacProvider`],
+/// under which the audit is DAC-only and behaviourally unchanged.
+///
+/// This function is the seam the enterprise overlay patches: its body is replaced with
+/// real backend selection (host MAC detection, provider construction), while the
+/// signature stays fixed so the call sites and the `--mac` contract do not move. A
+/// non-MAC host under a real build then returns a no-op provider, keeping the note
+/// DAC-only.
+///
+/// # Errors
+///
+/// Returns [`AuditError::NoMacBackend`] when `--mac` is requested but no MAC backend is
+/// linked into this build.
+pub fn resolve_mac_provider(mac_requested: bool) -> Result<Box<dyn MacProvider>, AuditError> {
+    if mac_requested {
+        Err(AuditError::NoMacBackend)
+    } else {
+        Ok(Box::new(NullMacProvider))
+    }
 }
 
 /// Run `census audit fs`: build the live permission index over the resolved scope
@@ -74,6 +115,16 @@ pub fn run_audit_fs(opts: AuditFsOpts) -> ExitCode {
         eprintln!("census: {e}");
         return ExitCode::FAILURE;
     }
+    // Resolve the MAC provider before any filesystem walk: `--mac` is pure argument
+    // validation and, in the open build, an immediate error — failing fast keeps
+    // `audit fs --mac --full` from walking the whole filesystem only to then reject it.
+    let mac = match resolve_mac_provider(opts.mac) {
+        Ok(mac) => mac,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let index = match PermissionIndex::live(&roots, &config.classifier()) {
         Ok(index) => index,
         Err(e) => {
@@ -90,13 +141,22 @@ pub fn run_audit_fs(opts: AuditFsOpts) -> ExitCode {
     };
     let ctx = ManagedContext::global(&state);
     let inspector = LiveInspector::new();
-    let findings = audit_fs(&index, &ctx, &config.broad_groups, &inspector);
+    let findings = audit_fs(&index, &ctx, &config.broad_groups, &inspector, mac.as_ref());
+    let note = mac_note(mac.as_ref());
     let output = match opts.format {
-        AuditFormat::Text => render_fs_text(&findings, index.skipped_mounts()),
-        AuditFormat::Json => render_fs_json(&findings, index.skipped_mounts()),
+        AuditFormat::Text => render_fs_text(&findings, index.skipped_mounts(), note.as_deref()),
+        AuditFormat::Json => render_fs_json(&findings, index.skipped_mounts(), note.as_deref()),
     };
     print!("{output}");
     audit_exit_code(&findings)
+}
+
+/// The verdict note for a posture (`audit fs`) report: `DAC + <system>` when a real MAC
+/// provider is active, or `None` (no note) under the null provider — keeping the
+/// open-build output unchanged.
+fn mac_note(mac: &dyn MacProvider) -> Option<String> {
+    mac.is_active()
+        .then(|| format!("DAC + {}", mac.system().as_str()))
 }
 
 /// Run `census audit expose`: resolve the principal, build the live index, compute
@@ -123,6 +183,17 @@ pub fn run_audit_expose(opts: AuditExposeOpts) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+    // The MAC provider is chosen at the overlay seam: the open build fails `--mac`
+    // closed and otherwise yields the null provider (DAC-only, no refinement).
+    // Resolve it before the filesystem walk so `--mac` fails fast rather than after
+    // scanning the whole tree.
+    let mac = match resolve_mac_provider(opts.mac) {
+        Ok(mac) => mac,
+        Err(e) => {
+            eprintln!("census: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let index = match PermissionIndex::live(&roots, &config.classifier()) {
         Ok(index) => index,
         Err(e) => {
@@ -138,7 +209,14 @@ pub fn run_audit_expose(opts: AuditExposeOpts) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = exposure_report(&index, &principal, &roots, &reachability, &state);
+    let report = exposure_report(
+        &index,
+        &principal,
+        &roots,
+        &reachability,
+        &state,
+        mac.as_ref(),
+    );
     let output = match opts.format {
         AuditFormat::Text => render_expose_text(&report),
         AuditFormat::Json => render_expose_json(&report),
@@ -265,9 +343,22 @@ fn skipped_notice(skipped: &[SkippedMount]) -> String {
 }
 
 /// Render the `audit fs` posture map as human-readable lines. Pure.
+///
+/// `note` is the verdict caveat printed when a real MAC provider is active
+/// (`DAC + <system>`); `None` (the open-build default) prints no note line, keeping the
+/// output unchanged.
 #[must_use]
-pub fn render_fs_text(findings: &[Finding], skipped: &[SkippedMount]) -> String {
+pub fn render_fs_text(
+    findings: &[Finding],
+    skipped: &[SkippedMount],
+    note: Option<&str>,
+) -> String {
     let mut out = String::new();
+    if let Some(note) = note {
+        out.push_str("note: ");
+        out.push_str(note);
+        out.push('\n');
+    }
     if findings.is_empty() {
         out.push_str("audit fs: no dangerous permission classes found\n");
     } else {
@@ -280,14 +371,25 @@ pub fn render_fs_text(findings: &[Finding], skipped: &[SkippedMount]) -> String 
     out
 }
 
-/// Render the `audit fs` posture map as JSON `{ findings, skipped_mounts }`. Pure;
-/// emits only finding metadata (never file content).
+/// Render the `audit fs` posture map as JSON `{ findings, skipped_mounts }` (plus a
+/// `note` when a real MAC provider is active). Pure; emits only finding metadata (never
+/// file content).
 #[must_use]
-pub fn render_fs_json(findings: &[Finding], skipped: &[SkippedMount]) -> String {
-    let value = serde_json::json!({
+pub fn render_fs_json(
+    findings: &[Finding],
+    skipped: &[SkippedMount],
+    note: Option<&str>,
+) -> String {
+    let mut value = serde_json::json!({
         "findings": findings,
         "skipped_mounts": skipped,
     });
+    if let (Some(note), Some(obj)) = (note, value.as_object_mut()) {
+        obj.insert(
+            "note".to_owned(),
+            serde_json::Value::String(note.to_owned()),
+        );
+    }
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned())
 }
 
@@ -346,6 +448,7 @@ mod tests {
             severity,
             remediation_class: RemediationClass::Ambient,
             hint: "remove world write manually: `chmod o-w <path>`".to_owned(),
+            mac: None,
         }
     }
 
@@ -391,7 +494,7 @@ mod tests {
             Risk::Leak,
             Severity::High,
         )];
-        let text = render_fs_text(&findings, &[]);
+        let text = render_fs_text(&findings, &[], None);
         assert!(text.contains("/etc/shadow"), "{text}");
         assert!(text.contains("secret"), "class is shown: {text}");
         assert!(text.contains("high"), "severity is shown");
@@ -411,7 +514,7 @@ mod tests {
             Risk::Escalation,
             Severity::High,
         )];
-        let json = render_fs_json(&findings, &[]);
+        let json = render_fs_json(&findings, &[], None);
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["findings"][0]["path"], "/var/spool/cron");
         assert_eq!(value["findings"][0]["class"], "cron");
@@ -433,7 +536,7 @@ mod tests {
                 Risk::Escalation,
                 Severity::High,
             )],
-            dac_only_note: crate::exposure::DAC_ONLY_NOTE,
+            dac_only_note: crate::exposure::DAC_ONLY_NOTE.to_owned(),
             skipped_mounts: vec![],
         };
         let text = render_expose_text(&report);
@@ -449,7 +552,7 @@ mod tests {
             principal: "svc".to_owned(),
             managed: false,
             findings: vec![],
-            dac_only_note: crate::exposure::DAC_ONLY_NOTE,
+            dac_only_note: crate::exposure::DAC_ONLY_NOTE.to_owned(),
             skipped_mounts: vec![SkippedMount {
                 path: "/mnt/share".to_owned(),
                 fstype: "nfs4".to_owned(),
@@ -489,5 +592,65 @@ mod tests {
         assert!(ensure_absolute_roots(&[PathBuf::from("/etc"), PathBuf::from("rel")]).is_err());
         // All-absolute roots pass.
         assert!(ensure_absolute_roots(&[PathBuf::from("/etc"), PathBuf::from("/opt")]).is_ok());
+    }
+
+    // --- MAC provider gating (--mac) ---
+
+    #[test]
+    fn mac_flag_in_open_build_fails_closed() {
+        // The open build links no MAC backend, so `--mac` is an honest error, not a
+        // silent no-op.
+        let Err(err) = resolve_mac_provider(true) else {
+            panic!("open build must reject --mac, not return a provider");
+        };
+        assert!(matches!(err, AuditError::NoMacBackend));
+        assert_eq!(err.to_string(), "no MAC backend in this build");
+    }
+
+    #[test]
+    fn no_mac_flag_yields_inactive_null_provider() {
+        // Without `--mac` the seam returns the neutral provider — DAC-only, unchanged.
+        let provider = resolve_mac_provider(false).expect("null provider is always available");
+        assert!(
+            !provider.is_active(),
+            "the default provider signals no real MAC backend"
+        );
+    }
+
+    #[test]
+    fn mac_note_is_none_under_null_and_set_when_active() {
+        // Snapshot parity: the null provider produces no posture note; an active
+        // provider produces `DAC + <system>`.
+        assert_eq!(mac_note(&NullMacProvider), None);
+        let active = crate::exposure::FakeMacProvider::new(crate::exposure::MacSystem::Parsec);
+        assert_eq!(mac_note(&active).as_deref(), Some("DAC + parsec"));
+    }
+
+    #[test]
+    fn mac_flag_parses_on_both_audit_subcommands() {
+        use crate::cli_def::{AuditSub, Cli, Command};
+        use clap::Parser;
+
+        let parse = |args: &[&str]| Cli::try_parse_from(args).expect("valid args");
+        // `audit fs --mac` sets the flag; absent it defaults to false.
+        match parse(&["census", "audit", "fs", "--mac"]).command {
+            Command::Audit {
+                sub: AuditSub::Fs { mac, .. },
+            } => assert!(mac, "--mac parsed on `audit fs`"),
+            other => panic!("expected audit fs, got {other:?}"),
+        }
+        match parse(&["census", "audit", "fs"]).command {
+            Command::Audit {
+                sub: AuditSub::Fs { mac, .. },
+            } => assert!(!mac, "--mac defaults off on `audit fs`"),
+            other => panic!("expected audit fs, got {other:?}"),
+        }
+        // `audit expose --principal <p> --mac`.
+        match parse(&["census", "audit", "expose", "--principal", "svc", "--mac"]).command {
+            Command::Audit {
+                sub: AuditSub::Expose { mac, .. },
+            } => assert!(mac, "--mac parsed on `audit expose`"),
+            other => panic!("expected audit expose, got {other:?}"),
+        }
     }
 }

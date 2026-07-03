@@ -379,12 +379,14 @@ fn main() -> std::process::ExitCode {
                 format,
                 managed,
                 config,
+                mac,
             } => census::cli::run_audit_fs(census::cli::AuditFsOpts {
                 roots: root,
                 full,
                 format,
                 managed,
                 config,
+                mac,
             }),
             AuditSub::Expose {
                 principal,
@@ -393,6 +395,7 @@ fn main() -> std::process::ExitCode {
                 format,
                 managed,
                 config,
+                mac,
             } => census::cli::run_audit_expose(census::cli::AuditExposeOpts {
                 principal,
                 roots: root,
@@ -400,6 +403,7 @@ fn main() -> std::process::ExitCode {
                 format,
                 managed,
                 config,
+                mac,
             }),
         },
     }

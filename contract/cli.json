@@ -118,6 +118,15 @@
               "num_args": null
             },
             {
+              "id": "mac",
+              "long": "mac",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
               "id": "managed",
               "long": "managed",
               "takes_value": true,
@@ -172,6 +181,15 @@
             {
               "id": "full",
               "long": "full",
+              "takes_value": false,
+              "required": false,
+              "default": null,
+              "repeatable": false,
+              "num_args": null
+            },
+            {
+              "id": "mac",
+              "long": "mac",
               "takes_value": false,
               "required": false,
               "default": null,

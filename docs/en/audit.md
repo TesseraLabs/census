@@ -90,11 +90,11 @@ rule.
 
 ### 2.2 The verdict is DAC-only — an honest upper bound
 
-`audit` evaluates **discretionary** access control only: mode bits, ownership and
-POSIX ACLs. It does **not** model mandatory access control (SELinux, AppArmor, or
-Astra's PARSEC mandatory integrity). A MAC layer can restrict access further, so the
-verdict is an **upper bound** — "reachable under DAC". Every `expose` report states
-this.
+In the open build `audit` evaluates **discretionary** access control only: mode
+bits, ownership and POSIX ACLs. It does **not** model mandatory access control
+(SELinux, AppArmor, or Astra's PARSEC). A MAC layer can restrict access further, so
+the verdict is an **upper bound** — "reachable under DAC". Every `expose` report
+states this. To refine the verdict against the host's MAC, see §2.4.
 
 ### 2.3 The killer filter — only the *excess* for a managed account
 
@@ -108,6 +108,30 @@ subtract, so the raw reachability is shown.
 This is what makes `expose` Census-specific rather than a generic permission
 scanner: it knows what the account was *supposed* to have, and shows you the
 difference.
+
+### 2.4 MAC-aware verdict (enterprise)
+
+The open build is DAC-only (§2.2). A **commercial MAC provider** can refine the
+verdict against the host's mandatory access control — Astra PARSEC today, SELinux
+later — through a MAC-system-neutral seam, so the same audit works across MAC
+systems. With a provider active:
+
+- A DAC-reachable finding that MAC blocks **in every security context the principal
+  can assume** is **suppressed** — it is provably unreachable, not just an upper
+  bound. A finding still reachable in some context is kept and annotated with those
+  context(s).
+- Each finding gains a `mac` field: `{ system, object_label, reachable_in }` (or
+  `null` when there is no provider or the object is unlabeled). In `audit fs`
+  (posture) mode there is no principal, so the provider only **annotates** each
+  object's label — it never suppresses.
+- The report note changes from the DAC-only caveat to `DAC + <system>`.
+
+The mandatory rules (PARSEC integrity/confidentiality, SELinux type-enforcement)
+live entirely in the commercial provider — the open core carries no MAC logic and no
+`libpdp`/`libselinux` dependency. `--mac` in the **open build** fails closed with
+"no MAC backend in this build" rather than silently doing nothing; on a host without
+the requested MAC system the provider is a no-op and the verdict stays DAC-only. The
+audit stays **read-only** — it inspects labels, never sets them.
 
 ---
 
@@ -187,6 +211,7 @@ census audit expose  --principal <name|uid>
 | `--format text\|json` | Output format. `text` (default) is human-readable; `json` is a stable, schema-locked contract on stdout. |
 | `--config <PATH>` | Audit config (default `/etc/census/exposure.toml`); absent file ⇒ built-in defaults. |
 | `--managed <PATH>` | Managed registry (default `/var/lib/census/managed.toml`), for the managed-account baseline. |
+| `--mac` | Refine the verdict against the host's MAC (§2.4). Requires a commercial MAC provider; in the open build it fails closed with "no MAC backend in this build". |
 
 **Default scope** is a curated set of security-relevant trees (`/etc`, `/var`,
 `/opt`, `/usr/local`, `/srv`, `/home`, `/root`). Pseudo-filesystems (`/proc`,

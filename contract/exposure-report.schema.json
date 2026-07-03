@@ -78,6 +78,17 @@
           "description": "The concrete remediation hint.",
           "type": "string"
         },
+        "mac": {
+          "description": "The mandatory-access refinement, when a real MAC provider is active and the\nobject is labeled; `None` under the null provider or for an unlabeled object.\nOmitted from JSON when `None`, so the null-provider output is unchanged.\n\nThe DAC finding is assembled first (pure discretionary access); a provider then\nannotates or suppresses it, so `finding_for` always sets this `None` and the\ncomposite layer fills it in.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MacFinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
           "description": "The exposed inode's absolute path.",
           "type": "string"
@@ -115,6 +126,49 @@
         "severity",
         "remediation_class",
         "hint"
+      ]
+    },
+    "MacFinding": {
+      "description": "The mandatory-access refinement attached to a finding when a real provider is active.\n\nPresent only when the provider labels the object (a null provider or an unlabeled\nobject leaves the finding's annotation `None`). Its shape differs by audit mode:\n\n- **expose** (per-principal): [`object_label`](Self::object_label) is the rendered\n  object label and [`reachable_in`](Self::reachable_in) is the **non-empty** set of\n  contexts in which the principal's access holds. A finding that MAC blocks in every\n  assumable context is suppressed rather than annotated, so in this mode an empty\n  `reachable_in` never occurs.\n- **posture** (`audit fs`, principal-independent): there is no principal to evaluate\n  `permits` for, so [`reachable_in`](Self::reachable_in) is **empty** and the\n  annotation only carries the object's label.\n\nConsequently `reachable_in` MAY be empty when this annotation is present — that is\nthe posture shape, not a \"blocked\" verdict.",
+      "type": "object",
+      "properties": {
+        "object_label": {
+          "description": "The rendered object label, when the provider labels the object.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reachable_in": {
+          "description": "The rendered principal contexts in which the access holds. Non-empty in expose\nmode; empty in posture mode (no principal to evaluate).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "system": {
+          "description": "The MAC system whose rule refined (expose) or labeled (posture) the object.",
+          "$ref": "#/$defs/MacSystem"
+        }
+      },
+      "required": [
+        "system",
+        "reachable_in"
+      ]
+    },
+    "MacSystem": {
+      "description": "The mandatory access control system a [`MacProvider`] refines the verdict against.\n\nThe token ([`Self::as_str`]) is the stable form used in report notes (`DAC +\n<system>`) and JSON output.",
+      "oneOf": [
+        {
+          "description": "Astra Linux PARSEC (Biba integrity + BLP confidentiality lattice).",
+          "type": "string",
+          "const": "parsec"
+        },
+        {
+          "description": "`SELinux` type-enforcement (unordered domains/types).",
+          "type": "string",
+          "const": "selinux"
+        }
       ]
     },
     "ObjectClass": {

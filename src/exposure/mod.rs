@@ -36,6 +36,7 @@ mod config;
 mod expose;
 mod fs_audit;
 mod index;
+mod mac;
 mod mounts;
 mod reach;
 mod scope;
@@ -64,6 +65,11 @@ pub use self::index::{
     WalkOutcome,
 };
 #[doc(inline)]
+pub use self::mac::{
+    FakeMacProvider, MacAccessKind, MacContextId, MacFinding, MacLabelId, MacProvider, MacSystem,
+    NullMacProvider,
+};
+#[doc(inline)]
 pub use self::mounts::{is_skip_fstype, MountTable};
 #[doc(inline)]
 pub use self::reach::Reachability;
@@ -75,6 +81,29 @@ pub use self::taxonomy::{
     Classifier, Finding, NoManagedContext, RemediationClass, RemediationContext, Risk, Severity,
     DEFAULT_SECRET_GLOBS,
 };
+
+/// Single-quote a string so it is safe to embed in a remediation hint that an
+/// operator may copy-paste into a root shell.
+///
+/// The audit walks attacker-influenced trees (a user's `/home`), so a scanned path
+/// can carry shell metacharacters (`;`, `$()`, spaces, `&`). Census never executes
+/// these hints itself — it uses argv arrays — but an operator pasting an unquoted
+/// path into a root shell would. Wrapping the value in single quotes makes the
+/// shell treat every byte literally; the only character with meaning inside single
+/// quotes is `'` itself, which is closed, escaped as `\'`, and reopened.
+pub(crate) fn shell_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
 
 /// The security class of an indexed inode, used to derive a finding's risk and
 /// severity.
@@ -157,5 +186,15 @@ mod tests {
         assert_eq!(ObjectClass::default(), ObjectClass::Generic);
         assert_eq!(ObjectClass::Generic.as_str(), "generic");
         assert_eq!(ObjectClass::Generic.to_string(), "generic");
+    }
+
+    #[test]
+    fn shell_quote_wraps_plain_and_metacharacter_values() {
+        assert_eq!(shell_quote("/etc/passwd"), "'/etc/passwd'");
+        // Spaces and shell metacharacters are neutralised by the single quotes.
+        assert_eq!(shell_quote("/home/u/x;$(id) &y"), "'/home/u/x;$(id) &y'");
+        // An embedded single quote is closed, escaped, and reopened so the wrapping
+        // cannot be broken out of.
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
     }
 }

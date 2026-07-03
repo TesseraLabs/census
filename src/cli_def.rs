@@ -226,6 +226,11 @@ pub enum AuditSub {
         /// absent file uses the built-in defaults.
         #[arg(long, default_value = "/etc/census/exposure.toml")]
         config: std::path::PathBuf,
+        /// Refine the verdict against mandatory access control (MAC). The open build
+        /// links no MAC backend and fails with an honest error; the enterprise build
+        /// selects a real provider (PARSEC / `SELinux`).
+        #[arg(long)]
+        mac: bool,
     },
     /// Per-principal exposure: what the principal can actually reach, with the
     /// intended baseline subtracted for a Census-managed account.
@@ -251,6 +256,11 @@ pub enum AuditSub {
         /// the built-in defaults.
         #[arg(long, default_value = "/etc/census/exposure.toml")]
         config: std::path::PathBuf,
+        /// Refine the verdict against mandatory access control (MAC). The open build
+        /// links no MAC backend and fails with an honest error; the enterprise build
+        /// selects a real provider (PARSEC / `SELinux`).
+        #[arg(long)]
+        mac: bool,
     },
 }
 
