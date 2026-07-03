@@ -267,18 +267,12 @@ fn atomic_replace(src: &Path, dest: &Path) -> Result<(), BackupError> {
         reason: e.to_string(),
     })?;
 
-    let open_excl = || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-    };
-    let mut file = match open_excl() {
+    let mut file = match open_restore_temp(&tmp) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Stale temp or a planted symlink — drop the path entry and retry.
             cleanup_temp(&tmp);
-            open_excl().map_err(|e| BackupError::Copy {
+            open_restore_temp(&tmp).map_err(|e| BackupError::Copy {
                 from: src.to_path_buf(),
                 to: tmp.clone(),
                 reason: e.to_string(),
@@ -300,6 +294,29 @@ fn atomic_replace(src: &Path, dest: &Path) -> Result<(), BackupError> {
             reason: e.to_string(),
         }
     })?;
+
+    // Match the replacement file to the permissions and ownership of the file it
+    // replaces. The temp was created owner-only (0600); renaming it in as-is would
+    // strip, for example, /etc/shadow's group-read (0640 root:shadow) — but worse,
+    // any file whose prior mode was more permissive would be silently narrowed, and
+    // a default-created temp would EXPOSE an auth file (0644) to every local user.
+    // Re-applying the destination's existing mode/owner keeps the restored file
+    // exactly as protected as the one it stands in for; a target that did not exist
+    // yet stays at the restrictive 0600 the temp was created with.
+    //
+    // Applied to the still-open descriptor before it is dropped: a path-based
+    // chown/chmod after close would leave a window in which the predictably-named
+    // temp could be swapped for a symlink by anyone who can write the parent dir,
+    // redirecting the ownership/mode change onto the link target. Operating on the
+    // fd removes that window entirely.
+    preserve_dest_permissions(&file, dest).map_err(|e| {
+        cleanup_temp(&tmp);
+        BackupError::Copy {
+            from: src.to_path_buf(),
+            to: dest.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })?;
     drop(file);
 
     std::fs::rename(&tmp, dest).map_err(|e| {
@@ -310,6 +327,58 @@ fn atomic_replace(src: &Path, dest: &Path) -> Result<(), BackupError> {
             reason: e.to_string(),
         }
     })
+}
+
+/// Open the restore temp for writing, failing if the path already exists (O_EXCL).
+///
+/// On Unix the file is created owner-only (0600) so a restored auth file is never
+/// world-readable for the window between creation and applying its real mode.
+fn open_restore_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(tmp)
+}
+
+/// Copy `dest`'s existing mode, owner, and group onto the open temp `file` before
+/// the rename.
+///
+/// Owner/group is set before the mode so that setuid/setgid bits (which the kernel
+/// clears on ownership change) survive. Both are applied to the open file
+/// descriptor — `fchown` for ownership, the fd-based [`std::fs::File::set_permissions`]
+/// for the mode — never by path, so the predictable temp name cannot be swapped for
+/// a symlink between close and a path-based call. A destination that does not exist
+/// yet has no prior permissions to copy; the temp keeps the restrictive 0600 it was
+/// created with rather than defaulting to a world-readable mode.
+#[cfg(unix)]
+fn preserve_dest_permissions(file: &std::fs::File, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(dest) {
+        Ok(meta) => {
+            // `fchown` acts on the open descriptor (the crate forbids `unsafe`, so
+            // this uses rustix's safe wrapper rather than a raw libc call). Ownership
+            // before mode, so setuid/setgid survive the chmod.
+            rustix::fs::fchown(
+                file,
+                Some(rustix::fs::Uid::from_raw(meta.uid())),
+                Some(rustix::fs::Gid::from_raw(meta.gid())),
+            )?;
+            file.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn preserve_dest_permissions(_file: &std::fs::File, _dest: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Best-effort removal of a leftover backup temp file. Never propagates — a
@@ -427,6 +496,68 @@ mod tests {
         );
         // dest got the new contents via the fresh real temp.
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW CONTENTS\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_preserves_mode_and_owner_of_replaced_file() {
+        // A rollback must put the auth DB files back with the SAME permissions they
+        // had, not a default world-readable mode. /etc/shadow is 0640 root:shadow;
+        // restoring it 0644 would expose password hashes to every local user.
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = tmp.path().join("shadow");
+        write(&shadow, b"root:$6$hash:19000:0:99999:7:::\n");
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let orig_uid = std::fs::metadata(&shadow).unwrap().uid();
+        let orig_gid = std::fs::metadata(&shadow).unwrap().gid();
+
+        let targets = BackupTargets {
+            files: vec![shadow.clone()],
+        };
+        let mut backup = Backup::new(targets, tmp.path().join("rollback"));
+        backup.snapshot().unwrap();
+
+        // Corrupt the live file (File::create truncates but keeps the 0640 mode).
+        write(&shadow, b"CORRUPTED\n");
+        backup.restore().unwrap();
+
+        let restored = std::fs::metadata(&shadow).unwrap();
+        assert_eq!(
+            restored.mode() & 0o7777,
+            0o640,
+            "restored auth file must keep its original mode, not become world-readable"
+        );
+        assert_eq!(restored.uid(), orig_uid, "owner must be preserved");
+        assert_eq!(restored.gid(), orig_gid, "group must be preserved");
+        assert_eq!(
+            std::fs::read(&shadow).unwrap(),
+            b"root:$6$hash:19000:0:99999:7:::\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_replace_of_fresh_dest_is_owner_only() {
+        // Restoring a file that did not exist at snapshot time (so has no prior mode
+        // to copy) must land restrictive (0600), never the default world-readable
+        // create mode.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        write(&src, b"secret\n");
+        let dest = tmp.path().join("newfile");
+        // dest does not exist yet.
+        atomic_replace(&src, &dest).unwrap();
+
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "a freshly created restore target must be owner-only"
+        );
     }
 
     #[test]

@@ -17,6 +17,13 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 ed25519-dalek = "2"
 hex = "0.4"
+# Fd-based `fchown` for the backup/restore path: ownership must be applied to the
+# still-open temp descriptor (not its predictable path) so the temp cannot be
+# swapped for a symlink between close and a path-based chown. std has no fd-based
+# chown, and the crate forbids `unsafe`, so a raw `libc::fchown` is out; rustix
+# wraps `fchown` in a safe API. The mode is applied via std's fd-based
+# `File::set_permissions`, so only `fchown` needs rustix.
+rustix = { version = "1", features = ["fs"] }
 # Structured diagnostics / audit-event logging (M-LOG-STRUCTURED). The library
 # crates emit through this facade only; the subscriber is installed once in the
 # binary (`main.rs`). Logs go to stderr so stdout / `--json` output stays clean.

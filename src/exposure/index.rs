@@ -170,12 +170,29 @@ impl FsWalker for LiveWalker {
             let mut visited: HashSet<(u64, u64)> = HashSet::new();
             visited.insert((root_meta.dev(), root_meta.ino()));
 
-            let mut stack: Vec<PathBuf> = vec![root.clone()];
-            while let Some(dir) = stack.pop() {
+            // Each stack entry carries the (dev, ino) recorded when the directory
+            // was lstat'd and admitted for descent, so the enumeration step can
+            // confirm it is still reading that exact inode.
+            let mut stack: Vec<(PathBuf, u64, u64)> =
+                vec![(root.clone(), root_meta.dev(), root_meta.ino())];
+            while let Some((dir, exp_dev, exp_ino)) = stack.pop() {
                 // An unreadable subtree is skipped, not aborted on.
                 let Ok(entries) = std::fs::read_dir(&dir) else {
                     continue;
                 };
+                // Re-confirm the directory just opened is the same inode that was
+                // lstat'd when it was chosen for descent. A dir swapped for a symlink
+                // (or a different directory) between that check and this read would
+                // otherwise redirect enumeration onto an out-of-scope target and
+                // record its entries under the in-scope path. On any mismatch the
+                // subtree is dropped whole (its entries are never processed).
+                if !dir_inode_unchanged(&dir, exp_dev, exp_ino) {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        "skipping directory whose inode changed between check and read"
+                    );
+                    continue;
+                }
                 for entry in entries.flatten() {
                     let path = entry.path();
                     // Pseudo-filesystem mount points (e.g. `/proc` on a full walk)
@@ -212,7 +229,7 @@ impl FsWalker for LiveWalker {
                         });
                         continue;
                     }
-                    stack.push(path);
+                    stack.push((path, meta.dev(), meta.ino()));
                 }
             }
         }
@@ -226,6 +243,19 @@ impl FsWalker for LiveWalker {
 /// gates directory descent only, never the recording of files.
 fn enter_dir(visited: &mut HashSet<(u64, u64)>, dev: u64, ino: u64) -> bool {
     visited.insert((dev, ino))
+}
+
+/// Whether `dir` is still the same directory inode recorded when it was admitted
+/// for descent. Guards the descent against a dir→symlink (or dir→other-directory)
+/// swap between the lstat that admitted it and the `read_dir` that enumerates it:
+/// such a swap would redirect enumeration out of scope. Returns `false` (skip the
+/// subtree) if the path is no longer a directory, its `(dev, ino)` differs, or it
+/// can no longer be `lstat`ed.
+fn dir_inode_unchanged(dir: &Path, exp_dev: u64, exp_ino: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_dir() && m.dev() == exp_dev && m.ino() == exp_ino)
+        .unwrap_or(false)
 }
 
 /// Append one inode's stat record to the accumulator.
@@ -467,6 +497,31 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dir_inode_unchanged_detects_swap() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("watched");
+        std::fs::create_dir(&dir).unwrap();
+        let meta = std::fs::symlink_metadata(&dir).unwrap();
+        let (dev, ino) = (meta.dev(), meta.ino());
+        // The recorded inode is still the live directory.
+        assert!(dir_inode_unchanged(&dir, dev, ino));
+
+        // Swap the directory for a symlink to an out-of-scope target: the descent
+        // guard must now reject it (a symlink is not the recorded directory inode).
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        assert!(
+            !dir_inode_unchanged(&dir, dev, ino),
+            "a dir swapped for a symlink must fail the inode-continuity check"
+        );
     }
 
     #[test]
