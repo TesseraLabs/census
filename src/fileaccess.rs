@@ -27,6 +27,14 @@
 //! of the tree, so a symlink planted inside a granted directory cannot redirect the
 //! ACL mutation onto an out-of-tree target as root.
 //!
+//! `--physical` only protects the in-tree walk, though: it still resolves any
+//! symlink in the path it is *handed* before walking. So before each invocation the
+//! grant path's ancestor chain is canonicalized once and the command targets that
+//! resolved path (see [`resolve_grant_path`]). This tolerates benign symlinked
+//! parents (`/home` → `/export/home`) — the resolved path no longer traverses an
+//! attacker-swappable symlink — while still refusing a symlinked grant *target*,
+//! which a recursive ACL would otherwise follow onto its link target.
+//!
 //! ## Why gating fails closed
 //!
 //! If no installed backend declares the capability a grant's shape requires,
@@ -153,15 +161,31 @@ pub enum FileAccessError {
         /// Underlying reason.
         reason: String,
     },
-    /// The top-level grant path is a symlink. `setfacl -R --physical` refuses to
-    /// follow symlinks ENCOUNTERED DURING the in-tree walk, but it still resolves
-    /// a symlinked ROOT before walking — so a symlinked grant root would point the
-    /// recursive ACL mutation at an arbitrary target tree. Refused fail-closed
-    /// before any `setfacl` runs.
-    #[error("file grant path {path:?} is a symlink; refusing to apply ACLs through it")]
+    /// The grant target itself (the final path component) is a symlink. The
+    /// ancestor chain is resolved up front by canonicalization — a benign
+    /// symlinked parent (`/home` → `/export/home`) is tolerated because the
+    /// commands run against the resolved path — but a symlinked *leaf* is refused:
+    /// `setfacl -R --physical` resolves a symlinked target before walking, so a
+    /// recursive ACL applied through an attacker-chosen leaf symlink would land on
+    /// its link target. Refused fail-closed before any `setfacl` runs.
+    #[error("file grant target {path:?} is a symlink; refusing to apply ACLs through it")]
     Symlink {
-        /// The symlinked grant path that was refused.
+        /// The symlinked grant target that was refused.
         path: String,
+    },
+    /// The grant path's ancestor chain could not be resolved to an absolute,
+    /// symlink-free path: the parent directory does not exist yet, is unreadable,
+    /// or a component is a dangling symlink. Census canonicalizes the ancestor
+    /// chain up front and operates on the resolved path, so a benign symlinked
+    /// parent is tolerated while an attacker-swappable one is designed out; if that
+    /// resolution fails there is no safe path to target, so the grant is refused
+    /// before any command runs.
+    #[error("cannot resolve file grant path {path:?} to a safe target: {reason}")]
+    Unresolvable {
+        /// The grant path whose ancestor chain could not be resolved.
+        path: String,
+        /// Why resolution failed (the underlying `canonicalize`/`lstat` error).
+        reason: String,
     },
 }
 
@@ -326,25 +350,87 @@ pub fn restore_args(rollback_file: impl AsRef<Path>) -> Vec<String> {
     vec![format!("--restore={}", rollback_file.as_ref().display())]
 }
 
-/// Whether the grant root at `path` is a symlink, by `lstat` (which does not
-/// follow the final component).
+/// Resolve a grant `path` to the absolute, symlink-free path the ACL commands
+/// will actually operate on, or fail closed.
 ///
-/// This is the one guard shared by `materialize`, `revoke`, and `snapshot`: every
+/// This is the one guard shared by `materialize`, `revoke`, and `snapshot`. Every
 /// recursive `setfacl`/`getfacl` pass runs with `--physical`, but `--physical`
-/// only refuses symlinks ENCOUNTERED DURING the in-tree walk — it still resolves a
-/// symlinked ROOT before walking. A planted symlink at the grant path would
-/// therefore redirect the recursive ACL mutation (or the snapshot dump) onto an
-/// arbitrary out-of-tree target as root. Refusing a symlinked root before any
-/// command runs closes that hole on the apply, teardown, and rollback paths alike.
+/// only refuses symlinks ENCOUNTERED DURING the in-tree walk — it still resolves
+/// every symlink in the path it is HANDED before walking. So a symlink anywhere in
+/// the path handed to the command is followed identically and could redirect the
+/// recursive ACL mutation (or the snapshot dump) onto an out-of-tree target as
+/// root.
 ///
-/// A path that does not exist (or cannot be `lstat`ed) is reported as "not a
-/// symlink": it is not a symlink finding, and the subsequent `setfacl`/`getfacl`
-/// call surfaces a missing/unreadable path as its own error. Only a confirmed
-/// symlink is rejected here.
-fn grant_root_is_symlink(path: &str) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+/// The fix is to resolve, not reject, the ancestor chain: benign symlinked parents
+/// are legitimate and common (`/home` → `/export/home`, `/var/run` → `/run`, macOS
+/// `/tmp` → `/private/tmp`), and refusing them outright breaks working grants and,
+/// worse, makes a *revoke* of an already-applied grant fail — leaving an ACL Census
+/// can no longer remove. Instead the parent directory is canonicalized once here
+/// and the final component re-joined onto it; every command then targets that
+/// resolved path. The resolved path no longer traverses an attacker-swappable
+/// symlink, and a symlink swapped in AFTER canonicalization is not on the resolved
+/// path, so the attack is closed without punishing benign parents.
+///
+/// The FINAL component is canonicalized *around* rather than *through*: the parent
+/// is resolved and the leaf re-joined, then the leaf is `lstat`ed and refused if it
+/// is itself a symlink. Canonicalizing the whole path would silently follow a
+/// symlinked leaf and apply the recursive ACL onto its link target; keeping the
+/// leaf un-followed and rejecting a symlinked one is what preserves that guard.
+///
+/// Only the parent must exist: the leaf may not exist yet (a grant may target a
+/// path setfacl will operate on but that is absent at resolve time). A missing leaf
+/// is accepted because the resolved path no longer traverses a swappable symlink and
+/// there is no leaf symlink to follow; the subsequent `setfacl`/`getfacl` surfaces a
+/// genuinely-absent target as its own error.
+///
+/// Fails closed with [`FileAccessError::Unresolvable`] if the parent cannot be
+/// canonicalized (does not exist, is unreadable, or has a dangling-symlink
+/// component) or the leaf cannot be `lstat`ed for a reason other than not existing,
+/// and with [`FileAccessError::Symlink`] if the resolved leaf is itself a symlink.
+fn resolve_grant_path(path: &str) -> Result<String, FileAccessError> {
+    let p = Path::new(path);
+    // Split off the final component so its own symlink status can be judged after
+    // the ancestors are resolved. A path with no ordinary final component (the
+    // filesystem root, `.`/`..`) has no attacker-chosen leaf to redirect through,
+    // so it is canonicalized whole.
+    let resolved = match (p.parent(), p.file_name()) {
+        (Some(parent), Some(leaf)) => {
+            // An empty parent is a bare relative name; resolve it against the cwd
+            // so a symlinked leaf is still `lstat`ed rather than followed.
+            let parent_dir: &Path = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            let canonical_parent =
+                std::fs::canonicalize(parent_dir).map_err(|e| FileAccessError::Unresolvable {
+                    path: path.to_owned(),
+                    reason: format!("parent {}: {e}", parent_dir.display()),
+                })?;
+            canonical_parent.join(leaf)
+        }
+        _ => std::fs::canonicalize(p).map_err(|e| FileAccessError::Unresolvable {
+            path: path.to_owned(),
+            reason: e.to_string(),
+        })?,
+    };
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(FileAccessError::Symlink {
+            path: resolved.to_string_lossy().into_owned(),
+        }),
+        // The leaf exists and is not a symlink: safe to target.
+        Ok(_) => Ok(resolved.to_string_lossy().into_owned()),
+        // The leaf does not exist yet: the parent is resolved, so there is no
+        // swappable symlink on the path and no leaf link to follow. setfacl will
+        // create/operate on it, or surface its own missing-target error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(resolved.to_string_lossy().into_owned())
+        }
+        Err(e) => Err(FileAccessError::Unresolvable {
+            path: path.to_owned(),
+            reason: format!("{}: {e}", resolved.display()),
+        }),
+    }
 }
 
 /// Why a [`CommandRunner`] invocation failed: the binary could not be spawned, or
@@ -513,20 +599,28 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
                     reason: "AclBackend enforces directory grants only".to_owned(),
                 });
             }
-            // Refuse a symlinked grant ROOT before any setfacl: `--physical` only
-            // protects the in-tree walk, and a symlinked root is resolved before
-            // the walk (see `grant_root_is_symlink`).
-            if grant_root_is_symlink(&grant.path) {
-                tracing::warn!(
-                    path = %grant.path,
-                    principal = %principal.name(),
-                    "refusing to apply ACLs through a symlinked grant root"
-                );
-                return Err(FileAccessError::Symlink {
-                    path: grant.path.clone(),
-                });
-            }
-            for args in setfacl_args(principal, grant) {
+            // Resolve the ancestor chain and target the canonical path: `--physical`
+            // only protects the in-tree walk, so any symlink in the path handed to
+            // setfacl is resolved before the walk. Benign symlinked parents are
+            // tolerated (the command runs against the resolved path); a symlinked
+            // target leaf is refused (see `resolve_grant_path`).
+            let target_path = match resolve_grant_path(&grant.path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %grant.path,
+                        principal = %principal.name(),
+                        error = %e,
+                        "refusing to apply ACLs: grant path did not resolve to a safe target"
+                    );
+                    return Err(e);
+                }
+            };
+            let target = ResolvedFileGrant {
+                path: target_path,
+                ..grant.clone()
+            };
+            for args in setfacl_args(principal, &target) {
                 self.runner
                     .run(&self.setfacl_bin, &args)
                     .map_err(|source| FileAccessError::Setfacl {
@@ -535,7 +629,8 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
                     })?;
             }
             tracing::info!(
-                path = %grant.path,
+                path = %target.path,
+                declared = %grant.path,
                 principal = %principal.name(),
                 "materialized ACL grant"
             );
@@ -548,22 +643,31 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
         principal: &Principal,
         grant: &ResolvedFileGrant,
     ) -> Result<(), FileAccessError> {
-        // The same symlink guard materialize uses, on the teardown path: the grant
-        // path comes from the managed registry and could have been swapped for a
-        // symlink (TOCTOU) since it was applied. `setfacl -R --physical -x` would
-        // still resolve a symlinked root before walking, redirecting the recursive
-        // removal out of tree. Refuse fail-closed before any setfacl runs.
-        if grant_root_is_symlink(&grant.path) {
-            tracing::warn!(
-                path = %grant.path,
-                principal = %principal.name(),
-                "refusing to revoke ACLs through a symlinked grant root"
-            );
-            return Err(FileAccessError::Symlink {
-                path: grant.path.clone(),
-            });
-        }
-        for args in revoke_args(principal, grant) {
+        // The same resolution materialize uses, on the teardown path. The grant
+        // path comes from the managed registry, so its ancestors may legitimately
+        // be symlinked (a benign parent symlinked since it was applied); resolving
+        // rather than rejecting them lets a revoke of an already-applied grant
+        // succeed instead of leaving a stale ACL Census can no longer remove. The
+        // command still targets the canonical path, so a target leaf swapped for a
+        // symlink (TOCTOU) is refused before `setfacl -R --physical -x` could
+        // resolve it and remove the entry out of tree.
+        let target_path = match resolve_grant_path(&grant.path) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    path = %grant.path,
+                    principal = %principal.name(),
+                    error = %e,
+                    "refusing to revoke ACLs: grant path did not resolve to a safe target"
+                );
+                return Err(e);
+            }
+        };
+        let target = ResolvedFileGrant {
+            path: target_path,
+            ..grant.clone()
+        };
+        for args in revoke_args(principal, &target) {
             self.runner
                 .run(&self.setfacl_bin, &args)
                 .map_err(|source| FileAccessError::Setfacl {
@@ -581,22 +685,26 @@ impl<R: CommandRunner> FileAccessBackend for AclBackend<R> {
         let mut dump: Vec<u8> = Vec::new();
         for path in paths {
             let path_str = path.to_string_lossy().into_owned();
-            // Refuse a symlinked snapshot ROOT before dumping: `getfacl -R
-            // --physical` still resolves a symlinked root before walking, so a
-            // symlinked root would capture an out-of-tree target's ACLs that a
-            // later `setfacl --restore` would replay out of tree. Fail closed,
-            // mirroring the materialize/revoke guards, so no out-of-tree entry is
-            // ever captured.
-            if grant_root_is_symlink(&path_str) {
-                tracing::warn!(
-                    path = %path_str,
-                    "refusing to snapshot ACLs through a symlinked root"
-                );
-                return Err(FileAccessError::Symlink { path: path_str });
-            }
+            // Resolve the ancestor chain and dump the canonical path, mirroring the
+            // materialize/revoke guards: `getfacl -R --physical` still resolves any
+            // symlink in the path it is handed before walking, so a symlinked
+            // target leaf would capture an out-of-tree target's ACLs that a later
+            // `setfacl --restore` would replay out of tree. Benign symlinked parents
+            // are resolved through; a symlinked leaf is refused before getfacl runs.
+            let target_path = match resolve_grant_path(&path_str) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path_str,
+                        error = %e,
+                        "refusing to snapshot ACLs: path did not resolve to a safe target"
+                    );
+                    return Err(e);
+                }
+            };
             let out = self
                 .runner
-                .run(&self.getfacl_bin, &getfacl_args(&path_str))
+                .run(&self.getfacl_bin, &getfacl_args(&target_path))
                 .map_err(|source| FileAccessError::Setfacl {
                     path: path_str.clone(),
                     source,
@@ -813,6 +921,26 @@ mod tests {
         }
     }
 
+    /// Create a real directory to grant on: a fresh tempdir with a `tree`
+    /// subdirectory. The backend resolves the ancestor chain before running any
+    /// command, so a grant path must exist on disk (an unresolvable path fails
+    /// closed). Returns the tempdir guard (keep it alive for the directory to
+    /// persist), the path to declare the grant on, and the canonical path the
+    /// backend targets after resolving ancestors — which is what the emitted argv
+    /// carries (a host may symlink the temp root, e.g. macOS `/tmp` →
+    /// `/private/tmp`, so declared and canonical can differ).
+    fn real_grant_dir() -> (tempfile::TempDir, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tree");
+        std::fs::create_dir(&dir).unwrap();
+        let declared = dir.to_string_lossy().into_owned();
+        let canonical = std::fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        (tmp, declared, canonical)
+    }
+
     /// A runner that records every (binary, argv) it is asked to run and returns a
     /// fixed stdout, so the AclBackend's argv construction and control flow can be
     /// asserted without executing real commands.
@@ -866,18 +994,18 @@ mod tests {
 
     #[test]
     fn setfacl_args_ro_uses_rx_and_default_pass() {
-        let g = grant("/etc/ssh", Access::RO, true, Shape::Dir);
+        let g = grant("/srv/ssh", Access::RO, true, Shape::Dir);
         let args = setfacl_args(&Principal::User("alice".to_owned()), &g);
         assert_eq!(args.len(), 2, "access ACL + default ACL");
-        // Access pass: -R --physical -m u:alice:r-X /etc/ssh
+        // Access pass: -R --physical -m u:alice:r-X /srv/ssh
         assert_eq!(
             args[0],
-            vec!["-R", "--physical", "-m", "u:alice:r-X", "/etc/ssh"]
+            vec!["-R", "--physical", "-m", "u:alice:r-X", "/srv/ssh"]
         );
         // Default pass carries -d.
         assert_eq!(
             args[1],
-            vec!["-d", "-R", "--physical", "-m", "u:alice:r-X", "/etc/ssh"]
+            vec!["-d", "-R", "--physical", "-m", "u:alice:r-X", "/srv/ssh"]
         );
     }
 
@@ -910,28 +1038,28 @@ mod tests {
     #[test]
     fn setfacl_args_user_ro_regression_unchanged() {
         // The pre-group behavior for a user principal is intact: u: prefix, r-X.
-        let g = grant("/etc/ssh", Access::RO, true, Shape::Dir);
+        let g = grant("/srv/ssh", Access::RO, true, Shape::Dir);
         let args = setfacl_args(&Principal::User("alice".to_owned()), &g);
         assert_eq!(
             args[0],
-            vec!["-R", "--physical", "-m", "u:alice:r-X", "/etc/ssh"]
+            vec!["-R", "--physical", "-m", "u:alice:r-X", "/srv/ssh"]
         );
     }
 
     #[test]
     fn revoke_args_remove_only_account_entry() {
-        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
+        let g = grant("/srv/ssh", Access::RW, true, Shape::Dir);
         let args = revoke_args(&Principal::User("alice".to_owned()), &g);
         assert_eq!(args.len(), 2);
         // -x with u:alice (no perm — removal), access + default. Never names owner
         // or other principals.
         assert_eq!(
             args[0],
-            vec!["-R", "--physical", "-x", "u:alice", "/etc/ssh"]
+            vec!["-R", "--physical", "-x", "u:alice", "/srv/ssh"]
         );
         assert_eq!(
             args[1],
-            vec!["-d", "-R", "--physical", "-x", "u:alice", "/etc/ssh"]
+            vec!["-d", "-R", "--physical", "-x", "u:alice", "/srv/ssh"]
         );
         // No argv mentions another principal or chmod/chown.
         for a in args.iter().flatten() {
@@ -946,16 +1074,16 @@ mod tests {
         // aborts. Revoking by the recorded numeric UID removes the exact entry the
         // kernel stored, which needs no passwd lookup. The argv must read `u:9010`,
         // not `u:<name>`, on both the access and default passes.
-        let g = grant("/etc/salt", Access::RW, true, Shape::Dir);
+        let g = grant("/srv/salt", Access::RW, true, Shape::Dir);
         let args = revoke_args(&Principal::Uid(9010), &g);
         assert_eq!(args.len(), 2);
         assert_eq!(
             args[0],
-            vec!["-R", "--physical", "-x", "u:9010", "/etc/salt"]
+            vec!["-R", "--physical", "-x", "u:9010", "/srv/salt"]
         );
         assert_eq!(
             args[1],
-            vec!["-d", "-R", "--physical", "-x", "u:9010", "/etc/salt"]
+            vec!["-d", "-R", "--physical", "-x", "u:9010", "/srv/salt"]
         );
     }
 
@@ -989,17 +1117,19 @@ mod tests {
         // End-to-end through the backend control flow: a revoke of a `Uid` principal
         // emits the numeric argv on both passes and (with a runner that returns exit
         // 0) reports success.
+        let (_tmp, declared, canonical) = real_grant_dir();
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/etc/salt", Access::RW, true, Shape::Dir);
+        let g = grant(&declared, Access::RW, true, Shape::Dir);
         b.revoke(&Principal::Uid(9010), &g).unwrap();
         assert_eq!(b.runner.calls.len(), 2);
+        // The argv targets the resolved canonical path, not the declared one.
         assert_eq!(
             b.runner.calls[0].1,
-            vec!["-R", "--physical", "-x", "u:9010", "/etc/salt"]
+            vec!["-R", "--physical", "-x", "u:9010", canonical.as_str()]
         );
         assert_eq!(
             b.runner.calls[1].1,
-            vec!["-d", "-R", "--physical", "-x", "u:9010", "/etc/salt"]
+            vec!["-d", "-R", "--physical", "-x", "u:9010", canonical.as_str()]
         );
     }
 
@@ -1021,14 +1151,17 @@ mod tests {
                 })
             }
         }
+        let (_tmp, declared, _canonical) = real_grant_dir();
         let mut b = AclBackend::new(ExitTwoRunner, "setfacl", "getfacl", std::env::temp_dir());
-        let g = grant("/etc/salt", Access::RW, true, Shape::Dir);
+        let g = grant(&declared, Access::RW, true, Shape::Dir);
         let err = b
             .revoke(&Principal::Uid(9010), &g)
             .expect_err("a non-zero setfacl exit must surface as an error");
         match err {
             FileAccessError::Setfacl { path, source } => {
-                assert_eq!(path, "/etc/salt");
+                // The error names the declared grant path (what the operator can
+                // act on), even though the command ran against the resolved path.
+                assert_eq!(path, declared);
                 assert!(
                     matches!(source, CommandError::NonZero { ref status, .. } if status == "exit status: 2"),
                     "must carry the underlying non-zero exit: {source:?}"
@@ -1055,13 +1188,14 @@ mod tests {
                 Ok(Vec::new())
             }
         }
+        let (_tmp, declared, _canonical) = real_grant_dir();
         let mut b = AclBackend::new(
             ZeroWithStderrRunner { calls: 0 },
             "setfacl",
             "getfacl",
             std::env::temp_dir(),
         );
-        let g = grant("/etc/salt", Access::RW, true, Shape::Dir);
+        let g = grant(&declared, Access::RW, true, Shape::Dir);
         b.revoke(&Principal::Uid(9010), &g)
             .expect("a zero exit must be a success even with stderr output");
         assert_eq!(b.runner.calls, 2, "both revoke passes ran");
@@ -1097,8 +1231,8 @@ mod tests {
     #[test]
     fn getfacl_and_restore_args() {
         assert_eq!(
-            getfacl_args("/etc/ssh"),
-            vec!["--absolute-names", "-R", "--physical", "/etc/ssh"]
+            getfacl_args("/srv/ssh"),
+            vec!["--absolute-names", "-R", "--physical", "/srv/ssh"]
         );
         let f = Path::new("/var/lib/census/rollback/x.snapshot");
         assert_eq!(
@@ -1125,8 +1259,9 @@ mod tests {
 
     #[test]
     fn acl_materialize_runs_both_setfacl_passes() {
+        let (_tmp, declared, _canonical) = real_grant_dir();
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
+        let g = grant(&declared, Access::RW, true, Shape::Dir);
         b.materialize(
             &Principal::User("alice".to_owned()),
             std::slice::from_ref(&g),
@@ -1138,32 +1273,43 @@ mod tests {
 
     #[test]
     fn acl_materialize_group_writes_g_entries() {
+        let (_tmp, declared, canonical) = real_grant_dir();
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/srv/shared", Access::RW, true, Shape::Dir);
+        let g = grant(&declared, Access::RW, true, Shape::Dir);
         b.materialize(
             &Principal::Group("wheel".to_owned()),
             std::slice::from_ref(&g),
         )
         .unwrap();
         // Both setfacl passes carry the g:wheel entry (access + default), proving the
-        // group principal flows through to the real argv the backend would run.
+        // group principal flows through to the real argv the backend would run,
+        // targeting the resolved canonical path.
         assert_eq!(b.runner.calls.len(), 2);
         assert_eq!(
             b.runner.calls[0].1,
-            vec!["-R", "--physical", "-m", "g:wheel:rwX", "/srv/shared"]
+            vec!["-R", "--physical", "-m", "g:wheel:rwX", canonical.as_str()]
         );
         assert_eq!(
             b.runner.calls[1].1,
-            vec!["-d", "-R", "--physical", "-m", "g:wheel:rwX", "/srv/shared"]
+            vec![
+                "-d",
+                "-R",
+                "--physical",
+                "-m",
+                "g:wheel:rwX",
+                canonical.as_str()
+            ]
         );
     }
 
     #[test]
     #[cfg(unix)]
-    fn acl_refuses_symlinked_grant_root() {
-        // A symlink planted AT the grant path would let `setfacl -R` resolve the
-        // root and walk the link target, escaping the intended tree. The backend
-        // must lstat the root and refuse before running any command.
+    fn acl_refuses_symlinked_grant_target() {
+        // The grant's FINAL component is itself a symlink. `setfacl -R --physical`
+        // resolves a symlinked target before walking, so a recursive ACL applied
+        // through it would land on the link target's tree. Resolving the ancestor
+        // chain does not rescue this — the leaf is `lstat`ed, not followed — so a
+        // symlinked target is refused before any command runs.
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real-tree");
         std::fs::create_dir(&real).unwrap();
@@ -1180,13 +1326,182 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, FileAccessError::Symlink { .. }),
-            "symlinked grant root must be refused: {err:?}"
+            "symlinked grant target must be refused: {err:?}"
         );
         // Refused before running any setfacl.
         assert!(
             b.runner.calls.is_empty(),
-            "no command must run for a symlink root"
+            "no command must run for a symlinked target"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_accepts_grant_with_symlinked_ancestor_on_canonical_path() {
+        // The grant's FINAL component is a real directory, but an ANCESTOR is a
+        // symlink — the common benign case (`/home` → `/export/home`). Refusing it
+        // would break a working grant. The backend must resolve the ancestor chain
+        // and target the CANONICAL path (which no longer traverses the symlink),
+        // then run setfacl against it.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let real_parent = base.join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let leaf = real_parent.join("proj");
+        std::fs::create_dir(&leaf).unwrap();
+        // A symlink standing in for a benign symlinked ancestor directory.
+        let link_parent = base.join("link-parent");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        // The declared grant path traverses the symlinked ancestor; its final
+        // component is a real directory.
+        let grant_path = link_parent.join("proj");
+        // The path the command must target: the ancestor symlink resolved away.
+        let expected = std::fs::canonicalize(&grant_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant(&grant_path.to_string_lossy(), Access::RW, true, Shape::Dir);
+        b.materialize(
+            &Principal::User("alice".to_owned()),
+            std::slice::from_ref(&g),
+        )
+        .expect("a benign symlinked ancestor must be accepted on the canonical path");
+        // Both setfacl passes ran, targeting the resolved canonical path — not the
+        // declared path that traversed the symlink.
+        assert_eq!(b.runner.calls.len(), 2);
+        for (_, argv) in &b.runner.calls {
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some(expected.as_str()),
+                "command must target the canonical path, not the symlinked declared path"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_refuses_grant_with_symlinked_leaf() {
+        // The dual of the accepted-ancestor case: an ancestor is benign but the
+        // FINAL component (the grant target) is itself a symlink. Resolving the
+        // ancestor chain does not follow the leaf; it is `lstat`ed and refused,
+        // because a recursive ACL applied through it would land on its link target.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let real_parent = base.join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        // The victim tree the leaf symlink points at.
+        let victim = base.join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        // A benign symlinked ancestor, plus a symlinked LEAF under it.
+        let link_parent = base.join("link-parent");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        let leaf_link = real_parent.join("proj");
+        std::os::unix::fs::symlink(&victim, &leaf_link).unwrap();
+        let grant_path = link_parent.join("proj");
+
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant(&grant_path.to_string_lossy(), Access::RW, true, Shape::Dir);
+        let err = b
+            .materialize(
+                &Principal::User("alice".to_owned()),
+                std::slice::from_ref(&g),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, FileAccessError::Symlink { .. }),
+            "a symlinked grant leaf must be refused: {err:?}"
+        );
+        assert!(
+            b.runner.calls.is_empty(),
+            "no command must run for a symlinked leaf"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_revoke_accepts_symlinked_ancestor_on_canonical_path() {
+        // The regression this whole fix targets: a revoke of an already-applied
+        // grant whose parent has since become a benign symlink must still succeed,
+        // targeting the canonical path — not error out and strand an ACL Census can
+        // no longer remove.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let real_parent = base.join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let leaf = real_parent.join("proj");
+        std::fs::create_dir(&leaf).unwrap();
+        let link_parent = base.join("link-parent");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        let grant_path = link_parent.join("proj");
+        let expected = std::fs::canonicalize(&grant_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant(&grant_path.to_string_lossy(), Access::RW, true, Shape::Dir);
+        b.revoke(&Principal::User("alice".to_owned()), &g)
+            .expect("revoke through a benign symlinked ancestor must succeed");
+        assert_eq!(b.runner.calls.len(), 2);
+        for (_, argv) in &b.runner.calls {
+            assert_eq!(argv.last().map(String::as_str), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_refuses_grant_with_unresolvable_parent() {
+        // Fail closed when the ancestor chain cannot be resolved at all: a parent
+        // that does not exist leaves no safe path to target, so the grant is refused
+        // before any command runs (distinct from a symlink finding).
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        // `missing` does not exist, so its child cannot be resolved.
+        let grant_path = base.join("missing").join("proj");
+
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant(&grant_path.to_string_lossy(), Access::RW, true, Shape::Dir);
+        let err = b
+            .materialize(
+                &Principal::User("alice".to_owned()),
+                std::slice::from_ref(&g),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, FileAccessError::Unresolvable { .. }),
+            "an unresolvable parent must fail closed: {err:?}"
+        );
+        assert!(
+            b.runner.calls.is_empty(),
+            "no command must run when the path cannot be resolved"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_accepts_grant_with_not_yet_existing_leaf() {
+        // Only the parent must exist: a grant may target a leaf setfacl will operate
+        // on that is absent at resolve time. The parent resolves, the missing leaf
+        // is accepted (no symlink to follow), and both setfacl passes run against
+        // the resolved path.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = std::fs::canonicalize(tmp.path()).unwrap();
+        let grant_path = parent.join("not-created-yet");
+        let expected = grant_path.to_string_lossy().into_owned();
+
+        let mut b = acl_with(RecordingRunner::default());
+        let g = grant(&grant_path.to_string_lossy(), Access::RW, true, Shape::Dir);
+        b.materialize(
+            &Principal::User("alice".to_owned()),
+            std::slice::from_ref(&g),
+        )
+        .expect("a not-yet-existing leaf under a real parent must be accepted");
+        assert_eq!(b.runner.calls.len(), 2);
+        for (_, argv) in &b.runner.calls {
+            assert_eq!(argv.last().map(String::as_str), Some(expected.as_str()));
+        }
     }
 
     #[test]
@@ -1247,13 +1562,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn acl_materialize_allows_real_directory_root() {
-        // The dual of the symlink rejection: a genuine (non-symlink) directory root
-        // passes the lstat guard and the setfacl passes run.
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("real-tree");
-        std::fs::create_dir(&real).unwrap();
+        // The dual of the symlink rejection: a genuine (non-symlink) directory
+        // passes resolution and the setfacl passes run. A symlinked temp root (e.g.
+        // macOS `/tmp` → `/private/tmp`) is now resolved rather than refused, so no
+        // manual canonicalize workaround is needed on the declared path.
+        let (_tmp, declared, _canonical) = real_grant_dir();
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant(&real.to_string_lossy(), Access::RW, true, Shape::Dir);
+        let g = grant(&declared, Access::RW, true, Shape::Dir);
         b.materialize(
             &Principal::User("alice".to_owned()),
             std::slice::from_ref(&g),
@@ -1269,7 +1584,7 @@ mod tests {
     #[test]
     fn acl_refuses_non_dir_grant() {
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/etc/ssh/sshd_config", Access::RW, false, Shape::File);
+        let g = grant("/srv/ssh/sshd_config", Access::RW, false, Shape::File);
         let err = b
             .materialize(
                 &Principal::User("alice".to_owned()),
@@ -1285,21 +1600,23 @@ mod tests {
 
     #[test]
     fn acl_revoke_runs_two_passes() {
+        let (_tmp, declared, _canonical) = real_grant_dir();
         let mut b = acl_with(RecordingRunner::default());
-        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
+        let g = grant(&declared, Access::RW, true, Shape::Dir);
         b.revoke(&Principal::User("alice".to_owned()), &g).unwrap();
         assert_eq!(b.runner.calls.len(), 2);
     }
 
     #[test]
     fn acl_snapshot_writes_rollback_and_restore_replays_it() {
+        let (_snap_target, declared, _canonical) = real_grant_dir();
         let tmp = tempfile::tempdir().unwrap();
         let runner = RecordingRunner {
-            stdout: b"# file: /etc/ssh\nuser::rwx\n".to_vec(),
+            stdout: b"# file: /srv/ssh\nuser::rwx\n".to_vec(),
             ..Default::default()
         };
         let mut b = AclBackend::new(runner, "setfacl", "getfacl", tmp.path());
-        let p = Path::new("/etc/ssh");
+        let p = Path::new(&declared);
         b.snapshot(&[p]).unwrap();
         let snap = tmp.path().join("file-access-acl.snapshot");
         assert!(snap.exists(), "snapshot file must be written");
@@ -1330,15 +1647,17 @@ mod tests {
                 })
             }
         }
+        let (_tmp, declared, _canonical) = real_grant_dir();
         let mut b = AclBackend::new(FailRunner, "setfacl", "getfacl", std::env::temp_dir());
-        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
+        let g = grant(&declared, Access::RW, true, Shape::Dir);
         let err = b
             .materialize(
                 &Principal::User("alice".to_owned()),
                 std::slice::from_ref(&g),
             )
             .unwrap_err();
-        assert!(matches!(err, FileAccessError::Setfacl { ref path, .. } if path == "/etc/ssh"));
+        // The Setfacl error names the declared grant path (what the operator acts on).
+        assert!(matches!(err, FileAccessError::Setfacl { ref path, .. } if *path == declared));
     }
 
     // --- FakeBackend records calls ---
@@ -1353,28 +1672,28 @@ mod tests {
             rewrite_proof: false,
         };
         let mut f = FakeBackend::new("fake", caps);
-        let g = grant("/etc/ssh", Access::RW, true, Shape::Dir);
+        let g = grant("/srv/ssh", Access::RW, true, Shape::Dir);
         f.materialize(
             &Principal::User("alice".to_owned()),
             std::slice::from_ref(&g),
         )
         .unwrap();
         f.revoke(&Principal::User("alice".to_owned()), &g).unwrap();
-        f.snapshot(&[Path::new("/etc/ssh")]).unwrap();
+        f.snapshot(&[Path::new("/srv/ssh")]).unwrap();
         f.restore().unwrap();
         assert_eq!(
             f.calls,
             vec![
                 FakeCall::Materialize {
                     principal: Principal::User("alice".to_owned()),
-                    paths: vec!["/etc/ssh".to_owned()],
+                    paths: vec!["/srv/ssh".to_owned()],
                 },
                 FakeCall::Revoke {
                     principal: Principal::User("alice".to_owned()),
-                    path: "/etc/ssh".to_owned(),
+                    path: "/srv/ssh".to_owned(),
                 },
                 FakeCall::Snapshot {
-                    paths: vec!["/etc/ssh".to_owned()],
+                    paths: vec!["/srv/ssh".to_owned()],
                 },
                 FakeCall::Restore,
             ]
@@ -1391,11 +1710,11 @@ mod tests {
     fn route_dir_grant_to_acl_backend() {
         let acl = FakeBackend::new("acl", acl_caps());
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl];
-        let grants = vec![grant("/etc/ssh", Access::RW, true, Shape::Dir)];
+        let grants = vec![grant("/srv/ssh", Access::RW, true, Shape::Dir)];
         let routed = route_grants(&grants, &backends).unwrap();
         assert_eq!(routed.len(), 1);
         assert_eq!(routed[0].0, 0, "routed to backend index 0 (acl)");
-        assert_eq!(routed[0].1.path, "/etc/ssh");
+        assert_eq!(routed[0].1.path, "/srv/ssh");
     }
 
     #[test]
@@ -1403,7 +1722,7 @@ mod tests {
         let acl = FakeBackend::new("acl", acl_caps());
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl];
         let grants = vec![grant(
-            "/etc/ssh/sshd_config",
+            "/srv/ssh/sshd_config",
             Access::RW,
             false,
             Shape::File,
@@ -1456,8 +1775,8 @@ mod tests {
         );
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl, &capable];
         let grants = vec![
-            grant("/etc/ssh", Access::RW, true, Shape::Dir),
-            grant("/etc/ssh/sshd_config", Access::RW, false, Shape::File),
+            grant("/srv/ssh", Access::RW, true, Shape::Dir),
+            grant("/srv/ssh/sshd_config", Access::RW, false, Shape::File),
             grant("/var/log/*.log", Access::RO, false, Shape::Pattern),
         ];
         let routed = route_grants(&grants, &backends).unwrap();
@@ -1474,7 +1793,7 @@ mod tests {
         let acl = FakeBackend::new("acl", acl_caps());
         let backends: Vec<&dyn FileAccessBackend> = vec![&acl];
         let grants = vec![
-            grant("/etc/ssh", Access::RW, true, Shape::Dir),
+            grant("/srv/ssh", Access::RW, true, Shape::Dir),
             grant("/var/log/*.log", Access::RO, false, Shape::Pattern),
         ];
         assert!(route_grants(&grants, &backends).is_err());

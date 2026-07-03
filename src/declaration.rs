@@ -292,7 +292,10 @@ pub(crate) fn is_valid_group_name(name: &str) -> bool {
 /// (1-32 chars, lowercase letter or `_` first, then `a-z`/`0-9`/`_`/`-`), so
 /// this delegates to [`is_valid_group_name`]; it exists as a named predicate so
 /// call sites read by intent (a user name, not a group name).
-fn is_valid_user_name(name: &str) -> bool {
+///
+/// `pub(crate)` so the managed-registry loader re-validates persisted account
+/// names against the same charset before they reach a sudoers subject.
+pub(crate) fn is_valid_user_name(name: &str) -> bool {
     is_valid_group_name(name)
 }
 

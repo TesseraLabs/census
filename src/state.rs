@@ -222,6 +222,16 @@ pub enum StateError {
         #[source]
         source: toml::de::Error,
     },
+    /// A managed record carries a name outside the accepted login/group charset.
+    #[error("managed registry {path} has invalid {kind} name {name:?}")]
+    InvalidName {
+        /// The registry path consulted.
+        path: PathBuf,
+        /// Whether the offending record is an account or a group.
+        kind: &'static str,
+        /// The rejected name.
+        name: String,
+    },
 }
 
 impl RegistryState {
@@ -249,6 +259,37 @@ impl RegistryState {
             path: path.to_path_buf(),
             source,
         })?;
+        // The record name is interpolated verbatim into a sudoers subject (`<user>`
+        // / `%<group>`) by the fragment renderers, which — unlike the command tokens
+        // — do not re-escape it. `deny_unknown_fields` alone does not constrain the
+        // charset, so a tampered registry could smuggle sudoers metacharacters
+        // through the name. Re-validate every persisted account/group NAME against
+        // the same login/group charset the declaration path enforces.
+        //
+        // This guarantees only the NAMES. Registry `sudo_commands` (command / runas)
+        // are NOT charset-validated on load: today they feed only `plan --diff`
+        // display, never written sudoers, and are passed through
+        // `escape_sudoers_command`, which neutralises sudoers metacharacters (but not
+        // newlines). Should a persisted `sudo_commands` value ever reach a written
+        // sudoers fragment, it would need validation of its own here.
+        for a in &file.accounts {
+            if !crate::declaration::is_valid_user_name(&a.name) {
+                return Err(StateError::InvalidName {
+                    path: path.to_path_buf(),
+                    kind: "account",
+                    name: a.name.clone(),
+                });
+            }
+        }
+        for g in &file.groups {
+            if !crate::declaration::is_valid_group_name(&g.name) {
+                return Err(StateError::InvalidName {
+                    path: path.to_path_buf(),
+                    kind: "group",
+                    name: g.name.clone(),
+                });
+            }
+        }
         let accounts = file
             .accounts
             .into_iter()
@@ -330,6 +371,53 @@ from_version = 3
         assert_eq!(oper.uid, 9010);
         assert_eq!(oper.groups, vec!["wheel"]);
         assert_eq!(oper.from_version, 3);
+    }
+
+    #[test]
+    fn rejects_account_name_with_sudoers_metacharacters() {
+        // A tampered registry must not smuggle a name that would break out of the
+        // `<user> ALL=...` sudoers subject the fragment renderer emits verbatim.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[account]]
+name = "oper ALL=(ALL) NOPASSWD: /bin/sh #"
+uid = 9010
+shell = "/bin/bash"
+groups = ["wheel"]
+from_version = 3
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            RegistryState::load(&path).unwrap_err(),
+            StateError::InvalidName {
+                kind: "account",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_group_name_with_sudoers_metacharacters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("managed.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[group]]
+name = "grp ALL=(ALL) /bin/sh"
+gid = 9010
+from_version = 3
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            RegistryState::load(&path).unwrap_err(),
+            StateError::InvalidName { kind: "group", .. }
+        ));
     }
 
     #[test]

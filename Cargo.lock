@@ -90,6 +90,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "rand",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",
