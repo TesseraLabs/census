@@ -49,3 +49,5 @@
 - [ ] 4.2 Прогнать `openspec validate package-deb-rpm`; ревью master-code-reviewer
   на диф `release.yml` + `nfpm.yaml`; PR в `main` (только off-hours, подписанный
   коммит)
+  - [x] `openspec validate package-deb-rpm` — valid (2026-07-26)
+  - [ ] Ревью master-code-reviewer на диф `release.yml` + `nfpm.yaml`
