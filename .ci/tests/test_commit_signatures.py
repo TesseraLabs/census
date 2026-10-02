@@ -56,10 +56,52 @@ class SignaturesTests(unittest.TestCase):
         record = pr();record["status"] = "open"
         self.assertIsNone(V.server_merge_receipt(record, REPO))
 
-    def test_unsigned_squash_and_rebase_are_not_merge_exceptions(self):
-        for mode in ("squash", "rebase"):
-            record = pr();record["merge_info"]["merge_parameters"][mode] = True
-            self.assertIsNone(V.server_merge_receipt(record, REPO))
+    def test_rebase_is_not_a_server_exception(self):
+        record = pr();record["merge_info"]["merge_parameters"]["rebase"] = True
+        self.assertIsNone(V.server_merge_receipt(record, REPO))
+
+    def test_squash_is_explicit_and_requires_verified_inputs(self):
+        record = pr();record["merge_info"]["merge_parameters"]["squash"] = True
+        receipt = V.server_merge_receipt(record, REPO)
+        self.assertEqual(receipt["strategy"], "squash")
+        with patch.object(V, "signed", return_value=False), patch.object(V, "git", return_value=b"tree x\n\nmessage"):
+            with self.assertRaisesRegex(V.VerificationError, "input provenance"):
+                V.verify(Path("."), [COMMIT], Path("keys"), {COMMIT: receipt})
+
+    def test_verified_squash_requires_one_exact_parent_and_tree(self):
+        receipt = {"commit": COMMIT, "source": SOURCE, "target": TARGET,
+                   "strategy": "squash", "source_signatures_verified": True, "tree": "d"*40}
+        def fake_git(repo, *args, **kwargs):
+            return b"tree x\n\nmessage" if args[0] == "cat-file" else (receipt["tree"]+"\n").encode()
+        with patch.object(V, "signed", return_value=False), patch.object(V, "git", side_effect=fake_git), \
+             patch.object(V, "parent_ids", return_value=[TARGET]):
+            self.assertEqual(V.verify(Path("."), [COMMIT], Path("keys"), {COMMIT:receipt})["sourcecraft_server_merges"], [COMMIT])
+        with patch.object(V, "signed", return_value=False), patch.object(V, "git", side_effect=fake_git), \
+             patch.object(V, "parent_ids", return_value=[TARGET, SOURCE]):
+            with self.assertRaises(V.VerificationError):V.verify(Path("."), [COMMIT], Path("keys"), {COMMIT:receipt})
+
+    def test_squash_tree_mismatch_is_rejected(self):
+        receipt = {"commit":COMMIT,"source":SOURCE,"target":TARGET,"strategy":"squash", "source_signatures_verified":True,"tree":"d"*40}
+        with patch.object(V,"signed",return_value=False), patch.object(V,"git",return_value=b"tree x\n\nmessage"), patch.object(V,"parent_ids",return_value=[TARGET]):
+            with self.assertRaises(V.VerificationError):V.verify(Path("."),[COMMIT],Path("keys"),{COMMIT:receipt})
+
+    def test_squash_audit_rejects_unsigned_original_inputs(self):
+        import subprocess
+        receipt={"commit":COMMIT,"source":SOURCE,"target":TARGET,"strategy":"squash"}
+        with patch.object(V.subprocess,"run",return_value=subprocess.CompletedProcess([],0)), \
+             patch.object(V,"git",return_value=b""), patch.object(V,"introduced",return_value=[SOURCE]), patch.object(V,"signed",return_value=False):
+            with self.assertRaisesRegex(V.VerificationError,"trusted signed developer"):
+                V.prepare_squash_receipts(Path("."),[COMMIT],Path("keys"),{COMMIT:receipt},REPO,"synthetic")
+
+    def test_squash_audit_marks_only_matching_signed_source_tree(self):
+        import subprocess
+        receipt={"commit":COMMIT,"source":SOURCE,"target":TARGET,"strategy":"squash"}
+        tree="d"*40
+        def fake_git(repo,*args,**kwargs): return (tree+"\n").encode() if args[0]=='show' else b""
+        with patch.object(V.subprocess,"run",return_value=subprocess.CompletedProcess([],0)), \
+             patch.object(V,"git",side_effect=fake_git), patch.object(V,"introduced",return_value=[SOURCE]), patch.object(V,"signed",return_value=True):
+            V.prepare_squash_receipts(Path("."),[COMMIT],Path("keys"),{COMMIT:receipt},REPO,"synthetic")
+        self.assertTrue(receipt['source_signatures_verified']); self.assertEqual(receipt['tree'],tree)
 
     def test_non_main_server_merge_is_not_an_exception(self):
         record = pr();record["target_branch"] = "feature/unprotected"

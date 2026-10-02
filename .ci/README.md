@@ -1,13 +1,17 @@
 # Developer signatures and SourceCraft server merge provenance
 
 Developer commits, including locally-created merge commits, require a trusted
-SSH signature. The owner-approved exception covers only ordinary server merges
-into protected SourceCraft `main`. Unsigned squash/rebase results are not covered.
+SSH signature. The owner-approved exception covers authoritative ordinary server merges and
+requested squash merges into protected SourceCraft `main`. Rebase results are not covered.
 
-An unsigned merge is accepted only when authenticated SourceCraft PR metadata
-reports `merged`, the expected organization/repository, ordinary merge parameters,
-the exact commit ID, and both exact ordered parents. A commit message, identity
-string or two-parent shape alone is insufficient. Bad/untrusted signatures fail.
+An unsigned ordinary merge requires authenticated SourceCraft PR metadata
+reporting `merged`, the expected repository/main, the exact commit ID and both
+exact ordered parents. A squash requires the explicit squash strategy, one exact
+target parent and a tree identical to the original signed source. Its branch must
+contain the target revision; the verifier rechecks every original input signature.
+After source-branch deletion it fetches only the immutable API-recorded source SHA
+from the fixed SourceCraft repository with redirects disabled. Unavailable inputs
+fail closed. GitHub receives only publisher-signed attestations of these checks. A commit message, identity string or parent shape alone is insufficient. Bad/untrusted signatures fail.
 
 Verification code and allowed keys must be extracted from the protected base,
 not the PR checkout. The check rejects shallow history and compares local base

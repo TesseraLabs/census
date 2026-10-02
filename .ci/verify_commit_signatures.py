@@ -9,6 +9,7 @@ SourceCraft credentials or private signing keys are needed in GitHub Actions.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -67,7 +68,7 @@ def introduced(repo: Path, base: str, head: str) -> list[str]:
 
 
 def server_merge_receipt(pr: dict, expected_repo: str) -> dict | None:
-    """Only an authoritative merged PR with ordinary merge parameters qualifies."""
+    """Only an authoritative main PR with a recognized non-rebase strategy qualifies."""
     if not isinstance(pr, dict) or pr.get("status") != "merged":
         return None
     repository = pr.get("repository", {})
@@ -82,14 +83,59 @@ def server_merge_receipt(pr: dict, expected_repo: str) -> dict | None:
         return None
     info = pr.get("merge_info", {})
     parameters = info.get("merge_parameters", {})
-    if parameters.get("rebase") is not False or parameters.get("squash") is not False:
+    if parameters.get("rebase") is not False or parameters.get("squash") not in (False, True):
         return None
-    return {
+    receipt = {
         "commit": commit_sha(info.get("merge_commit_hash")),
         "target": commit_sha(info.get("target_commit_hash")),
         "source": commit_sha(pr.get("source", {}).get("sha")),
         "pr": str(pr.get("slug", "")),
     }
+    if parameters["squash"]:
+        receipt["strategy"] = "squash"
+    return receipt
+
+
+def prepare_squash_receipts(repo: Path, commits: list[str], signers: Path,
+                            receipts: dict[str, dict], expected_repo: str, token: str) -> None:
+    """Reverify original signed inputs, including after automatic branch deletion."""
+    for sha in commits:
+        receipt = receipts.get(sha, {})
+        if receipt.get("strategy") != "squash":
+            continue
+        source, target = receipt["source"], receipt["target"]
+        exists = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", source + "^{commit}"],
+                                capture_output=True, timeout=120, check=False).returncode == 0
+        if not exists:
+            # Fetch only the API-recorded SHA from this fixed SourceCraft repository.
+            # Token stays in child environment, never in argv, URLs or printed errors.
+            env = dict(os.environ)
+            env["GIT_CONFIG_COUNT"] = "3"
+            env["GIT_CONFIG_KEY_0"] = "http.https://git.sourcecraft.dev/.extraHeader"
+            basic = base64.b64encode(("git:" + token).encode()).decode()
+            env["GIT_CONFIG_VALUE_0"] = "Authorization: Basic " + basic
+            env["GIT_CONFIG_KEY_1"] = "http.followRedirects"
+            env["GIT_CONFIG_VALUE_1"] = "false"
+            env["GIT_CONFIG_KEY_2"] = "credential.helper"
+            env["GIT_CONFIG_VALUE_2"] = ""
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            env["GIT_ASKPASS"] = "/usr/bin/false"
+            env["SSH_ASKPASS"] = "/usr/bin/false"
+            fetch = subprocess.run(["git", "-C", str(repo), "fetch", "--no-tags",
+                                    "https://git.sourcecraft.dev/" + expected_repo + ".git", source],
+                                   env=env, capture_output=True, timeout=120, check=False)
+            if fetch.returncode:
+                raise VerificationError("Cannot retrieve original squash input for audit")
+        # Up-to-date source branches make the expected squash tree unambiguous.
+        git(repo, "merge-base", "--is-ancestor", target, source)
+        inputs = introduced(repo, target, source)
+        if not inputs or any(not signed(repo, commit, signers) for commit in inputs):
+            raise VerificationError("Squash inputs must contain only trusted signed developer commits")
+        tree = commit_sha(git(repo, "show", "-s", "--format=%T", source).decode().strip())
+        if git(repo, "show", "-s", "--format=%T", sha).decode().strip() != tree:
+            raise VerificationError("Squash result differs from its verified source tree")
+        receipt["tree"] = tree
+        receipt["source_signatures_verified"] = True
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -241,6 +287,13 @@ def publication_receipts(repo: Path, base: str, head: str, path: str,
             raise VerificationError("Invalid server merge record")
         for field in ("commit", "source", "target"):
             commit_sha(receipt.get(field))
+        strategy = receipt.get("strategy", "merge")
+        if strategy == "squash":
+            commit_sha(receipt.get("tree"))
+            if receipt.get("source_signatures_verified") is not True:
+                raise VerificationError("Publisher did not attest verified squash inputs")
+        elif strategy != "merge":
+            raise VerificationError("Unknown server merge strategy")
         git(repo, "merge-base", "--is-ancestor", receipt["commit"], source_head)
         if receipt["commit"] in receipts:
             raise VerificationError("Duplicate server merge record")
@@ -261,7 +314,15 @@ def verify(repo: Path, commits: list[str], signers: Path, receipts: dict[str, di
         if any(line.startswith(b"gpgsig") for line in headers.splitlines()):
             raise VerificationError("Invalid or untrusted signature on " + sha)
         receipt = receipts.get(sha)
-        if not receipt or parent_ids(repo, sha) != [receipt["target"], receipt["source"]]:
+        if not receipt:
+            raise VerificationError("Unsigned commit lacks matching SourceCraft server provenance: " + sha)
+        strategy = receipt.get("strategy", "merge")
+        if strategy == "squash":
+            if (receipt.get("source_signatures_verified") is not True or
+                    parent_ids(repo, sha) != [receipt["target"]] or
+                    git(repo, "show", "-s", "--format=%T", sha).decode().strip() != receipt.get("tree")):
+                raise VerificationError("Squash commit lacks exact parent/tree/input provenance: " + sha)
+        elif strategy != "merge" or parent_ids(repo, sha) != [receipt["target"], receipt["source"]]:
             raise VerificationError("Unsigned commit lacks matching SourceCraft server provenance: " + sha)
         result["sourcecraft_server_merges"].append(sha)
     return result
@@ -310,6 +371,9 @@ def main() -> int:
                 raise VerificationError("Trusted publisher file is required")
             receipts = publication_receipts(args.repo_path, base, head, args.publication_manifest,
                                             args.publisher_signers, args.sourcecraft_repo)
+        if args.sourcecraft_api or args.sourcecraft_export_main:
+            prepare_squash_receipts(args.repo_path, commits, args.signers, receipts,
+                                    args.sourcecraft_repo, token)
         result = verify(args.repo_path, commits, args.signers, receipts)
         if args.export_receipts:
             # Do not attest an outdated selection if main changed during verification.
