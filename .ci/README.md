@@ -51,3 +51,7 @@ the separate cutover checks complete. Initial configuration installation is a
 signed, independently-reviewed bootstrap PR; it cannot yet run a workflow whose
 trusted base files do not exist until that PR is merged. Validate signatures and
 configuration locally first, then test the installed checks in follow-up PRs.
+
+The signature workflow also emits a trusted binding of the exact PR, input/base
+revisions and CI run for local signed GitHub publication. No private signing key
+or SourceCraft credential is passed to GitHub CI.
