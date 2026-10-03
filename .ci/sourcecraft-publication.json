@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "repository": "tessera-labs/census",
+  "source_head": "54ddcac04307d5ea6c47fa1e0f8473f2fe6066cc",
+  "server_merges": [
+    {
+      "commit": "54ddcac04307d5ea6c47fa1e0f8473f2fe6066cc",
+      "target": "5cc72b814ca8d40d815798556a287603c1b41ade",
+      "source": "6aa7ce76a91ed6a4cd22fbcb0a9f2700d1732121",
+      "pr": "6",
+      "strategy": "squash",
+      "tree": "6fec512d9ae6b80f8f94207766b015b3f1ab4ed9",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "5cc72b814ca8d40d815798556a287603c1b41ade",
+      "target": "7148d4a9d6a12648972405f9cc8dffdea9120329",
+      "source": "c37bcf0005454f879ca9075cca9dd68a92913f68",
+      "pr": "5",
+      "strategy": "squash",
+      "tree": "92b9a5003d8aef0aff14992369950053a1c231a3",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "7148d4a9d6a12648972405f9cc8dffdea9120329",
+      "target": "3f61966a98b8c70a9f38c7ef8464374ba4506fb7",
+      "source": "436b09a55823a3ea3d958769fc85061f86dffd76",
+      "pr": "4",
+      "strategy": "squash",
+      "tree": "22e8fae7ff6bccbe095db0fa97bcf22457ec6e7d",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "3f61966a98b8c70a9f38c7ef8464374ba4506fb7",
+      "target": "d5f6cf06436f5748ccab565d63e9ad7503d239ff",
+      "source": "4dbc1ac6ee9e2beb2abca460056bc1692f5f5679",
+      "pr": "3",
+      "strategy": "squash",
+      "tree": "7d5cb6633da8f4d74f9eac0d3736eb3852ae8610",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "d5f6cf06436f5748ccab565d63e9ad7503d239ff",
+      "target": "af39fc558324eac50f4d082f4ff08fdeba4fd94b",
+      "source": "fc0b49e6952fa6de8ac541137b05ac7b72fef212",
+      "pr": "2"
+    },
+    {
+      "commit": "af39fc558324eac50f4d082f4ff08fdeba4fd94b",
+      "target": "eca4b057ac4d214e733afef2565cca3ad227a24e",
+      "source": "4b859ab021906fd822d41682e9409f6bd6896033",
+      "pr": "1"
+    }
+  ],
+  "quality": {
+    "repository": "census",
+    "source_main": "54ddcac04307d5ea6c47fa1e0f8473f2fe6066cc",
+    "source_pr": "6",
+    "source_input": "6aa7ce76a91ed6a4cd22fbcb0a9f2700d1732121",
+    "source_target": "5cc72b814ca8d40d815798556a287603c1b41ade",
+    "github_base": "1accb79a211e4e39c449f9e09e111971f4d775ad",
+    "workflows": {
+      "quality": "6",
+      "signatures": "6"
+    }
+  }
+}
