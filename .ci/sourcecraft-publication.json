@@ -1,8 +1,17 @@
 {
   "version": 1,
   "repository": "tessera-labs/census",
-  "source_head": "42a790d8d6b7b8ae98e8182305e2a6e223c599b8",
+  "source_head": "ec67e38fa779a95b3996c75d7036633a52682dbb",
   "server_merges": [
+    {
+      "commit": "ec67e38fa779a95b3996c75d7036633a52682dbb",
+      "target": "42a790d8d6b7b8ae98e8182305e2a6e223c599b8",
+      "source": "fd2a12eb3a54b6b7e50e87e1e5ba99c071644227",
+      "pr": "8",
+      "strategy": "squash",
+      "tree": "3a22ca21713ce04fd4933a58d8a5ae07fdda7797",
+      "source_signatures_verified": true
+    },
     {
       "commit": "42a790d8d6b7b8ae98e8182305e2a6e223c599b8",
       "target": "54ddcac04307d5ea6c47fa1e0f8473f2fe6066cc",
@@ -63,14 +72,14 @@
   ],
   "quality": {
     "repository": "census",
-    "source_main": "42a790d8d6b7b8ae98e8182305e2a6e223c599b8",
-    "source_pr": "7",
-    "source_input": "e9eeef6418600ac5a7a9c680b793ea043b5beb5d",
-    "source_target": "54ddcac04307d5ea6c47fa1e0f8473f2fe6066cc",
-    "github_base": "db602e29879ad8cf6fd02b73a054c92fcd0e30a7",
+    "source_main": "ec67e38fa779a95b3996c75d7036633a52682dbb",
+    "source_pr": "8",
+    "source_input": "fd2a12eb3a54b6b7e50e87e1e5ba99c071644227",
+    "source_target": "42a790d8d6b7b8ae98e8182305e2a6e223c599b8",
+    "github_base": "70011ab554223b6524fbc23d715c2b208481d98b",
     "workflows": {
-      "quality": "7",
-      "signatures": "7"
+      "quality": "8",
+      "signatures": "8"
     }
   }
 }
